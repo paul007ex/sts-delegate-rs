@@ -948,6 +948,8 @@ fn exchange_delegation(
     gate_may_act(&exchange.subject_claims, &actor_claims)?;
 
     let now = unix_now();
+    let prior_act = exchange.subject_claims.act.as_ref().map(act_claim_from_value).transpose()?;
+    let act = build_act(actor_claims.sub.clone(), prior_act);
     let actor_jti =
         actor_claims.jti.as_deref().filter(|value| !value.trim().is_empty()).ok_or_else(|| {
             HttpError::invalid_client("actor_token jti must be a non-empty string")
@@ -967,8 +969,6 @@ fn exchange_delegation(
         .into_iter()
         .min()
         .unwrap_or(now + state.config.scoped_token_ttl);
-    let prior_act = exchange.subject_claims.act.as_ref().map(act_claim_from_value).transpose()?;
-    let act = build_act(actor_claims.sub.clone(), prior_act);
     let mut payload = build_scoped_payload(
         state.config.our_issuer.clone(),
         exchange.subject_sub,

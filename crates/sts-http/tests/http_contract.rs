@@ -181,6 +181,20 @@ fn signed_subject_token_with_may_act(signer: &RsaJoseSigner, now: i64, may_act: 
         .expect("subject token")
 }
 
+fn signed_subject_token_with_act(signer: &RsaJoseSigner, now: i64, act: Value) -> String {
+    signer
+        .sign_json_claims(&json!({
+            "iss": "https://issuer.example/oauth2/default",
+            "sub": "alice@example.com",
+            "aud": "api://obo",
+            "scope": "chat.read chat.write",
+            "exp": now + 600,
+            "iat": now,
+            "act": act,
+        }))
+        .expect("subject token")
+}
+
 fn signed_assertion(signer: &RsaJoseSigner, now: i64, jti: &str) -> String {
     signed_assertion_with_exp_delta(signer, now, jti, 300)
 }
@@ -839,6 +853,120 @@ async fn contract_delegation_token_matches_python_oracle_wire_shape() {
     assert!(payload.get("auth_time").is_none());
     assert!(payload.get("acr").is_none());
     assert!(payload.get("amr").is_none());
+}
+
+#[tokio::test]
+async fn contract_delegation_preserves_sanitized_nested_prior_act_chain() {
+    let (state, subject_signer, actor_signer, _) = test_state();
+    let now = unix_now();
+    let subject_token = signed_subject_token_with_act(
+        &subject_signer,
+        now,
+        json!({
+            "sub": "gateway",
+            "iss": "https://gateway.example",
+            "exp": now + 500,
+            "aud": "api://leak",
+            "iat": now,
+            "act": {
+                "sub": "edge-router",
+                "iss": "https://router.example",
+                "scope": "leak"
+            }
+        }),
+    );
+    let actor_token = signed_assertion(&actor_signer, now, "actor-prior-act-preserve");
+
+    let response =
+        post_token_form(state.clone(), delegation_form(&subject_token, &actor_token)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = read_json(response).await;
+    let token = response_body["access_token"].as_str().expect("access token");
+    let payload = jwt_segment(token, 1);
+    assert_eq!(
+        payload["act"],
+        json!({
+            "sub": "chat-mcp",
+            "act": {
+                "sub": "gateway",
+                "iss": "https://gateway.example",
+                "act": {
+                    "sub": "edge-router",
+                    "iss": "https://router.example"
+                }
+            }
+        })
+    );
+}
+
+#[tokio::test]
+async fn contract_malformed_prior_act_does_not_burn_actor_replay() {
+    let (state, subject_signer, actor_signer, _) = test_state();
+    let now = unix_now();
+    let actor_token = signed_assertion(&actor_signer, now, "actor-prior-act-retry");
+
+    let rejected_subject = signed_subject_token_with_act(&subject_signer, now, json!("not-a-dict"));
+    let rejected =
+        post_token_form(state.clone(), delegation_form(&rejected_subject, &actor_token)).await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let body = read_json(rejected).await;
+    assert_eq!(body["error"], "invalid_request");
+    assert!(body["error_description"].as_str().unwrap_or("").contains("malformed prior act claim"));
+    assert!(body.get("access_token").is_none());
+
+    let accepted_subject =
+        signed_subject_token_with_act(&subject_signer, now, json!({"sub": "gateway"}));
+    let accepted =
+        post_token_form(state.clone(), delegation_form(&accepted_subject, &actor_token)).await;
+    assert_eq!(
+        accepted.status(),
+        StatusCode::OK,
+        "failed prior-act gate must not record actor replay state"
+    );
+    let response_body = read_json(accepted).await;
+    let token = response_body["access_token"].as_str().expect("access token");
+    let payload = jwt_segment(token, 1);
+    assert_eq!(payload["act"], json!({"sub": "chat-mcp", "act": {"sub": "gateway"}}));
+}
+
+#[tokio::test]
+async fn contract_prior_act_chain_rejects_missing_sub_and_excessive_depth() {
+    let (state, subject_signer, actor_signer, _) = test_state();
+    let now = unix_now();
+    let cases = [
+        (
+            "actor-prior-act-missing-sub",
+            json!({"iss": "https://gateway.example"}),
+            "malformed prior act claim",
+        ),
+        ("actor-prior-act-empty-sub", json!({"sub": ""}), "malformed prior act claim"),
+        (
+            "actor-prior-act-too-deep",
+            {
+                let mut deep = json!({"sub": "a0"});
+                for idx in 1..=15 {
+                    deep = json!({"sub": format!("a{idx}"), "act": deep});
+                }
+                deep
+            },
+            "act delegation chain too deep",
+        ),
+    ];
+
+    for (actor_jti, prior_act, expected_description) in cases {
+        let subject_token = signed_subject_token_with_act(&subject_signer, now, prior_act);
+        let actor_token = signed_assertion(&actor_signer, now, actor_jti);
+        let response =
+            post_token_form(state.clone(), delegation_form(&subject_token, &actor_token)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{actor_jti}");
+        let body = read_json(response).await;
+        assert_eq!(body["error"], "invalid_request", "{actor_jti}");
+        assert!(
+            body["error_description"].as_str().unwrap_or("").contains(expected_description),
+            "{actor_jti}: {body}"
+        );
+        assert!(body.get("access_token").is_none(), "{actor_jti}");
+    }
 }
 
 #[tokio::test]
