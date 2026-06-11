@@ -6,8 +6,6 @@ use http_body_util::BodyExt;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use p256::ecdsa::SigningKey;
 use p256::pkcs8::EncodePrivateKey;
-use rand::{SeedableRng, rngs::StdRng};
-use rsa::RsaPrivateKey;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sts_config::{
@@ -60,10 +58,8 @@ struct DpopProofClaims {
     iat: i64,
 }
 
-fn signer(seed: u64, kid: &str) -> RsaJoseSigner {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa");
-    RsaJoseSigner::from_generated(&private_key, kid).expect("signer")
+fn signer(_seed: u64, kid: &str) -> RsaJoseSigner {
+    RsaJoseSigner::generate_for_tests(kid).expect("signer")
 }
 
 struct FailingSigner {

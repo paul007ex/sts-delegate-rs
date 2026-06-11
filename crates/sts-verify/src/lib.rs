@@ -525,16 +525,12 @@ fn map_verify_error(err: VerifyError) -> VerifyError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
     use reqwest::Client;
-    use rsa::RsaPrivateKey;
     use sts_jose::{JoseSigner, RsaJoseSigner};
     use tokio::net::TcpListener;
 
     fn signer() -> RsaJoseSigner {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
-        let private = RsaPrivateKey::new(&mut rng, 2048).expect("rsa");
-        RsaJoseSigner::from_generated(&private, "issuer-key").expect("signer")
+        RsaJoseSigner::generate_for_tests("issuer-key").expect("signer")
     }
 
     fn subject_claims() -> sts_core::MintedClaims {

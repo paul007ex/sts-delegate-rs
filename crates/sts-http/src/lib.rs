@@ -1421,15 +1421,14 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_lc_rs::{
+        encoding::{AsDer, Pkcs8V1Der},
+        signature::RsaKeyPair,
+    };
     use axum::body::Body;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
     use http::{Method, Request};
     use http_body_util::BodyExt;
-    use rand::{SeedableRng, rngs::StdRng};
-    use rsa::{
-        RsaPrivateKey,
-        traits::{PrivateKeyParts, PublicKeyParts},
-    };
     use serde_json::Value;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1460,27 +1459,33 @@ mod tests {
         jti: String,
     }
 
-    fn signer(seed: u64, kid: &str) -> RsaJoseSigner {
-        let mut rng = StdRng::seed_from_u64(seed);
-        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa");
-        RsaJoseSigner::from_generated(&private_key, kid).expect("signer")
+    fn signer(_seed: u64, kid: &str) -> RsaJoseSigner {
+        RsaJoseSigner::generate_for_tests(kid).expect("signer")
     }
 
-    fn private_key(seed: u64) -> RsaPrivateKey {
-        let mut rng = StdRng::seed_from_u64(seed);
-        RsaPrivateKey::new(&mut rng, 2048).expect("rsa")
+    fn private_key_pem(_seed: u64) -> String {
+        let key_pair = RsaKeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).expect("rsa key");
+        let der = AsDer::<Pkcs8V1Der>::as_der(&key_pair).expect("pkcs8 der");
+        pkcs8_pem(der.as_ref())
     }
 
-    fn private_jwk_json(key: &RsaPrivateKey, kid: &str) -> String {
-        let primes = key.primes();
+    fn pkcs8_pem(der: &[u8]) -> String {
+        let encoded = STANDARD.encode(der);
+        let mut body = String::new();
+        for chunk in encoded.as_bytes().chunks(64) {
+            body.push_str(std::str::from_utf8(chunk).expect("base64"));
+            body.push('\n');
+        }
+        format!("-----BEGIN PRIVATE KEY-----\n{body}-----END PRIVATE KEY-----\n")
+    }
+
+    fn invalid_private_jwk_json(kid: &str) -> String {
         serde_json::json!({
             "kty": "RSA",
             "kid": kid,
-            "n": URL_SAFE_NO_PAD.encode(key.n().to_bytes_be()),
-            "e": URL_SAFE_NO_PAD.encode(key.e().to_bytes_be()),
-            "d": URL_SAFE_NO_PAD.encode(key.d().to_bytes_be()),
-            "p": URL_SAFE_NO_PAD.encode(primes[0].to_bytes_be()),
-            "q": URL_SAFE_NO_PAD.encode(primes[1].to_bytes_be()),
+            "n": URL_SAFE_NO_PAD.encode(vec![0xff; 256]),
+            "e": URL_SAFE_NO_PAD.encode([0x01, 0x00, 0x01]),
+            "d": URL_SAFE_NO_PAD.encode(vec![0x7f; 256]),
         })
         .to_string()
     }
@@ -1503,9 +1508,8 @@ mod tests {
     }
 
     fn bootstrap_source(dir: &Path) -> ConfigSource {
-        let sts_key = private_key(10);
-        let sts_key_file = dir.join("sts-private.json");
-        write_file(&sts_key_file, &private_jwk_json(&sts_key, "sts-key-1"));
+        let sts_key_file = dir.join("sts-private.pem");
+        write_file(&sts_key_file, &private_key_pem(10));
 
         let subject_signer = signer(11, "subject-key-1");
         let actor_signer = signer(12, "chat-mcp-key-1");
@@ -1551,7 +1555,7 @@ mod tests {
     async fn bootstrap_rejects_missing_signing_key_before_serving() {
         let dir = temp_bootstrap_dir("missing-key");
         let source = bootstrap_source(&dir);
-        fs::remove_file(dir.join("sts-private.json")).expect("remove key");
+        fs::remove_file(dir.join("sts-private.pem")).expect("remove key");
         let err = match build_state_from_source(&source).await {
             Ok(_) => panic!("missing key should fail bootstrap"),
             Err(err) => err,
@@ -1563,10 +1567,9 @@ mod tests {
     async fn bootstrap_rejects_private_material_in_public_jwks() {
         let dir = temp_bootstrap_dir("private-jwks");
         let source = bootstrap_source(&dir);
-        let private_actor = private_key(13);
         write_file(
             &dir.join("actor-jwks.json"),
-            &format!(r#"{{"keys":[{}]}}"#, private_jwk_json(&private_actor, "chat-mcp-key-1")),
+            &format!(r#"{{"keys":[{}]}}"#, invalid_private_jwk_json("chat-mcp-key-1")),
         );
         let err = match build_state_from_source(&source).await {
             Ok(_) => panic!("private public JWKS should fail bootstrap"),
@@ -1583,7 +1586,7 @@ mod tests {
 
         let dir = temp_bootstrap_dir("writable-key");
         let source = bootstrap_source(&dir);
-        fs::set_permissions(dir.join("sts-private.json"), fs::Permissions::from_mode(0o620))
+        fs::set_permissions(dir.join("sts-private.pem"), fs::Permissions::from_mode(0o620))
             .expect("chmod");
         let err = match build_state_from_source(&source).await {
             Ok(_) => panic!("writable key should fail bootstrap"),

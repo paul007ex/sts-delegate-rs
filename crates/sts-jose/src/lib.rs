@@ -9,16 +9,17 @@
 
 use std::fmt;
 
+use aws_lc_rs::{
+    encoding::{AsDer, Pkcs8V1Der},
+    signature::{KeyPair as AwsKeyPair, RsaKeyPair, RsaPublicKeyComponents},
+};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use rsa::{
-    RsaPrivateKey, RsaPublicKey,
-    pkcs1::DecodeRsaPrivateKey,
-    pkcs1v15::{Signature as RsaSignature, SigningKey, VerifyingKey},
-    traits::PublicKeyParts,
+use jsonwebtoken::{
+    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
+    errors::{Error as JwtError, ErrorKind as JwtErrorKind},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sha2::Sha256;
-use signature::{SignatureEncoding, Signer as _, Verifier as _};
+use simple_asn1::{ASN1Block, BigInt, BigUint};
 use sts_core::MintedClaims;
 
 /// The signing backend requested by policy/config.
@@ -128,6 +129,9 @@ struct PrivateRsaJwk {
     d: String,
     p: String,
     q: String,
+    dp: Option<String>,
+    dq: Option<String>,
+    qi: Option<String>,
 }
 
 /// Deserialized claims plus the protected-header key id selected for verification.
@@ -135,6 +139,13 @@ struct PrivateRsaJwk {
 pub struct VerifiedJws<T> {
     pub claims: T,
     pub kid: String,
+}
+
+/// Decoded public RSA JWK components.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedRsaPublicKey {
+    pub n: Vec<u8>,
+    pub e: Vec<u8>,
 }
 
 /// The crypto/signing surface the STS needs from the JOSE backend.
@@ -149,28 +160,23 @@ pub trait JoseSigner: Send + Sync {
 ///
 /// This keeps key material handling in the JOSE crate instead of making the HTTP
 /// or verification layers decode `n`/`e` on their own.
-pub fn rsa_public_key_from_jwk(jwk: &PublicJwk) -> Result<RsaPublicKey, JoseError> {
+pub fn rsa_public_key_from_jwk(jwk: &PublicJwk) -> Result<DecodedRsaPublicKey, JoseError> {
     if jwk.kty != "RSA" {
         return Err(JoseError::new(
             JoseErrorKind::InvalidKey,
             format!("unsupported JWK key type {}", jwk.kty),
         ));
     }
-    let n = URL_SAFE_NO_PAD.decode(jwk.n.as_bytes()).map_err(|e| {
-        JoseError::new(JoseErrorKind::InvalidKey, format!("invalid RSA modulus encoding: {e}"))
-    })?;
-    let e = URL_SAFE_NO_PAD.decode(jwk.e.as_bytes()).map_err(|e| {
-        JoseError::new(JoseErrorKind::InvalidKey, format!("invalid RSA exponent encoding: {e}"))
-    })?;
-    RsaPublicKey::new(rsa::BigUint::from_bytes_be(&n), rsa::BigUint::from_bytes_be(&e)).map_err(
-        |e| JoseError::new(JoseErrorKind::InvalidKey, format!("invalid RSA public key: {e}")),
-    )
+    let n = decode_jwk_component("n", &jwk.n)?;
+    let e = decode_jwk_component("e", &jwk.e)?;
+    validate_public_components(&n, &e)?;
+    Ok(DecodedRsaPublicKey { n, e })
 }
 
 /// Return the RSA modulus size for public-key policy checks.
 pub fn rsa_public_key_bits_from_jwk(jwk: &PublicJwk) -> Result<usize, JoseError> {
     let public_key = rsa_public_key_from_jwk(jwk)?;
-    Ok(public_key.n().bits())
+    Ok(rsa_modulus_bits(&public_key.n))
 }
 
 /// Verify a compact JWS against a JWKS and deserialize the payload.
@@ -190,65 +196,25 @@ pub fn verify_claims_against_jwks_with_header<T: DeserializeOwned>(
     token: &str,
     jwks: &JwksDocument,
 ) -> Result<VerifiedJws<T>, JoseError> {
-    let (header_b64, payload_b64, sig_b64) = RsaJoseSigner::parse_compact_jws(token)?;
-    let header_json = URL_SAFE_NO_PAD.decode(header_b64.as_bytes()).map_err(|e| {
-        JoseError::new(
-            JoseErrorKind::InvalidCompactJws,
-            format!("invalid compact JWS header encoding: {e}"),
-        )
-    })?;
-    let header: serde_json::Value = serde_json::from_slice(&header_json).map_err(|e| {
-        JoseError::new(
-            JoseErrorKind::InvalidCompactJws,
-            format!("invalid compact JWS header JSON: {e}"),
-        )
-    })?;
-    let kid = header.get("kid").and_then(|v| v.as_str()).ok_or_else(|| {
+    RsaJoseSigner::parse_compact_jws(token)?;
+    let header = decode_header(token).map_err(map_jwt_header_error)?;
+    let kid = header.kid.as_deref().ok_or_else(|| {
         JoseError::new(JoseErrorKind::InvalidCompactJws, "compact JWS header missing kid")
     })?;
-    if header.get("alg").and_then(|v| v.as_str()) != Some("RS256") {
+    if header.alg != Algorithm::RS256 {
         return Err(JoseError::new(JoseErrorKind::VerificationFailed, "unexpected JWS algorithm"));
     }
 
     let jwk = jwks.keys.iter().find(|key| key.kid == kid).ok_or_else(|| {
         JoseError::new(JoseErrorKind::VerificationFailed, format!("no JWK found for kid {kid}"))
     })?;
-    let public_key = rsa_public_key_from_jwk(jwk)?;
-
-    let payload_json = URL_SAFE_NO_PAD.decode(payload_b64.as_bytes()).map_err(|e| {
-        JoseError::new(
-            JoseErrorKind::InvalidCompactJws,
-            format!("invalid compact JWS payload encoding: {e}"),
-        )
+    let _ = rsa_public_key_from_jwk(jwk)?;
+    let decoding_key = DecodingKey::from_rsa_components(&jwk.n, &jwk.e).map_err(|e| {
+        JoseError::new(JoseErrorKind::InvalidKey, format!("invalid RSA public JWK: {e}"))
     })?;
-    let claims: T = serde_json::from_slice(&payload_json).map_err(|e| {
-        JoseError::new(JoseErrorKind::InvalidClaims, format!("invalid token claims JSON: {e}"))
-    })?;
-
-    let signature = URL_SAFE_NO_PAD.decode(sig_b64.as_bytes()).map_err(|e| {
-        JoseError::new(
-            JoseErrorKind::InvalidCompactJws,
-            format!("invalid compact JWS signature encoding: {e}"),
-        )
-    })?;
-    let verifying_key = VerifyingKey::<Sha256>::new(public_key);
-    verifying_key
-        .verify(
-            RsaJoseSigner::signing_input(header_json.as_slice(), payload_json.as_slice())
-                .as_bytes(),
-            &RsaSignature::try_from(signature.as_slice()).map_err(|e| {
-                JoseError::new(
-                    JoseErrorKind::InvalidCompactJws,
-                    format!("invalid signature bytes: {e}"),
-                )
-            })?,
-        )
-        .map_err(|e| {
-            JoseError::new(
-                JoseErrorKind::VerificationFailed,
-                format!("RSA verification failed: {e}"),
-            )
-        })?;
+    let claims = decode::<T>(token, &decoding_key, &signature_only_rs256_validation())
+        .map_err(map_jwt_decode_error)?
+        .claims;
 
     Ok(VerifiedJws { claims, kid: kid.to_string() })
 }
@@ -257,8 +223,8 @@ pub fn verify_claims_against_jwks_with_header<T: DeserializeOwned>(
 #[derive(Debug, Clone)]
 pub struct RsaJoseSigner {
     kid: String,
-    private_key: RsaPrivateKey,
-    public_key: RsaPublicKey,
+    encoding_key: EncodingKey,
+    public_jwk: PublicJwk,
 }
 
 impl RsaJoseSigner {
@@ -301,69 +267,93 @@ impl RsaJoseSigner {
                 format!("unsupported private JWK key type {}", jwk.kty),
             ));
         }
-        let n = decode_biguint("n", &jwk.n)?;
-        if n.bits() < 2048 {
+        let n = decode_jwk_component("n", &jwk.n)?;
+        let e = decode_jwk_component("e", &jwk.e)?;
+        validate_public_components(&n, &e)?;
+        if rsa_modulus_bits(&n) < 2048 {
             return Err(JoseError::new(
                 JoseErrorKind::InvalidKey,
                 "RSA signing key modulus must be at least 2048 bits",
             ));
         }
-        let e = decode_biguint("e", &jwk.e)?;
-        let d = decode_biguint("d", &jwk.d)?;
-        let p = decode_biguint("p", &jwk.p)?;
-        let q = decode_biguint("q", &jwk.q)?;
-        let private_key = RsaPrivateKey::from_components(n, e, d, vec![p, q]).map_err(|e| {
-            JoseError::new(JoseErrorKind::InvalidKey, format!("invalid RSA private JWK: {e}"))
-        })?;
+        let private_der = rsa_private_jwk_to_pkcs1_der(&jwk)?;
         let kid = jwk.kid.unwrap_or_else(|| fallback_kid.into());
-        Self::from_generated(&private_key, kid)
+        Self::from_pkcs1_der(private_der, kid)
     }
 
     pub fn from_pkcs1_pem(
         private_pem: impl AsRef<str>,
         kid: impl Into<String>,
     ) -> Result<Self, JoseError> {
-        let private_pem = private_pem.as_ref().trim().to_string();
-        let private_key = RsaPrivateKey::from_pkcs1_pem(&private_pem).map_err(|e| {
-            JoseError::new(JoseErrorKind::InvalidKey, format!("invalid RSA private key: {e}"))
-        })?;
-        let public_key = RsaPublicKey::from(&private_key);
-        Ok(Self { kid: kid.into(), private_key, public_key })
+        let encoding_key = EncodingKey::from_rsa_pem(private_pem.as_ref().trim().as_bytes())
+            .map_err(map_jwt_key_error)?;
+        Self::from_pkcs1_der(encoding_key.inner(), kid)
     }
 
-    /// Build a test/generated RS256 signer only for the selected classical backend.
-    pub fn from_generated_for_backend(
+    /// Build the RS256 signer from a DER-encoded RSA private key only when the
+    /// selected backend is classical. PKCS#1 and PKCS#8 DER are both accepted.
+    pub fn from_private_key_der_for_backend(
         selection: &BackendSelection,
-        private_key: &RsaPrivateKey,
+        private_der: impl AsRef<[u8]>,
         kid: impl Into<String>,
     ) -> Result<Self, JoseError> {
         resolve_backend(selection)?;
-        Self::from_generated(private_key, kid)
+        Self::from_private_key_der(private_der, kid)
     }
 
-    pub fn from_generated(
-        private_key: &RsaPrivateKey,
+    /// Build the RS256 signer from a DER-encoded RSA private key.
+    ///
+    /// This accepts PKCS#1 `RSAPrivateKey` DER directly and PKCS#8
+    /// `PrivateKeyInfo` DER by extracting the embedded PKCS#1 key.
+    pub fn from_private_key_der(
+        private_der: impl AsRef<[u8]>,
         kid: impl Into<String>,
     ) -> Result<Self, JoseError> {
-        let public_key = RsaPublicKey::from(private_key);
-        Ok(Self { kid: kid.into(), private_key: private_key.clone(), public_key })
+        let private_der = normalize_rsa_private_key_der(private_der.as_ref())?;
+        Self::from_pkcs1_der(private_der, kid)
+    }
+
+    fn from_pkcs1_der(
+        private_der: impl AsRef<[u8]>,
+        kid: impl Into<String>,
+    ) -> Result<Self, JoseError> {
+        let private_der = private_der.as_ref();
+        let key_pair = RsaKeyPair::from_der(private_der).map_err(|e| {
+            JoseError::new(JoseErrorKind::InvalidKey, format!("invalid RSA private key: {e}"))
+        })?;
+        if key_pair.public_modulus_len() * 8 < 2048 {
+            return Err(JoseError::new(
+                JoseErrorKind::InvalidKey,
+                "RSA signing key modulus must be at least 2048 bits",
+            ));
+        }
+        let public = key_pair.public_key();
+        let components = RsaPublicKeyComponents::<Vec<u8>>::from(public);
+        let kid = kid.into();
+        let public_jwk = PublicJwk {
+            kty: "RSA".to_string(),
+            kid: kid.clone(),
+            use_: "sig".to_string(),
+            alg: "RS256".to_string(),
+            n: URL_SAFE_NO_PAD.encode(&components.n),
+            e: URL_SAFE_NO_PAD.encode(&components.e),
+        };
+        Ok(Self { kid, encoding_key: EncodingKey::from_rsa_der(private_der), public_jwk })
+    }
+
+    /// Generate an ephemeral 2048-bit RSA signer for tests and local fixtures.
+    pub fn generate_for_tests(kid: impl Into<String>) -> Result<Self, JoseError> {
+        let key_pair = RsaKeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).map_err(|e| {
+            JoseError::new(JoseErrorKind::InvalidKey, format!("generate RSA key failed: {e}"))
+        })?;
+        let private_der = AsDer::<Pkcs8V1Der>::as_der(&key_pair).map_err(|e| {
+            JoseError::new(JoseErrorKind::InvalidKey, format!("encode RSA key failed: {e}"))
+        })?;
+        Self::from_private_key_der(private_der.as_ref(), kid)
     }
 
     fn public_jwk(&self) -> PublicJwk {
-        PublicJwk {
-            kty: "RSA".to_string(),
-            kid: self.kid.clone(),
-            use_: "sig".to_string(),
-            alg: self.alg().to_string(),
-            n: URL_SAFE_NO_PAD.encode(self.public_key.n().to_bytes_be()),
-            e: URL_SAFE_NO_PAD.encode(self.public_key.e().to_bytes_be()),
-        }
-    }
-
-    fn signing_input(header_json: &[u8], payload_json: &[u8]) -> String {
-        let header_b64 = URL_SAFE_NO_PAD.encode(header_json);
-        let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json);
-        format!("{header_b64}.{payload_b64}")
+        self.public_jwk.clone()
     }
 
     /// Sign an arbitrary JSON payload as a compact JWS.
@@ -380,21 +370,10 @@ impl RsaJoseSigner {
         claims: &T,
         typ: &str,
     ) -> Result<String, JoseError> {
-        let header = serde_json::json!({
-            "alg": self.alg(),
-            "kid": self.kid,
-            "typ": typ,
-        });
-        let header_json = serde_json::to_vec(&header).map_err(|e| {
-            JoseError::new(JoseErrorKind::InvalidClaims, format!("encode header failed: {e}"))
-        })?;
-        let payload_json = serde_json::to_vec(claims).map_err(|e| {
-            JoseError::new(JoseErrorKind::InvalidClaims, format!("encode claims failed: {e}"))
-        })?;
-        let signing_input = Self::signing_input(&header_json, &payload_json);
-        let signing_key = SigningKey::<Sha256>::new(self.private_key.clone());
-        let signature: RsaSignature = signing_key.sign(signing_input.as_bytes());
-        Ok(format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes())))
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(self.kid.clone());
+        header.typ = Some(typ.to_string());
+        encode(&header, claims, &self.encoding_key).map_err(map_jwt_encode_error)
     }
 
     fn parse_compact_jws(token: &str) -> Result<(&str, &str, &str), JoseError> {
@@ -418,14 +397,195 @@ impl RsaJoseSigner {
     }
 }
 
-fn decode_biguint(name: &str, value: &str) -> Result<rsa::BigUint, JoseError> {
+fn signature_only_rs256_validation() -> Validation {
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.required_spec_claims.clear();
+    validation.validate_exp = false;
+    validation.validate_aud = false;
+    validation
+}
+
+fn decode_jwk_component(name: &str, value: &str) -> Result<Vec<u8>, JoseError> {
     let bytes = URL_SAFE_NO_PAD.decode(value.as_bytes()).map_err(|e| {
+        JoseError::new(JoseErrorKind::InvalidKey, format!("invalid RSA JWK {name} encoding: {e}"))
+    })?;
+    if bytes.is_empty() {
+        return Err(JoseError::new(
+            JoseErrorKind::InvalidKey,
+            format!("invalid RSA JWK {name}: empty unsigned integer"),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn decode_required_private_component(
+    name: &str,
+    value: Option<&str>,
+) -> Result<Vec<u8>, JoseError> {
+    let value = value.ok_or_else(|| {
         JoseError::new(
             JoseErrorKind::InvalidKey,
-            format!("invalid RSA private JWK {name} encoding: {e}"),
+            format!("RSA private JWK missing CRT member {name}"),
         )
     })?;
-    Ok(rsa::BigUint::from_bytes_be(&bytes))
+    decode_jwk_component(name, value)
+}
+
+fn validate_public_components(n: &[u8], e: &[u8]) -> Result<(), JoseError> {
+    if n.is_empty() || e.is_empty() {
+        return Err(JoseError::new(
+            JoseErrorKind::InvalidKey,
+            "RSA public key components must be non-empty",
+        ));
+    }
+    if n[0] == 0 || e[0] == 0 {
+        return Err(JoseError::new(
+            JoseErrorKind::InvalidKey,
+            "RSA public key components must use minimal unsigned encoding",
+        ));
+    }
+    Ok(())
+}
+
+fn rsa_modulus_bits(n: &[u8]) -> usize {
+    let Some(first_nonzero) = n.iter().position(|byte| *byte != 0) else {
+        return 0;
+    };
+    let bytes = &n[first_nonzero..];
+    (bytes.len() - 1) * 8 + (8 - bytes[0].leading_zeros() as usize)
+}
+
+fn rsa_private_jwk_to_pkcs1_der(jwk: &PrivateRsaJwk) -> Result<Vec<u8>, JoseError> {
+    let n = decode_jwk_component("n", &jwk.n)?;
+    let e = decode_jwk_component("e", &jwk.e)?;
+    let d = decode_jwk_component("d", &jwk.d)?;
+    let p = decode_jwk_component("p", &jwk.p)?;
+    let q = decode_jwk_component("q", &jwk.q)?;
+    let dp = decode_required_private_component("dp", jwk.dp.as_deref())?;
+    let dq = decode_required_private_component("dq", jwk.dq.as_deref())?;
+    let qi = decode_required_private_component("qi", jwk.qi.as_deref())?;
+
+    let blocks = vec![
+        ASN1Block::Integer(0, BigInt::from(0)),
+        positive_integer_block("n", &n)?,
+        positive_integer_block("e", &e)?,
+        positive_integer_block("d", &d)?,
+        positive_integer_block("p", &p)?,
+        positive_integer_block("q", &q)?,
+        positive_integer_block("dp", &dp)?,
+        positive_integer_block("dq", &dq)?,
+        positive_integer_block("qi", &qi)?,
+    ];
+    simple_asn1::to_der(&ASN1Block::Sequence(0, blocks)).map_err(|e| {
+        JoseError::new(
+            JoseErrorKind::InvalidKey,
+            format!("failed to encode RSA private JWK as PKCS#1 DER: {e}"),
+        )
+    })
+}
+
+fn positive_integer_block(name: &str, bytes: &[u8]) -> Result<ASN1Block, JoseError> {
+    if bytes.is_empty() || bytes.iter().all(|byte| *byte == 0) {
+        return Err(JoseError::new(
+            JoseErrorKind::InvalidKey,
+            format!("invalid RSA private JWK {name}: zero unsigned integer"),
+        ));
+    }
+    Ok(ASN1Block::Integer(0, BigInt::from(BigUint::from_bytes_be(bytes))))
+}
+
+fn normalize_rsa_private_key_der(private_der: &[u8]) -> Result<Vec<u8>, JoseError> {
+    if RsaKeyPair::from_der(private_der).is_ok() {
+        return Ok(private_der.to_vec());
+    }
+    extract_pkcs8_private_key_octets(private_der)
+}
+
+fn extract_pkcs8_private_key_octets(private_der: &[u8]) -> Result<Vec<u8>, JoseError> {
+    let blocks = simple_asn1::from_der(private_der).map_err(|e| {
+        JoseError::new(JoseErrorKind::InvalidKey, format!("invalid RSA private key DER: {e}"))
+    })?;
+    find_first_octet_string(&blocks).ok_or_else(|| {
+        JoseError::new(
+            JoseErrorKind::InvalidKey,
+            "invalid RSA private key DER: PKCS#8 privateKey octets not found",
+        )
+    })
+}
+
+fn find_first_octet_string(blocks: &[ASN1Block]) -> Option<Vec<u8>> {
+    for block in blocks {
+        match block {
+            ASN1Block::OctetString(_, value) => return Some(value.clone()),
+            ASN1Block::Sequence(_, values) | ASN1Block::Set(_, values) => {
+                if let Some(value) = find_first_octet_string(values) {
+                    return Some(value);
+                }
+            }
+            ASN1Block::Explicit(_, _, _, inner) => {
+                if let Some(value) = find_first_octet_string(std::slice::from_ref(inner.as_ref())) {
+                    return Some(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn map_jwt_key_error(err: JwtError) -> JoseError {
+    JoseError::new(JoseErrorKind::InvalidKey, format!("invalid RSA private key: {err}"))
+}
+
+fn map_jwt_encode_error(err: JwtError) -> JoseError {
+    match err.kind() {
+        JwtErrorKind::Json(_) => {
+            JoseError::new(JoseErrorKind::InvalidClaims, format!("encode claims failed: {err}"))
+        }
+        JwtErrorKind::InvalidKeyFormat
+        | JwtErrorKind::InvalidRsaKey(_)
+        | JwtErrorKind::RsaFailedSigning
+        | JwtErrorKind::Signing(_) => {
+            JoseError::new(JoseErrorKind::InvalidKey, format!("RSA signing failed: {err}"))
+        }
+        _ => {
+            JoseError::new(JoseErrorKind::VerificationFailed, format!("JWT signing failed: {err}"))
+        }
+    }
+}
+
+fn map_jwt_header_error(err: JwtError) -> JoseError {
+    JoseError::new(JoseErrorKind::InvalidCompactJws, format!("invalid compact JWS header: {err}"))
+}
+
+fn map_jwt_decode_error(err: JwtError) -> JoseError {
+    match err.kind() {
+        JwtErrorKind::InvalidToken | JwtErrorKind::Base64(_) | JwtErrorKind::Utf8(_) => {
+            JoseError::new(JoseErrorKind::InvalidCompactJws, format!("invalid compact JWS: {err}"))
+        }
+        JwtErrorKind::Json(_)
+        | JwtErrorKind::MissingRequiredClaim(_)
+        | JwtErrorKind::InvalidClaimFormat(_)
+        | JwtErrorKind::ExpiredSignature
+        | JwtErrorKind::InvalidIssuer
+        | JwtErrorKind::InvalidAudience
+        | JwtErrorKind::InvalidSubject
+        | JwtErrorKind::ImmatureSignature => {
+            JoseError::new(JoseErrorKind::InvalidClaims, format!("invalid token claims: {err}"))
+        }
+        JwtErrorKind::InvalidSignature
+        | JwtErrorKind::InvalidAlgorithm
+        | JwtErrorKind::MissingAlgorithm
+        | JwtErrorKind::InvalidKeyFormat
+        | JwtErrorKind::InvalidRsaKey(_) => JoseError::new(
+            JoseErrorKind::VerificationFailed,
+            format!("JWT verification failed: {err}"),
+        ),
+        _ => JoseError::new(
+            JoseErrorKind::VerificationFailed,
+            format!("JWT verification failed: {err}"),
+        ),
+    }
 }
 
 impl JoseSigner for RsaJoseSigner {
@@ -442,64 +602,18 @@ impl JoseSigner for RsaJoseSigner {
     }
 
     fn verify_claims(&self, token: &str) -> Result<MintedClaims, JoseError> {
-        let (header_b64, payload_b64, sig_b64) = Self::parse_compact_jws(token)?;
-        let header_json = URL_SAFE_NO_PAD.decode(header_b64.as_bytes()).map_err(|e| {
-            JoseError::new(
-                JoseErrorKind::InvalidCompactJws,
-                format!("invalid compact JWS header encoding: {e}"),
-            )
-        })?;
-        let header: serde_json::Value = serde_json::from_slice(&header_json).map_err(|e| {
-            JoseError::new(
-                JoseErrorKind::InvalidCompactJws,
-                format!("invalid compact JWS header JSON: {e}"),
-            )
-        })?;
-        if header.get("alg").and_then(|v| v.as_str()) != Some(self.alg()) {
+        Self::parse_compact_jws(token)?;
+        let header = decode_header(token).map_err(map_jwt_header_error)?;
+        if header.alg != Algorithm::RS256 {
             return Err(JoseError::new(
                 JoseErrorKind::VerificationFailed,
                 "unexpected JWS algorithm",
             ));
         }
-        if header.get("kid").and_then(|v| v.as_str()) != Some(self.kid.as_str()) {
+        if header.kid.as_deref() != Some(self.kid.as_str()) {
             return Err(JoseError::new(JoseErrorKind::VerificationFailed, "unexpected JWS kid"));
         }
-
-        let payload_json = URL_SAFE_NO_PAD.decode(payload_b64.as_bytes()).map_err(|e| {
-            JoseError::new(
-                JoseErrorKind::InvalidCompactJws,
-                format!("invalid compact JWS payload encoding: {e}"),
-            )
-        })?;
-        let claims: MintedClaims = serde_json::from_slice(&payload_json).map_err(|e| {
-            JoseError::new(JoseErrorKind::InvalidClaims, format!("invalid token claims JSON: {e}"))
-        })?;
-
-        let signature = URL_SAFE_NO_PAD.decode(sig_b64.as_bytes()).map_err(|e| {
-            JoseError::new(
-                JoseErrorKind::InvalidCompactJws,
-                format!("invalid compact JWS signature encoding: {e}"),
-            )
-        })?;
-        let verifying_key = VerifyingKey::<Sha256>::new(self.public_key.clone());
-        verifying_key
-            .verify(
-                Self::signing_input(header_json.as_slice(), payload_json.as_slice()).as_bytes(),
-                &RsaSignature::try_from(signature.as_slice()).map_err(|e| {
-                    JoseError::new(
-                        JoseErrorKind::InvalidCompactJws,
-                        format!("invalid signature bytes: {e}"),
-                    )
-                })?,
-            )
-            .map_err(|e| {
-                JoseError::new(
-                    JoseErrorKind::VerificationFailed,
-                    format!("RSA verification failed: {e}"),
-                )
-            })?;
-
-        Ok(claims)
+        verify_claims_against_jwks(token, &self.public_jwks())
     }
 }
 
@@ -519,12 +633,14 @@ pub fn resolve_backend(selection: &BackendSelection) -> Result<(), JoseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{SeedableRng, rngs::StdRng};
 
     fn test_signer() -> RsaJoseSigner {
-        let mut rng = StdRng::seed_from_u64(7);
-        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa key");
-        RsaJoseSigner::from_generated(&private_key, "kid-1").expect("signer")
+        RsaJoseSigner::generate_for_tests("kid-1").expect("signer")
+    }
+
+    fn generated_private_key_der() -> Vec<u8> {
+        let key_pair = RsaKeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).expect("rsa key");
+        AsDer::<Pkcs8V1Der>::as_der(&key_pair).expect("pkcs8 der").as_ref().to_vec()
     }
 
     fn claims() -> MintedClaims {
@@ -560,11 +676,9 @@ mod tests {
 
     #[test]
     fn selected_classical_backend_can_construct_rsa_signer() {
-        let mut rng = StdRng::seed_from_u64(17);
-        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa key");
-        let signer = RsaJoseSigner::from_generated_for_backend(
+        let signer = RsaJoseSigner::from_private_key_der_for_backend(
             &BackendSelection::Classical,
-            &private_key,
+            generated_private_key_der(),
             "kid-1",
         )
         .expect("signer");
@@ -573,15 +687,29 @@ mod tests {
 
     #[test]
     fn selected_pqc_backend_cannot_construct_rsa_signer() {
-        let mut rng = StdRng::seed_from_u64(19);
-        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa key");
-        let err = RsaJoseSigner::from_generated_for_backend(
+        let err = RsaJoseSigner::from_private_key_der_for_backend(
             &BackendSelection::parse("ML-DSA-65"),
-            &private_key,
+            generated_private_key_der(),
             "kid-1",
         )
         .unwrap_err();
         assert_eq!(err.kind, JoseErrorKind::UnsupportedAlgorithm);
+    }
+
+    #[test]
+    fn private_jwk_without_crt_members_fails_closed() {
+        let jwk = serde_json::json!({
+            "kty": "RSA",
+            "kid": "kid-1",
+            "n": URL_SAFE_NO_PAD.encode(vec![0xff; 256]),
+            "e": URL_SAFE_NO_PAD.encode([0x01, 0x00, 0x01]),
+            "d": URL_SAFE_NO_PAD.encode(vec![0x7f; 256]),
+            "p": URL_SAFE_NO_PAD.encode(vec![0x7f; 128]),
+            "q": URL_SAFE_NO_PAD.encode(vec![0x7f; 128]),
+        });
+        let err = RsaJoseSigner::from_private_jwk(jwk.to_string(), "fallback").unwrap_err();
+        assert_eq!(err.kind, JoseErrorKind::InvalidKey);
+        assert!(err.message.contains("missing CRT member"));
     }
 
     #[test]

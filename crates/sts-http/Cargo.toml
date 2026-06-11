@@ -25,10 +25,10 @@ tokio = { version = "1.52.3", features = ["macros", "net", "rt-multi-thread"] }
 url = "2"
 
 [dev-dependencies]
+aws-lc-rs = "1.17.0"
 http-body-util = "0.1"
-jsonwebtoken = { version = "10.4.0", default-features = false, features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.4.0", default-features = false, features = ["aws_lc_rs"] }
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
-rsa = { version = "0.9", features = ["pem"] }
 serde_urlencoded = "0.7"
 tower = { version = "0.5.3", features = ["util"] }

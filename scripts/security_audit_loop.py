@@ -36,6 +36,14 @@ OPTIONAL_SUPPLY_CHAIN_TOOLS = {
 
 STRICT_SUPPLY_CHAIN_TIMEOUT_SECONDS = 180
 
+ALLOWED_DUPLICATE_DEPENDENCIES = {
+    "untrusted": (
+        "aws-lc-rs 1.17 uses untrusted 0.7 via ring-io while rustls-webpki "
+        "0.103 uses untrusted 0.9; both are required by the selected AWS-LC "
+        "JOSE provider plus rustls verifier stack"
+    ),
+}
+
 
 def timestamp() -> str:
     return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -66,11 +74,32 @@ def check_duplicate_dependencies() -> bool:
     if completed.returncode != 0:
         print(f"check=duplicate-dependencies result=fail code={completed.returncode}")
         return False
-    if completed.stdout.strip():
-        print("check=duplicate-dependencies result=fail reason=duplicates-present")
+    duplicate_names = duplicate_dependency_names(completed.stdout)
+    unreviewed = sorted(name for name in duplicate_names if name not in ALLOWED_DUPLICATE_DEPENDENCIES)
+    if unreviewed:
+        print(
+            "check=duplicate-dependencies result=fail reason=unreviewed-duplicates "
+            f"crates={','.join(unreviewed)}"
+        )
         return False
+    for name in sorted(duplicate_names):
+        print(
+            "check=duplicate-dependencies allowed="
+            f"{name} reason={ALLOWED_DUPLICATE_DEPENDENCIES[name]!r}"
+        )
     print("check=duplicate-dependencies result=pass")
     return True
+
+
+def duplicate_dependency_names(tree_output: str) -> set[str]:
+    names: set[str] = set()
+    for line in tree_output.splitlines():
+        if line[:1].isspace():
+            continue
+        match = re.match(r"^([A-Za-z0-9_.-]+) v\d", line)
+        if match:
+            names.add(match.group(1))
+    return names
 
 
 def rust_source_files() -> list[Path]:

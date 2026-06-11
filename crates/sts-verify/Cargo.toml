@@ -21,6 +21,4 @@ url = "2"
 
 [dev-dependencies]
 axum = "0.8.9"
-rand = "0.8"
-rsa = { version = "0.9", features = ["pem"] }
 sts-core = { version = "0.1.0", path = "../sts-core" }
