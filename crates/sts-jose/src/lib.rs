@@ -109,6 +109,13 @@ impl JwksDocument {
     }
 }
 
+/// Deserialized claims plus the protected-header key id selected for verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedJws<T> {
+    pub claims: T,
+    pub kid: String,
+}
+
 /// The crypto/signing surface the STS needs from the JOSE backend.
 pub trait JoseSigner {
     fn alg(&self) -> &'static str;
@@ -148,6 +155,14 @@ pub fn verify_claims_against_jwks<T: DeserializeOwned>(
     token: &str,
     jwks: &JwksDocument,
 ) -> Result<T, JoseError> {
+    verify_claims_against_jwks_with_header(token, jwks).map(|verified| verified.claims)
+}
+
+/// Verify a compact JWS against a JWKS and return claims plus selected header data.
+pub fn verify_claims_against_jwks_with_header<T: DeserializeOwned>(
+    token: &str,
+    jwks: &JwksDocument,
+) -> Result<VerifiedJws<T>, JoseError> {
     let (header_b64, payload_b64, sig_b64) = RsaJoseSigner::parse_compact_jws(token)?;
     let header_json = URL_SAFE_NO_PAD.decode(header_b64.as_bytes()).map_err(|e| {
         JoseError::new(
@@ -208,7 +223,7 @@ pub fn verify_claims_against_jwks<T: DeserializeOwned>(
             )
         })?;
 
-    Ok(claims)
+    Ok(VerifiedJws { claims, kid: kid.to_string() })
 }
 
 /// Classical RS256 backend; PQC is reserved for a future explicit backend.
@@ -550,5 +565,15 @@ mod tests {
             verify_claims_against_jwks(&token, &signer.public_jwks()).expect("verify");
         assert_eq!(decoded.sub, "user@example.com");
         assert_eq!(decoded.aud, "api://chat-mcp");
+    }
+
+    #[test]
+    fn jwks_verifier_returns_selected_kid_with_claims() {
+        let signer = test_signer();
+        let token = signer.sign_claims(&claims()).expect("sign");
+        let verified: VerifiedJws<MintedClaims> =
+            verify_claims_against_jwks_with_header(&token, &signer.public_jwks()).expect("verify");
+        assert_eq!(verified.kid, "kid-1");
+        assert_eq!(verified.claims.sub, "user@example.com");
     }
 }

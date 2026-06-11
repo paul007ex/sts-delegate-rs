@@ -55,7 +55,7 @@ fn test_state() -> (HttpState, RsaJoseSigner, RsaJoseSigner, RsaJoseSigner) {
     let sts_signer = signer(10, "sts-kid");
     let subject_signer = signer(11, "subject-kid");
     let actor_signer = signer(12, "actor-kid");
-    let client_signer = signer(13, "client-kid");
+    let client_signer = signer(13, "chat-mcp-key-1");
     let mut config = RuntimeConfig::from_source(&ConfigSource::from_pairs([
         ("IDP_ISSUER", "https://issuer.example/oauth2/default"),
         ("EXPECTED_SUBJECT_AUD", "api://obo"),

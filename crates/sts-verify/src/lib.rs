@@ -6,13 +6,14 @@
 //! HTTP-based discovery/JWKS fetchers and JWT verification helpers that the
 //! transport/service layers will call.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sts_jose::{JwksDocument, verify_claims_against_jwks};
+use sts_jose::{JwksDocument, verify_claims_against_jwks, verify_claims_against_jwks_with_header};
 use subtle::ConstantTimeEq;
 
 /// The class of trust anchor being configured.
@@ -161,6 +162,7 @@ pub struct AssertionVerificationOptions<'a> {
     pub max_ttl: i64,
     pub binding_subject_token: Option<&'a str>,
     pub require_subject_binding: bool,
+    pub key_binding_registry: Option<&'a BTreeSet<String>>,
 }
 
 /// Validate an issuer value without making network calls.
@@ -319,8 +321,9 @@ pub fn verify_assertion(
     jwks: &JwksDocument,
     options: AssertionVerificationOptions<'_>,
 ) -> Result<AssertionClaims, VerifyError> {
-    let claims: AssertionClaims =
-        verify_claims_against_jwks(token, jwks).map_err(map_jose_error)?;
+    let verified = verify_claims_against_jwks_with_header::<AssertionClaims>(token, jwks)
+        .map_err(map_jose_error)?;
+    let claims = verified.claims;
     let expected_issuer = validate_issuer(options.expected_issuer).map_err(map_verify_error)?;
     if claims.iss != claims.sub {
         return Err(VerifyError::new(
@@ -342,6 +345,14 @@ pub fn verify_assertion(
             ));
         }
     }
+    if let Some(registry) = options.key_binding_registry
+        && !kid_belongs_to_claimed_identity(&verified.kid, &claims.sub, registry)
+    {
+        return Err(VerifyError::new(
+            VerifyErrorKind::KeyBindingMismatch,
+            "assertion signing key does not belong to the claimed identity",
+        ));
+    }
     validate_time_window(claims.exp, None, options.clock_skew_leeway)?;
     validate_assertion_lifetime(&claims, options.max_ttl, options.clock_skew_leeway)?;
     if options.require_subject_binding {
@@ -355,6 +366,32 @@ pub fn verify_assertion(
         }
     }
     Ok(claims)
+}
+
+fn kid_belongs_to_claimed_identity(
+    kid: &str,
+    claimed_identity: &str,
+    registry: &BTreeSet<String>,
+) -> bool {
+    if kid.is_empty() || claimed_identity.is_empty() {
+        return false;
+    }
+
+    fn prefix_match(kid: &str, identity: &str) -> bool {
+        kid == identity
+            || kid.strip_prefix(identity).is_some_and(|suffix| {
+                suffix.starts_with('-') || suffix.starts_with('/') || suffix.starts_with('.')
+            })
+    }
+
+    if !prefix_match(kid, claimed_identity) {
+        return false;
+    }
+    !registry.iter().any(|other| {
+        other != claimed_identity
+            && other.len() > claimed_identity.len()
+            && prefix_match(kid, other)
+    })
 }
 
 fn validate_time_window(
@@ -537,6 +574,16 @@ mod tests {
         assert_eq!(err.kind, VerifyErrorKind::AnchorCollision);
     }
 
+    #[test]
+    fn key_binding_uses_longest_registered_identity_prefix() {
+        let registry =
+            BTreeSet::from(["svc".to_string(), "svc-staging".to_string(), "chat-mcp".to_string()]);
+        assert!(kid_belongs_to_claimed_identity("svc-key-1", "svc", &registry));
+        assert!(kid_belongs_to_claimed_identity("svc-staging-key-1", "svc-staging", &registry));
+        assert!(!kid_belongs_to_claimed_identity("svc-staging-key-1", "svc", &registry));
+        assert!(!kid_belongs_to_claimed_identity("other-client-key-1", "chat-mcp", &registry));
+    }
+
     #[tokio::test]
     async fn discovery_fetches_jwks_uri_from_local_server() {
         let app = axum::Router::new().route(
@@ -602,6 +649,7 @@ mod tests {
                 max_ttl: 3600,
                 binding_subject_token: Some("subject-token"),
                 require_subject_binding: true,
+                key_binding_registry: None,
             },
         )
         .unwrap();
