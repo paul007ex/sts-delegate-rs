@@ -158,7 +158,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-128 | Full Authorization Server features such as authorization endpoint, revocation, introspection, and registration are non-goals for current STS alpha. | non-goal | implemented | PM/http | Python docs; `README.md:3` | no routes | Future AS expansion requires new milestone. |
 | R-129 | CLI parser, runtime bootstrap, offline smoke, canary config check, public key/JWKS inspection, and file-backed RSA private JWK rotation are shipped. | policy | implemented | cli/ops | `README.md`; `crates/sts-cli/src/main.rs`; issues #20/#28 | `cargo test -p sts-cli` | Rotation stages old public keys for overlap, uses atomic writes, and keeps KMS/HSM/PQC rotation out of scope. |
 | R-130 | Native PQC signing/JWKS/downstream verification is a v2 requirement. | must | implemented-experimental | jose/security | repo instructions; RFC 9964; issue #19 | JOSE and HTTP feature tests | RFC 9964 AKP/ML-DSA is opt-in behind `pqc-aws-lc-unstable`; do not claim stable or FIPS-validated PQC. |
-| R-131 | Live tenant validation must use the configured real Okta trial issuer; `example.com`, `issuer.example`, `sts.example`, and `*.example.*` are fixture-only and must not close readiness issues. | must | partial | tests/security/cli | issue #21; `scripts/real_tenant_endpoint_loop.py`; `crates/sts-cli/src/main.rs`; `/Users/Shared/claude/obo-lab/okta.env` | redaction self-test; FastMCP loops; CLI canary config tests | Rust STS live base remains gated by `CANARY_STS_BASE_URL`. |
+| R-131 | Live tenant validation must use the configured real Okta trial issuer; `example.com`, `issuer.example`, `sts.example`, and `*.example.*` are fixture-only and must not close readiness issues. | must | implemented | tests/security/cli | issue #21; `scripts/real_tenant_endpoint_loop.py`; `crates/sts-cli/src/main.rs`; `/Users/Shared/claude/obo-lab/okta.env` | redaction self-test; FastMCP loops; CLI canary config tests; local Rust STS live-base canary | Rust STS metadata, JWKS, and token endpoint passed against configured real-tenant MCP flows with redacted evidence. |
 | R-132 | Runtime STS issuer values must reject query components, fragment components, and non-loopback HTTP while preserving Python's loopback HTTP dev exception. | must | implemented | config/security | issue #13; Python `tests/test_stress.py:920`; Python `infrastructure/config_env.py:47` | Rust config/verify issuer tests | Canonicalizes trailing slash to keep issuer/audience/metadata stable. |
 
 ## Use Cases
@@ -301,9 +301,9 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | #16 | core/http | Subject auth-context claims needed Python parity | Minted claims | closed | Keep auth-context carry contract test. |
 | #17 | http/parity | Residual Python parity gaps for token form and route errors | Request/error surface | closed | Keep route/error contract tests. |
 | #18 | runtime/security | Production bootstrap now composes config, keys, trust anchors, replay, and startup validation before serving | Runtime startup | closed | Keep bootstrap smoke and fail-closed startup tests in release gates. |
-| #19 | jose/pqc/security | Native PQC signing, JWKS publication, and downstream verification are implemented behind `pqc-aws-lc-unstable` | JOSE/PQC | open | Close after feature-gated tests, docs, and issue evidence land; keep stable-backend/FIPS claims out. |
+| #19 | jose/pqc/security | Native PQC signing, JWKS publication, and downstream verification are implemented behind `pqc-aws-lc-unstable` | JOSE/PQC | closed | Feature-gated tests and docs landed; keep stable-backend/FIPS claims out. |
 | #20 | cli/ops | CLI now has explicit parser, bootstrap, offline smoke, canary config check, and public key/JWKS inspection; rotation split to #28 | CLI/ops | closed | Keep shipped CLI command tests in release gates. |
-| #21 | tests/security | Real Okta proof must not be substituted with synthetic issuer evidence | Live canary | open | Configure Rust STS live base and keep redacted real-tenant evidence green. |
+| #21 | tests/security | Real Okta proof must not be substituted with synthetic issuer evidence | Live canary | closed | Keep redacted real-tenant configured/direct MCP and Rust STS canary evidence green. |
 | #22 | http/ops | Metrics/OpenAPI parity is implemented with curated OpenAPI and opt-in metrics | Metrics/OpenAPI | closed | Keep OpenAPI/docs/metrics contract tests green. |
 | #23 | security/tests | Secure Rust audit loop has normal monitoring plus pinned strict supply-chain tooling/policy; strict mode is green after #27 | Security loop | closed | Keep strict supply-chain gate in release evidence. |
 | #24 | replay/security | Poisoned replay mutex locks could panic instead of failing closed | Replay availability | closed | Keep poisoned-lock fail-closed tests in release gate. |
@@ -317,10 +317,10 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | Python #580 | bug/parity | Empty actor_token is present malformed | Mode dispatch | implemented in Rust contract | Keep #15 both-mode dispatch test in release gate. |
 | Python #602 | bug/parity | DPoP jti/proof anti-DoS and replay key bounds | DPoP/replay | implemented in Rust | Keep DPoP tests. |
 
-## Current Freeze Gaps
+## Current Alpha Boundaries
 
 - Native PQC signing/JWKS/downstream verification is implemented only behind the explicit `pqc-aws-lc-unstable` feature; classical RS256 remains the default (#19).
-- Rust STS live-base canary remains not configured in this environment because `CANARY_STS_BASE_URL` is absent (#21).
+- Real Okta/MCP/Rust STS live-base canary proof is green and redacted; future failures should reopen a focused canary regression issue (#21).
 - Full Authorization Server features remain non-goals for this STS alpha.
 
 ## Executive Conclusion
