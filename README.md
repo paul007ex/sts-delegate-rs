@@ -36,6 +36,46 @@ Required environment includes `IDP_ISSUER` or `OKTA_ISSUER`,
 `IDP_JWKS_URI`/OIDC discovery. `STS_HTTP_ADDR` defaults to
 `127.0.0.1:8888`.
 
+## Install and package locally
+
+For Rust users, run the CLI directly from source:
+
+```bash
+cargo run -p sts-cli -- --help
+```
+
+After runtime configuration is present, run startup checks or the server:
+
+```bash
+cargo run -p sts-cli -- bootstrap-check
+cargo run -p sts-cli -- serve
+```
+
+To build an installable local archive without hosted GitHub Actions:
+
+```bash
+scripts/package_release.sh
+shasum -a 256 -c dist/SHA256SUMS
+tar -tzf dist/sts-cli-*-*.tar.gz
+```
+
+Install the binary from the archive:
+
+```bash
+mkdir -p ~/.local/bin
+tar -xzf dist/sts-cli-*-*.tar.gz -C /tmp
+install -m 0755 /tmp/sts-cli-*-*/sts-cli ~/.local/bin/sts-cli
+sts-cli --help
+```
+
+The local archive contains the `sts-cli` binary plus public README/LICENSE material
+when present. It does not include generated keys, tokens, environment files, or
+runtime policy files. `dist/` is ignored by git.
+
+Hosted release binaries, Docker/GHCR images, Homebrew formulas, `cargo-binstall`,
+and crates.io publication are not shipped in this phase. Track those as separate
+release follow-ups instead of treating local archives as hosted distribution.
+
 The default signing runtime is classical RS256. Experimental ML-DSA signing,
 AKP JWKS publication, and ML-DSA verification can be compiled with
 `pqc-openssl-unstable`; runtime selection then requires a concrete
@@ -87,7 +127,12 @@ separate future work.
 
 ## Release shape
 
-Current releases are source releases from GitHub tags. Workspace crates inherit `publish = false`; crates.io publication is intentionally out of scope until the internal crate graph, package names, and public API stability are ready for an explicit publishing milestone.
+Current releases are source releases from GitHub tags, plus locally reproducible
+`sts-cli` archives from `scripts/package_release.sh`. Hosted GitHub release
+automation is intentionally separate so account/billing limits do not block local
+packaging. Workspace crates inherit `publish = false`; crates.io publication is
+intentionally out of scope until the internal crate graph, package names, and public
+API stability are ready for an explicit publishing milestone.
 
 Release validation currently uses:
 
@@ -95,6 +140,12 @@ Release validation currently uses:
 cargo fmt --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+scripts/package_release.sh
+shasum -a 256 -c dist/SHA256SUMS
 ```
 
-GitHub tag source archives are the release artifacts for this phase. `cargo package --workspace` expects internal workspace crates such as `sts-core` to exist in the crates.io index after Cargo prepares local `path` dependencies for publication. That is not the current release model and remains out of scope until a crates.io publishing milestone is opened.
+GitHub tag source archives and local `dist/` archives are the release artifacts for
+this phase. `cargo package --workspace` expects internal workspace crates such as
+`sts-core` to exist in the crates.io index after Cargo prepares local `path`
+dependencies for publication. That is not the current release model and remains out
+of scope until a crates.io publishing milestone is opened.
