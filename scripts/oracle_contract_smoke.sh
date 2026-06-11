@@ -29,6 +29,7 @@ python_tests=(
   "tests/test_integration.py::test_metadata_is_public_and_get_only"
   "tests/test_integration.py::test_path_bearing_issuer_advertised_endpoints_are_real"
   "tests/test_impersonation.py::test_impersonation_policy_wrong_target"
+  "tests/test_impersonation.py::test_impersonation_policy_wrong_subject"
   "tests/test_dpop.py::test_valid_proof_returns_jkt_and_jti"
   "tests/test_dpop.py::test_dpop_replay_key_is_bounded"
 )

@@ -509,10 +509,23 @@ fn exchange_impersonation(
     let client_claims = exchange
         .client_claims
         .ok_or_else(|| HttpError::invalid_client("impersonation requires client_assertion"))?;
-    if !state.config.impersonation_policy.allowed_clients.contains(&client_claims.sub) {
+    let Some(policy_entry) = state.config.impersonation_policy.clients.get(&client_claims.sub)
+    else {
         return Err(HttpError::invalid_request(format!(
             "impersonation not authorized for client {:?}",
             client_claims.sub
+        )));
+    };
+    if !policy_entry.targets.allows(&exchange.target) {
+        return Err(HttpError::invalid_target(format!(
+            "impersonation to {:?} not authorized for client {:?}",
+            exchange.target, client_claims.sub
+        )));
+    }
+    if !policy_entry.subjects.allows(&exchange.subject_sub) {
+        return Err(HttpError::invalid_request(format!(
+            "impersonation of subject {:?} not authorized for client {:?}",
+            exchange.subject_sub, client_claims.sub
         )));
     }
 
@@ -1063,7 +1076,9 @@ mod tests {
     use rand::{SeedableRng, rngs::StdRng};
     use rsa::RsaPrivateKey;
     use serde_json::Value;
-    use sts_config::{ConfigSource, TokenExchangeMode};
+    use sts_config::{
+        ConfigSource, ImpersonationPolicyEntry, ImpersonationSelector, TokenExchangeMode,
+    };
     use tower::ServiceExt;
 
     #[derive(Debug, Clone, Serialize)]
@@ -1118,6 +1133,16 @@ mod tests {
             ReplayPolicy::in_memory(),
         );
         (state, subject_signer, actor_signer, client_signer)
+    }
+
+    fn allow_impersonation_anywhere(state: &mut HttpState, client_id: &str) {
+        state.config.impersonation_policy.clients.insert(
+            client_id.to_string(),
+            ImpersonationPolicyEntry {
+                targets: ImpersonationSelector::Any,
+                subjects: ImpersonationSelector::Any,
+            },
+        );
     }
 
     async fn read_json(response: Response) -> Value {
@@ -1280,7 +1305,7 @@ mod tests {
     async fn token_route_mints_impersonation_token_without_act() {
         let (mut state, subject_signer, _, client_signer) = test_state();
         state.config.token_exchange_mode = TokenExchangeMode::Impersonation;
-        state.config.impersonation_policy.allowed_clients.insert("chat-mcp".to_string());
+        allow_impersonation_anywhere(&mut state, "chat-mcp");
         let now = unix_now();
         let subject_token = signed_subject_token(&subject_signer, now);
         let client_assertion = signed_assertion(&client_signer, now, "client-jti-impersonation");

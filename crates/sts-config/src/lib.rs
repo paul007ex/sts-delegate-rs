@@ -114,7 +114,28 @@ impl TargetPolicy {
 /// Per-client impersonation authorization policy.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ImpersonationPolicy {
-    pub allowed_clients: BTreeSet<String>,
+    pub clients: BTreeMap<String, ImpersonationPolicyEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImpersonationPolicyEntry {
+    pub targets: ImpersonationSelector,
+    pub subjects: ImpersonationSelector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImpersonationSelector {
+    Any,
+    Values(BTreeSet<String>),
+}
+
+impl ImpersonationSelector {
+    pub fn allows(&self, value: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Values(values) => values.contains(value),
+        }
+    }
 }
 
 /// Raw configuration source.
@@ -259,7 +280,7 @@ impl RuntimeConfig {
             client_ids,
             token_exchange_mode: parse_token_exchange_mode(source)?,
             client_auth_policy: parse_client_auth_policy(source)?,
-            impersonation_policy: parse_impersonation_policy(source),
+            impersonation_policy: parse_impersonation_policy(source)?,
             target_policy: load_target_policy_from_source(source)?,
             sts_signing_alg: source.get("STS_SIGNING_ALG").unwrap_or("").trim().to_string(),
             sts_signing_provider: source
@@ -455,10 +476,20 @@ fn parse_client_auth_policy(source: &ConfigSource) -> Result<ClientAuthPolicy, C
     }
 }
 
-fn parse_impersonation_policy(source: &ConfigSource) -> ImpersonationPolicy {
-    ImpersonationPolicy {
-        allowed_clients: split_csv_set(source.get("IMPERSONATION_POLICY").unwrap_or("")),
-    }
+fn parse_impersonation_policy(source: &ConfigSource) -> Result<ImpersonationPolicy, ConfigError> {
+    let Some(raw) =
+        source.get("IMPERSONATION_POLICY_JSON").map(str::trim).filter(|value| !value.is_empty())
+    else {
+        return Ok(ImpersonationPolicy::default());
+    };
+    let parsed: serde_json::Value = serde_json::from_str(raw).map_err(|err| {
+        ConfigError::new(
+            ConfigErrorKind::InvalidJson,
+            Some("IMPERSONATION_POLICY_JSON".to_string()),
+            format!("impersonation policy JSON could not be parsed: {err}"),
+        )
+    })?;
+    normalize_impersonation_policy(&parsed)
 }
 
 fn parse_log_level(source: &ConfigSource) -> String {
@@ -599,6 +630,65 @@ fn normalize_target_policy(data: &serde_json::Value) -> Result<TargetPolicy, Con
     Ok(TargetPolicy { targets })
 }
 
+fn normalize_impersonation_policy(
+    data: &serde_json::Value,
+) -> Result<ImpersonationPolicy, ConfigError> {
+    let Some(map) = data.as_object() else {
+        return Err(ConfigError::new(
+            ConfigErrorKind::InvalidPolicy,
+            Some("IMPERSONATION_POLICY_JSON".to_string()),
+            "impersonation policy must be a JSON object",
+        ));
+    };
+
+    let mut clients = BTreeMap::new();
+    for (client_id, policy) in map {
+        let Some(entry) = policy.as_object() else {
+            return Err(ConfigError::new(
+                ConfigErrorKind::InvalidPolicy,
+                Some(client_id.to_string()),
+                "impersonation policy entry must be an object",
+            ));
+        };
+        let targets = parse_impersonation_selector(client_id, "targets", entry.get("targets"))?;
+        let subjects = parse_impersonation_selector(client_id, "subjects", entry.get("subjects"))?;
+        clients.insert(client_id.to_string(), ImpersonationPolicyEntry { targets, subjects });
+    }
+    Ok(ImpersonationPolicy { clients })
+}
+
+fn parse_impersonation_selector(
+    client_id: &str,
+    field: &str,
+    value: Option<&serde_json::Value>,
+) -> Result<ImpersonationSelector, ConfigError> {
+    let Some(value) = value else {
+        return Ok(ImpersonationSelector::Values(BTreeSet::new()));
+    };
+    if value.as_str() == Some("*") {
+        return Ok(ImpersonationSelector::Any);
+    }
+    let Some(values) = value.as_array() else {
+        return Err(ConfigError::new(
+            ConfigErrorKind::InvalidPolicy,
+            Some(client_id.to_string()),
+            format!("impersonation policy {field} must be a JSON array of strings or \"*\""),
+        ));
+    };
+    let mut parsed = BTreeSet::new();
+    for item in values {
+        let Some(item) = item.as_str() else {
+            return Err(ConfigError::new(
+                ConfigErrorKind::InvalidPolicy,
+                Some(client_id.to_string()),
+                format!("impersonation policy {field} must contain only strings"),
+            ));
+        };
+        parsed.insert(item.to_string());
+    }
+    Ok(ImpersonationSelector::Values(parsed))
+}
+
 fn parse_scopes(
     aud: &str,
     key: &str,
@@ -665,6 +755,40 @@ mod tests {
             ),
         ]);
         let err = load_target_policy_from_source(&source).unwrap_err();
+        assert_eq!(err.kind, ConfigErrorKind::InvalidPolicy);
+    }
+
+    #[test]
+    fn impersonation_policy_parses_targets_and_subjects() {
+        let source = ConfigSource::from_pairs([(
+            "IMPERSONATION_POLICY_JSON",
+            r#"{"chat-mcp":{"targets":["api://tool"],"subjects":["alice@example.com"]}}"#,
+        )]);
+        let policy = parse_impersonation_policy(&source).expect("policy");
+        let entry = policy.clients.get("chat-mcp").expect("entry");
+        assert!(entry.targets.allows("api://tool"));
+        assert!(!entry.targets.allows("api://other"));
+        assert!(entry.subjects.allows("alice@example.com"));
+        assert!(!entry.subjects.allows("bob@example.com"));
+    }
+
+    #[test]
+    fn impersonation_policy_parses_star_subjects() {
+        let source = ConfigSource::from_pairs([(
+            "IMPERSONATION_POLICY_JSON",
+            r#"{"chat-mcp":{"targets":["api://tool"],"subjects":"*"}}"#,
+        )]);
+        let policy = parse_impersonation_policy(&source).expect("policy");
+        let entry = policy.clients.get("chat-mcp").expect("entry");
+        assert!(entry.targets.allows("api://tool"));
+        assert!(entry.subjects.allows("anyone@example.com"));
+    }
+
+    #[test]
+    fn impersonation_policy_rejects_invalid_entry_type() {
+        let source =
+            ConfigSource::from_pairs([("IMPERSONATION_POLICY_JSON", r#"{"chat-mcp":"bad"}"#)]);
+        let err = parse_impersonation_policy(&source).unwrap_err();
         assert_eq!(err.kind, ConfigErrorKind::InvalidPolicy);
     }
 

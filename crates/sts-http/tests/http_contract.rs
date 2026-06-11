@@ -10,7 +10,9 @@ use rand::{SeedableRng, rngs::StdRng};
 use rsa::RsaPrivateKey;
 use serde::Serialize;
 use serde_json::{Value, json};
-use sts_config::{ConfigSource, RuntimeConfig, TokenExchangeMode};
+use sts_config::{
+    ConfigSource, ImpersonationPolicyEntry, ImpersonationSelector, RuntimeConfig, TokenExchangeMode,
+};
 use sts_core::{ACCESS_TOKEN_TYPE, JWT_TOKEN_TYPE, TOKEN_EXCHANGE_GRANT_TYPE};
 use sts_http::{HttpState, router};
 use sts_jose::{JoseSigner, RsaJoseSigner};
@@ -84,6 +86,16 @@ fn path_bearing_state() -> HttpState {
     let (mut state, _, _, _) = test_state();
     state.config.our_issuer = "https://sts.example/tenant1".to_string();
     state
+}
+
+fn allow_impersonation_anywhere(state: &mut HttpState, client_id: &str) {
+    state.config.impersonation_policy.clients.insert(
+        client_id.to_string(),
+        ImpersonationPolicyEntry {
+            targets: ImpersonationSelector::Any,
+            subjects: ImpersonationSelector::Any,
+        },
+    );
 }
 
 fn unix_now() -> i64 {
@@ -649,7 +661,7 @@ async fn contract_requested_token_type_matches_python_oracle() {
 async fn contract_impersonation_omits_act_claim() {
     let (mut state, subject_signer, _, client_signer) = test_state();
     state.config.token_exchange_mode = TokenExchangeMode::Impersonation;
-    state.config.impersonation_policy.allowed_clients.insert("chat-mcp".to_string());
+    allow_impersonation_anywhere(&mut state, "chat-mcp");
     let now = unix_now();
     let subject_token = signed_subject_token(&subject_signer, now);
     let client_assertion = signed_assertion(&client_signer, now, "client-contract-1");
@@ -679,7 +691,7 @@ async fn contract_impersonation_omits_act_claim() {
 async fn contract_dpop_impersonation_binds_token_without_act_claim() {
     let (mut state, subject_signer, _, client_signer) = test_state();
     state.config.token_exchange_mode = TokenExchangeMode::Impersonation;
-    state.config.impersonation_policy.allowed_clients.insert("chat-mcp".to_string());
+    allow_impersonation_anywhere(&mut state, "chat-mcp");
     let now = unix_now();
     let subject_token = signed_subject_token(&subject_signer, now);
     let client_assertion = signed_assertion(&client_signer, now, "client-dpop-contract-1");
@@ -707,6 +719,63 @@ async fn contract_dpop_impersonation_binds_token_without_act_claim() {
     assert_eq!(payload["client_id"], "chat-mcp");
     assert!(payload.get("act").is_none(), "impersonation must omit act");
     assert!(payload["cnf"]["jkt"].as_str().is_some_and(|value| !value.is_empty()));
+}
+
+#[tokio::test]
+async fn contract_impersonation_policy_rejects_wrong_target_and_subject() {
+    let (mut state, subject_signer, _, client_signer) = test_state();
+    state.config.token_exchange_mode = TokenExchangeMode::Impersonation;
+    state.config.impersonation_policy.clients.insert(
+        "chat-mcp".to_string(),
+        ImpersonationPolicyEntry {
+            targets: ImpersonationSelector::Values(["api://other".to_string()].into()),
+            subjects: ImpersonationSelector::Any,
+        },
+    );
+    let now = unix_now();
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let client_assertion = signed_assertion(&client_signer, now, "client-wrong-target");
+    let wrong_target_body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+        ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+        ("client_assertion", client_assertion.as_str()),
+        ("client_id", "chat-mcp"),
+    ])
+    .expect("form");
+
+    let response = post_token_form(state.clone(), wrong_target_body).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_target");
+
+    state.config.impersonation_policy.clients.insert(
+        "chat-mcp".to_string(),
+        ImpersonationPolicyEntry {
+            targets: ImpersonationSelector::Any,
+            subjects: ImpersonationSelector::Values(["allowed@example.com".to_string()].into()),
+        },
+    );
+    let client_assertion = signed_assertion(&client_signer, now, "client-wrong-subject");
+    let wrong_subject_body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+        ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+        ("client_assertion", client_assertion.as_str()),
+        ("client_id", "chat-mcp"),
+    ])
+    .expect("form");
+
+    let response = post_token_form(state, wrong_subject_body).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_request");
 }
 
 #[tokio::test]
