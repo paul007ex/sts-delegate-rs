@@ -198,9 +198,9 @@ pub fn downscope(
 
     if let Some(subject) = subject_scopes {
         let subject_scopes = split_scopes(Some(subject));
-        let subject_intersection = intersect_scopes(&result, &subject_scopes);
-        if subject_scope_bound_required || !subject_scopes.is_empty() {
-            result = subject_intersection;
+        let subject_target_intersection = intersect_scopes(&target_allowed, &subject_scopes);
+        if subject_scope_bound_required || !subject_target_intersection.is_empty() {
+            result = intersect_scopes(&result, &subject_target_intersection);
         }
     }
 
@@ -351,6 +351,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "chat.read");
+    }
+
+    #[test]
+    fn downscope_default_preserves_target_scopes_for_oidc_only_subject_scopes() {
+        let out = downscope(
+            Some("chat.read"),
+            "chat.read chat.admin",
+            Some("offline_access profile openid email"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(out, "chat.read");
+    }
+
+    #[test]
+    fn downscope_strict_requires_subject_tool_scope_overlap() {
+        let err = downscope(
+            Some("chat.read"),
+            "chat.read chat.admin",
+            Some("offline_access profile openid email"),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, CoreErrorKind::InvalidScope);
     }
 
     #[test]
