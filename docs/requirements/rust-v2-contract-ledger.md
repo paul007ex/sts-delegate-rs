@@ -100,7 +100,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-070 | Nested incoming `act` chains must be preserved when building delegation `act`. | must | implemented | core | RFC 8693 Section 4.1; `crates/sts-core/src/lib.rs:217` | `build_act_nests_prior_chain` | Full incoming nested-chain verification remains partial. |
 | R-071 | `client_id` in delegation mode equals the actor identity. | policy | implemented | core/http | Python `domain/payload.py:39`; HTTP tests | delegation contract test | Multiple actors require correct one. |
 | R-072 | `client_id` in impersonation mode equals authenticated private_key_jwt client. | policy | implemented | http/core | issue #12; Python `tests/test_impersonation.py:299` | impersonation contract tests | Actor-token-only cannot impersonate. |
-| R-073 | Optional auth-context claims `auth_time`, `acr`, and `amr` are copied when present and omitted when absent. | must | partial | core/http | Python `domain/payload.py:18`; Python `tests/test_integration.py:232` | core omits absent | Rust carry-forward not fully wired. |
+| R-073 | Optional auth-context claims `auth_time`, `acr`, and `amr` are copied when present and omitted when absent. | must | implemented | core/http | Python `domain/payload.py:18`; Python `tests/test_integration.py:232` | `contract_auth_context_claims_carry_from_subject_token_when_present` | Present claims carry forward; absent claims are not synthesized. |
 | R-074 | Minted token `exp` must be no later than now + configured scoped token TTL. | must | implemented | http/core | `crates/sts-http/src/lib.rs`; Python `domain/payload.py:28` | HTTP tests | TTL defaults to 300. |
 | R-075 | Minted token `exp` must not outlive the subject token. | must | implemented | http/core | Python `tests/test_integration.py:678`; Python `domain/payload.py:28` | `contract_delegation_lifetime_is_capped_by_subject_and_actor_exp` | Covers delegation and impersonation subject cap. |
 | R-076 | Delegation minted token `exp` must not outlive the actor token. | must | implemented | http/core | Python `tests/test_integration.py:693`; Python `domain/payload.py:28` | `contract_delegation_lifetime_is_capped_by_subject_and_actor_exp` | Actor cap is delegation-specific. |
@@ -241,7 +241,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | E-11 | Missing impersonation policy selector field | empty set, deny | Rust config | R-098 |
 | E-12 | Impersonation selector `"*"` | any for that selector | Rust/Python config tests | R-101 |
 | E-13 | Empty present actor_token in both mode | malformed, not impersonation | Python impersonation; Rust HTTP contract | R-097 |
-| E-14 | Auth-context absent | omit `auth_time`, `acr`, `amr` | Python integration; Rust core | R-073 |
+| E-14 | Auth-context absent | omit `auth_time`, `acr`, `amr` | Python integration; Rust HTTP contract | R-073 |
 | E-15 | Subject expires before default TTL | cap minted exp and expires_in | Python integration | R-075, R-077 |
 | E-16 | Actor expires before default TTL | cap minted exp | Python integration | R-076 |
 | E-17 | DPoP htm lower-case `post` | accept | Rust/Python DPoP | R-113 |

@@ -30,6 +30,19 @@ struct SubjectWireClaims {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct SubjectAuthContextWireClaims {
+    iss: String,
+    sub: String,
+    aud: String,
+    scope: String,
+    exp: i64,
+    iat: i64,
+    auth_time: i64,
+    acr: String,
+    amr: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct AssertionWireClaims {
     iss: String,
     sub: String,
@@ -138,6 +151,22 @@ fn signed_subject_token_with_exp_delta(signer: &RsaJoseSigner, now: i64, exp_del
             scope: "chat.read chat.write".to_string(),
             exp: now + exp_delta,
             iat: now,
+        })
+        .expect("subject token")
+}
+
+fn signed_subject_token_with_auth_context(signer: &RsaJoseSigner, now: i64) -> String {
+    signer
+        .sign_json_claims(&SubjectAuthContextWireClaims {
+            iss: "https://issuer.example/oauth2/default".to_string(),
+            sub: "alice@example.com".to_string(),
+            aud: "api://obo".to_string(),
+            scope: "chat.read chat.write".to_string(),
+            exp: now + 600,
+            iat: now,
+            auth_time: now - 120,
+            acr: "urn:mace:incommon:iap:silver".to_string(),
+            amr: vec!["mfa".to_string(), "otp".to_string()],
         })
         .expect("subject token")
 }
@@ -689,6 +718,55 @@ async fn contract_delegation_token_matches_python_oracle_wire_shape() {
     assert_eq!(payload["client_id"], "chat-mcp");
     assert_eq!(payload["act"], json!({"sub": "chat-mcp"}));
     assert!(payload.get("cnf").is_none());
+    assert!(payload.get("auth_time").is_none());
+    assert!(payload.get("acr").is_none());
+    assert!(payload.get("amr").is_none());
+}
+
+#[tokio::test]
+async fn contract_auth_context_claims_carry_from_subject_token_when_present() {
+    let (state, subject_signer, actor_signer, _) = test_state();
+    let now = unix_now();
+    let subject_token = signed_subject_token_with_auth_context(&subject_signer, now);
+    let actor_token = signed_assertion(&actor_signer, now, "actor-auth-context-present");
+    let body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", actor_token.as_str()),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+    ])
+    .expect("form");
+
+    let response = post_token_form(state.clone(), body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = read_json(response).await;
+    let token = response_body["access_token"].as_str().expect("access token");
+    let payload = jwt_segment(token, 1);
+    assert_eq!(payload["auth_time"], now - 120);
+    assert_eq!(payload["acr"], "urn:mace:incommon:iap:silver");
+    assert_eq!(payload["amr"], json!(["mfa", "otp"]));
+
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let actor_token = signed_assertion(&actor_signer, now, "actor-auth-context-absent");
+    let body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", actor_token.as_str()),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+    ])
+    .expect("form");
+
+    let response = post_token_form(state, body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = read_json(response).await;
+    let token = response_body["access_token"].as_str().expect("access token");
+    let payload = jwt_segment(token, 1);
     assert!(payload.get("auth_time").is_none());
     assert!(payload.get("acr").is_none());
     assert!(payload.get("amr").is_none());
