@@ -35,16 +35,17 @@ use sts_core::{
 use sts_dpop::{
     DPOP_SIGNING_ALGS_SUPPORTED, DpopBinding, DpopError, DpopProofRequest, validate_dpop_proof,
 };
-#[cfg(feature = "pqc-aws-lc-unstable")]
+#[cfg(feature = "pqc-openssl-unstable")]
 use sts_jose::MlDsaJoseSigner;
 use sts_jose::{
     BackendSelection, JoseError, JoseSigner, JwksDocument, PublicJwk, RsaJoseSigner,
-    rsa_public_key_bits_from_jwk, supported_jws_signing_algs, validate_public_jwk,
+    rsa_public_key_bits_from_jwk, validate_public_jwk,
 };
 use sts_replay::{InMemoryReplayStore, ReplayErrorKind, ReplayPolicy, dpop_replay_key};
 use sts_verify::{
     AssertionClaims, AssertionVerificationOptions, SubjectTokenClaims, VerifyError,
-    VerifyErrorKind, resolve_idp_jwks, verify_assertion, verify_subject_token,
+    VerifyErrorKind, inbound_jwt_signing_algs, resolve_idp_jwks, verify_assertion,
+    verify_subject_token,
 };
 use url::Url;
 
@@ -403,7 +404,7 @@ fn load_signer(config: &RuntimeConfig) -> Result<Arc<dyn JoseSigner>, BootstrapE
     Ok(Arc::new(signer))
 }
 
-#[cfg(feature = "pqc-aws-lc-unstable")]
+#[cfg(feature = "pqc-openssl-unstable")]
 fn load_pqc_signer(
     selection: &BackendSelection,
     raw: &str,
@@ -420,7 +421,7 @@ fn load_pqc_signer(
     Ok(Arc::new(signer))
 }
 
-#[cfg(not(feature = "pqc-aws-lc-unstable"))]
+#[cfg(not(feature = "pqc-openssl-unstable"))]
 fn load_pqc_signer(
     selection: &BackendSelection,
     _raw: &str,
@@ -797,7 +798,7 @@ async fn metadata(State(state): State<HttpState>) -> impl IntoResponse {
         response_types_supported: Vec::new(),
         grant_types_supported: vec![TOKEN_EXCHANGE_GRANT_TYPE.to_string()],
         token_endpoint_auth_methods_supported: vec!["private_key_jwt".to_string()],
-        token_endpoint_auth_signing_alg_values_supported: supported_jws_signing_algs(),
+        token_endpoint_auth_signing_alg_values_supported: inbound_jwt_signing_algs(),
         dpop_signing_alg_values_supported: DPOP_SIGNING_ALGS_SUPPORTED
             .iter()
             .map(|alg| (*alg).to_string())
@@ -1655,7 +1656,7 @@ mod tests {
         .to_string()
     }
 
-    #[cfg(feature = "pqc-aws-lc-unstable")]
+    #[cfg(feature = "pqc-openssl-unstable")]
     fn mldsa_private_jwk(seed: [u8; 32], kid: &str) -> String {
         let signer = sts_jose::MlDsaJoseSigner::from_seed_for_tests(
             sts_jose::MlDsaAlgorithm::MlDsa65,
@@ -1764,7 +1765,7 @@ mod tests {
         assert!(err.to_string().contains("private JWK member"));
     }
 
-    #[cfg(feature = "pqc-aws-lc-unstable")]
+    #[cfg(feature = "pqc-openssl-unstable")]
     #[tokio::test]
     async fn bootstrap_loads_feature_gated_mldsa_signer() {
         let dir = temp_bootstrap_dir("mldsa-key");

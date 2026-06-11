@@ -39,8 +39,8 @@ STRICT_SUPPLY_CHAIN_TIMEOUT_SECONDS = 180
 ALLOWED_DUPLICATE_DEPENDENCIES = {
     "untrusted": (
         "aws-lc-rs 1.17 uses untrusted 0.7 via ring-io while rustls-webpki "
-        "0.103 uses untrusted 0.9; both are required by the selected AWS-LC "
-        "JOSE provider plus rustls verifier stack"
+        "0.103 uses untrusted 0.9; both are required by the RS256/jsonwebtoken "
+        "path plus rustls verifier stack"
     ),
 }
 

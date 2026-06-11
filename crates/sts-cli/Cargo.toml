@@ -10,7 +10,7 @@ version.workspace = true
 
 [features]
 default = []
-pqc-aws-lc-unstable = ["sts-http/pqc-aws-lc-unstable", "sts-jose/pqc-aws-lc-unstable"]
+pqc-openssl-unstable = ["sts-http/pqc-openssl-unstable", "sts-jose/pqc-openssl-unstable"]
 
 [dependencies]
 base64 = "0.22"

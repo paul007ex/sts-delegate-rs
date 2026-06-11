@@ -1,6 +1,6 @@
 # sts-delegate-rs
 
-Rust-native successor to `sts-delegate`: an OAuth 2.1 / RFC 8693 security token service with explicit crate boundaries, contract-first migration from the Python oracle, classical RS256 signing by default, and opt-in RFC 9964 ML-DSA support behind an explicit experimental feature gate.
+Rust-native successor to `sts-delegate`: an RFC 8693 token-exchange STS with OAuth 2.1-aligned token-endpoint behavior where applicable, explicit crate boundaries, contract-first migration from the Python oracle, classical RS256 signing by default, and opt-in RFC 9964 ML-DSA support behind an explicit experimental feature gate.
 
 ## Workspace shape
 
@@ -38,11 +38,11 @@ Required environment includes `IDP_ISSUER` or `OKTA_ISSUER`,
 
 The default signing runtime is classical RS256. Experimental ML-DSA signing,
 AKP JWKS publication, and ML-DSA verification can be compiled with
-`pqc-aws-lc-unstable`; runtime selection then requires a concrete
+`pqc-openssl-unstable`; runtime selection then requires a concrete
 `STS_SIGNING_ALG` such as `ML-DSA-65` and an RFC 9964 AKP private JWK seed file
 with matching public material. The published JWKS contains only public `AKP`
 members (`kty`, `kid`, `use`, `alg`, `pub`) and never `priv`. This path uses
-AWS-LC's unstable ML-DSA API and is not a FIPS-validation claim.
+OpenSSL 3.5+ ML-DSA through `openssl-rs` and is not a FIPS-validation claim.
 
 ## HTTP Ops
 

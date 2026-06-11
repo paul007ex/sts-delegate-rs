@@ -29,7 +29,6 @@ allow-workspace = true
 
 deny = [
     { crate = "native-tls", reason = "Use rustls/aws-lc unless a dedicated issue accepts native TLS." },
-    { crate = "openssl", reason = "Use rustls/aws-lc unless a dedicated issue accepts OpenSSL." },
 ]
 
 [sources]

@@ -13,7 +13,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sts_jose::{JwksDocument, verify_claims_against_jwks, verify_claims_against_jwks_with_header};
+use sts_jose::{JwksDocument, verify_claims_against_jwks_with_allowed_algs};
 use subtle::ConstantTimeEq;
 use url::{Host, Url};
 
@@ -164,6 +164,13 @@ pub struct AssertionVerificationOptions<'a> {
     pub binding_subject_token: Option<&'a str>,
     pub require_subject_binding: bool,
     pub key_binding_registry: Option<&'a BTreeSet<String>>,
+}
+
+const INBOUND_JWT_SIGNING_ALGS: &[&str] = &["RS256"];
+
+/// Algorithms accepted for inbound subject, actor, and client assertion JWTs.
+pub fn inbound_jwt_signing_algs() -> Vec<String> {
+    INBOUND_JWT_SIGNING_ALGS.iter().map(|alg| (*alg).to_string()).collect()
 }
 
 /// Validate an issuer value without making network calls.
@@ -349,7 +356,9 @@ pub fn verify_subject_token(
     clock_skew_leeway: i64,
 ) -> Result<SubjectTokenClaims, VerifyError> {
     let claims: SubjectTokenClaims =
-        verify_claims_against_jwks(token, jwks).map_err(map_jose_error)?;
+        verify_claims_against_jwks_with_allowed_algs(token, jwks, INBOUND_JWT_SIGNING_ALGS)
+            .map_err(map_jose_error)?
+            .claims;
     let expected_issuer = validate_issuer(expected_issuer).map_err(map_verify_error)?;
     if claims.iss != expected_issuer {
         return Err(VerifyError::new(
@@ -368,8 +377,12 @@ pub fn verify_assertion(
     jwks: &JwksDocument,
     options: AssertionVerificationOptions<'_>,
 ) -> Result<AssertionClaims, VerifyError> {
-    let verified = verify_claims_against_jwks_with_header::<AssertionClaims>(token, jwks)
-        .map_err(map_jose_error)?;
+    let verified = verify_claims_against_jwks_with_allowed_algs::<AssertionClaims>(
+        token,
+        jwks,
+        INBOUND_JWT_SIGNING_ALGS,
+    )
+    .map_err(map_jose_error)?;
     let claims = verified.claims;
     let expected_issuer = validate_issuer(options.expected_issuer).map_err(map_verify_error)?;
     if claims.iss != claims.sub {
