@@ -80,6 +80,12 @@ fn test_state() -> (HttpState, RsaJoseSigner, RsaJoseSigner, RsaJoseSigner) {
     (state, subject_signer, actor_signer, client_signer)
 }
 
+fn path_bearing_state() -> HttpState {
+    let (mut state, _, _, _) = test_state();
+    state.config.our_issuer = "https://sts.example/tenant1".to_string();
+    state
+}
+
 fn unix_now() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
@@ -118,6 +124,20 @@ async fn read_json(response: Response<Body>) -> Value {
 
 async fn post_token_form(state: HttpState, body: String) -> Response<Body> {
     post_token_form_with_dpop_values(state, body, &[]).await
+}
+
+async fn post_form_to_uri(state: HttpState, uri: &str, body: String) -> Response<Body> {
+    router(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
 }
 
 async fn post_token_raw(
@@ -326,6 +346,102 @@ async fn contract_discovery_and_jwks_match_python_oracle_shape() {
     for private_member in ["d", "p", "q", "dp", "dq", "qi"] {
         assert!(key.get(private_member).is_none(), "JWKS leaked {private_member}");
     }
+}
+
+#[tokio::test]
+async fn contract_path_bearing_issuer_advertised_endpoints_are_live() {
+    let state = path_bearing_state();
+    let app = router(state.clone());
+
+    let metadata_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/.well-known/oauth-authorization-server/tenant1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(metadata_response.status(), StatusCode::OK);
+    let metadata = read_json(metadata_response).await;
+    assert_eq!(metadata["issuer"], "https://sts.example/tenant1");
+    assert_eq!(metadata["token_endpoint"], "https://sts.example/tenant1/token");
+    assert_eq!(metadata["jwks_uri"], "https://sts.example/tenant1/jwks");
+
+    let jwks_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/tenant1/jwks")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(jwks_response.status(), StatusCode::OK);
+    assert_eq!(
+        jwks_response.headers().get(CACHE_CONTROL).and_then(|value| value.to_str().ok()),
+        Some("public, max-age=300")
+    );
+    let jwks = read_json(jwks_response).await;
+    assert_eq!(jwks["keys"][0]["kid"], "sts-kid");
+
+    let token_response =
+        post_form_to_uri(state.clone(), "/tenant1/token", "grant_type=x".to_string()).await;
+    assert_ne!(token_response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        token_response.headers().get(CACHE_CONTROL).and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        token_response.headers().get(PRAGMA).and_then(|value| value.to_str().ok()),
+        Some("no-cache")
+    );
+    let token_error = read_json(token_response).await;
+    assert_eq!(token_error["error"], "unsupported_grant_type");
+
+    let root_jwks_response = router(state.clone())
+        .oneshot(Request::builder().method(Method::GET).uri("/jwks").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(root_jwks_response.status(), StatusCode::OK);
+
+    let root_token_response = post_form_to_uri(state, "/token", "grant_type=x".to_string()).await;
+    assert_ne!(root_token_response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn contract_metadata_is_public_and_get_only() {
+    let (state, _, _, _) = test_state();
+
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/.well-known/oauth-authorization-server")
+                .header(AUTHORIZATION, "Bearer ignored")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/.well-known/oauth-authorization-server")
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("grant_type=x"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
 
 #[tokio::test]
