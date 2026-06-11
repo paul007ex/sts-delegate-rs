@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// The token-exchange grant type URN.
 pub const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 
@@ -17,7 +19,7 @@ pub const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_tok
 pub const JWT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:jwt";
 
 /// The minimum public contract shape for a token-exchange request.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ExchangeRequest {
     pub grant_type: String,
     pub subject_token: String,
@@ -34,7 +36,7 @@ pub struct ExchangeRequest {
 }
 
 /// The delegation marker that rides inside a minted token.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActClaim {
     pub sub: String,
     pub iss: Option<String>,
@@ -42,7 +44,7 @@ pub struct ActClaim {
 }
 
 /// The minted claim contract the STS must preserve.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MintedClaims {
     pub iss: String,
     pub sub: String,
@@ -133,6 +135,11 @@ impl fmt::Display for CoreError {
 impl std::error::Error for CoreError {}
 
 /// Resolve the target audience from `audience` / `resource`.
+///
+/// RFC 8693 defines both `audience` and `resource` as request inputs. This
+/// function is the local normalization gate: it accepts either parameter and,
+/// when both are present, requires them to agree so the token is minted for one
+/// downstream target only.
 pub fn resolve_target(audience: Option<&str>, resource: Option<&str>) -> Result<String, CoreError> {
     match (audience, resource) {
         (Some(aud), None) => validate_target_value(aud),
@@ -156,6 +163,11 @@ pub fn resolve_target(audience: Option<&str>, resource: Option<&str>) -> Result<
 }
 
 /// Downscope a requested scope against target and subject limits.
+///
+/// This is local authorization-policy logic layered on top of RFC 8693 token
+/// exchange. The RFC defines token exchange and its delegation semantics; this
+/// crate keeps the issued scope no broader than the deployment allowlist and any
+/// subject-scoped bound that the caller enabled.
 pub fn downscope(
     requested: Option<&str>,
     target_allowed: &str,
@@ -185,11 +197,19 @@ pub fn downscope(
 }
 
 /// Build the RFC 8693 `act` claim.
+///
+/// RFC 8693 §4.1 defines `act` as the actor claim used to express delegation.
+/// The nested shape preserves prior actors when the caller is already acting
+/// through another actor.
 pub fn build_act(actor_sub: impl Into<String>, prior_act: Option<ActClaim>) -> ActClaim {
     ActClaim { sub: actor_sub.into(), iss: None, act: prior_act.map(Box::new) }
 }
 
 /// Build the minted payload while preserving the contract shape.
+///
+/// The top-level claim set follows the JWT access-token profile (RFC 9068) and
+/// the token-exchange actor/client fields from RFC 8693 §4.3. The `cnf_jkt`
+/// field is the local sender-constraining hook used by the DPoP lane.
 #[allow(clippy::too_many_arguments)]
 pub fn build_scoped_payload(
     iss: impl Into<String>,
@@ -329,7 +349,7 @@ mod tests {
             Some(build_act("chat-mcp", None)),
             Some("thumbprint".to_string()),
         );
-        let value = serde_json::to_value(&payload_to_json(&payload)).unwrap();
+        let value = serde_json::to_value(payload_to_json(&payload)).unwrap();
         assert_eq!(value["sub"], "user@example.com");
         assert_eq!(value["act"]["sub"], "chat-mcp");
         assert_eq!(value["client_id"], "chat-mcp");
@@ -337,7 +357,7 @@ mod tests {
     }
 
     fn payload_to_json(payload: &MintedClaims) -> serde_json::Value {
-        let act = payload.act.as_ref().map(|act| act_to_json(act));
+        let act = payload.act.as_ref().map(act_to_json);
         serde_json::json!({
             "iss": payload.iss,
             "sub": payload.sub,
