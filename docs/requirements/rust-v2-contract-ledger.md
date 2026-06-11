@@ -67,7 +67,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-037 | `/token` must reject Authorization header client auth and direct callers to private_key_jwt. | policy | implemented | http/client-auth | `crates/sts-http/src/lib.rs:350`; issue #4 | `contract_authorization_header_client_auth_is_rejected` | Preserve WWW-Authenticate scheme. |
 | R-038 | `/token` responses and errors must include `Cache-Control: no-store` and `Pragma: no-cache`. | must | implemented | http | RFC 6749 Section 5.1; Python `tests/test_integration.py:550`; `crates/sts-http/src/lib.rs:267` | token/error contract tests | Metadata/JWKS are public-cacheable. |
 | R-039 | OAuth error responses must be JSON and include stable `error` and `error_description` when OAuth-shaped. | must | implemented | http | RFC 6749 Section 5.2; `crates/sts-http/src/lib.rs:282` | HTTP contract tests | Service-unavailable may omit OAuth `error`. |
-| R-040 | Unexpected internal failures must map to clean `server_error` without leaking internal detail. | must | open | http | Python `tests/test_integration.py:732` | missing Rust test | Add catch-all/panic-safe HTTP test. |
+| R-040 | Unexpected internal failures must map to clean `server_error` without leaking internal detail. | must | implemented | http | Python `tests/test_integration.py:732` | `contract_unexpected_signing_failure_is_clean_server_error` | Signing backend failures return sanitized 500 JSON. |
 | R-041 | Old `/exchange` route must remain absent. | must-not | implemented | http | Python `tests/test_integration.py:751`; issue #17 | `contract_exchange_route_remains_absent` | `/token` is the only token-exchange route. |
 | R-042 | Interactive docs must be off by default if/when served. | policy | open | http/ops | Python `transport.py:78` | missing Rust scope | Rust has no docs UI yet. |
 | R-043 | OpenAPI, if shipped, must be curated and drift-checked. | policy | missing | http/docs | Python `transport.py:78` | no Rust OpenAPI | Future issue needed before full HTTP release. |
@@ -304,7 +304,6 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 
 ## Current Freeze Gaps
 
-- Rust still needs an explicit catch-all clean 500 test for unexpected HTTP failures.
 - Native PQC signing/JWKS/downstream verification is missing; only fail-closed selection is shipped.
 - CLI/ops helpers are only a crate boundary, not a complete product surface.
 - Full Authorization Server features remain non-goals for this STS alpha.

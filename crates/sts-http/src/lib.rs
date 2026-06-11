@@ -31,7 +31,7 @@ use sts_core::{
 use sts_dpop::{
     DPOP_SIGNING_ALGS_SUPPORTED, DpopBinding, DpopError, DpopProofRequest, validate_dpop_proof,
 };
-use sts_jose::{JoseSigner, JwksDocument, RsaJoseSigner};
+use sts_jose::{JoseSigner, JwksDocument};
 use sts_replay::{ReplayErrorKind, ReplayPolicy, dpop_replay_key};
 use sts_verify::{
     AssertionClaims, AssertionVerificationOptions, SubjectTokenClaims, VerifyError,
@@ -62,7 +62,7 @@ struct VerifiedExchange {
 #[derive(Clone)]
 pub struct HttpState {
     pub config: RuntimeConfig,
-    pub signer: RsaJoseSigner,
+    pub signer: Arc<dyn JoseSigner>,
     pub subject_jwks: JwksDocument,
     pub actor_jwks: JwksDocument,
     pub client_jwks: JwksDocument,
@@ -70,15 +70,25 @@ pub struct HttpState {
 }
 
 impl HttpState {
-    pub fn new(
+    pub fn new<S>(
         config: RuntimeConfig,
-        signer: RsaJoseSigner,
+        signer: S,
         subject_jwks: JwksDocument,
         actor_jwks: JwksDocument,
         client_jwks: JwksDocument,
         replay: ReplayPolicy,
-    ) -> Self {
-        Self { config, signer, subject_jwks, actor_jwks, client_jwks, replay: Arc::new(replay) }
+    ) -> Self
+    where
+        S: JoseSigner + 'static,
+    {
+        Self {
+            config,
+            signer: Arc::new(signer),
+            subject_jwks,
+            actor_jwks,
+            client_jwks,
+            replay: Arc::new(replay),
+        }
     }
 
     fn token_endpoint(&self) -> String {
@@ -480,9 +490,10 @@ fn exchange_delegation(
     payload.acr = exchange.subject_claims.acr.clone();
     payload.amr = exchange.subject_claims.amr.clone().unwrap_or_default();
 
-    let access_token = state.signer.sign_claims(&payload).map_err(|err| {
-        HttpError::server_error(format!("failed to sign scoped token: {}", err.message))
-    })?;
+    let access_token = state
+        .signer
+        .sign_claims(&payload)
+        .map_err(|_| HttpError::server_error("internal error"))?;
 
     Ok((
         token_headers(),
@@ -554,9 +565,10 @@ fn exchange_impersonation(
     payload.acr = exchange.subject_claims.acr.clone();
     payload.amr = exchange.subject_claims.amr.clone().unwrap_or_default();
 
-    let access_token = state.signer.sign_claims(&payload).map_err(|err| {
-        HttpError::server_error(format!("failed to sign scoped token: {}", err.message))
-    })?;
+    let access_token = state
+        .signer
+        .sign_claims(&payload)
+        .map_err(|_| HttpError::server_error("internal error"))?;
 
     Ok((
         token_headers(),
@@ -1089,6 +1101,7 @@ mod tests {
     use sts_config::{
         ConfigSource, ImpersonationPolicyEntry, ImpersonationSelector, TokenExchangeMode,
     };
+    use sts_jose::RsaJoseSigner;
     use tower::ServiceExt;
 
     #[derive(Debug, Clone, Serialize)]

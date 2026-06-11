@@ -13,9 +13,9 @@ use serde_json::{Value, json};
 use sts_config::{
     ConfigSource, ImpersonationPolicyEntry, ImpersonationSelector, RuntimeConfig, TokenExchangeMode,
 };
-use sts_core::{ACCESS_TOKEN_TYPE, JWT_TOKEN_TYPE, TOKEN_EXCHANGE_GRANT_TYPE};
+use sts_core::{ACCESS_TOKEN_TYPE, JWT_TOKEN_TYPE, MintedClaims, TOKEN_EXCHANGE_GRANT_TYPE};
 use sts_http::{HttpState, router};
-use sts_jose::{JoseSigner, RsaJoseSigner};
+use sts_jose::{JoseError, JoseErrorKind, JoseSigner, JwksDocument, RsaJoseSigner};
 use sts_replay::ReplayPolicy;
 use tower::ServiceExt;
 
@@ -51,6 +51,28 @@ fn signer(seed: u64, kid: &str) -> RsaJoseSigner {
     let mut rng = StdRng::seed_from_u64(seed);
     let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa");
     RsaJoseSigner::from_generated(&private_key, kid).expect("signer")
+}
+
+struct FailingSigner {
+    jwks: JwksDocument,
+}
+
+impl JoseSigner for FailingSigner {
+    fn alg(&self) -> &'static str {
+        "RS256"
+    }
+
+    fn sign_claims(&self, _claims: &MintedClaims) -> Result<String, JoseError> {
+        Err(JoseError::new(JoseErrorKind::InvalidClaims, "internal detail that must NOT leak"))
+    }
+
+    fn public_jwks(&self) -> JwksDocument {
+        self.jwks.clone()
+    }
+
+    fn verify_claims(&self, _token: &str) -> Result<MintedClaims, JoseError> {
+        Err(JoseError::new(JoseErrorKind::VerificationFailed, "not used by HTTP tests"))
+    }
 }
 
 fn test_state() -> (HttpState, RsaJoseSigner, RsaJoseSigner, RsaJoseSigner) {
@@ -1080,6 +1102,42 @@ async fn contract_client_assertion_jti_is_not_burned_by_late_target_failure() {
     let body = read_json(replay).await;
     assert_eq!(body["error"], "invalid_client");
     assert!(body["error_description"].as_str().unwrap_or("").contains("replay"));
+}
+
+#[tokio::test]
+async fn contract_unexpected_signing_failure_is_clean_server_error() {
+    let (mut state, subject_signer, actor_signer, _) = test_state();
+    state.signer = std::sync::Arc::new(FailingSigner { jwks: state.signer.public_jwks() });
+    let now = unix_now();
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let actor_token = signed_assertion(&actor_signer, now, "actor-clean-server-error");
+    let body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", actor_token.as_str()),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+    ])
+    .expect("form");
+
+    let response = post_token_form(state, body).await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response.headers().get(CACHE_CONTROL).and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        response.headers().get(PRAGMA).and_then(|value| value.to_str().ok()),
+        Some("no-cache")
+    );
+    let body = read_json(response).await;
+    assert_eq!(body, json!({"error": "server_error", "error_description": "internal error"}));
+    assert!(
+        !body.to_string().contains("internal detail"),
+        "server_error must not disclose backend signing detail"
+    );
 }
 
 #[tokio::test]

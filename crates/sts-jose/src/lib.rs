@@ -117,7 +117,7 @@ pub struct VerifiedJws<T> {
 }
 
 /// The crypto/signing surface the STS needs from the JOSE backend.
-pub trait JoseSigner {
+pub trait JoseSigner: Send + Sync {
     fn alg(&self) -> &'static str;
     fn sign_claims(&self, claims: &MintedClaims) -> Result<String, JoseError>;
     fn public_jwks(&self) -> JwksDocument;
