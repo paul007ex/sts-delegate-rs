@@ -49,7 +49,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-019 | `sts-dpop` owns stateless RFC 9449 proof validation and holder-key binding. | must | implemented | dpop | `crates/sts-dpop/src/lib.rs:3` | `cargo test -p sts-dpop --lib` | Replay recording remains in replay/http. |
 | R-020 | `sts-replay` owns replay state and fixed-size replay keys. | must | implemented | replay | `crates/sts-replay/src/lib.rs:3` | `cargo test -p sts-replay --lib` | Multi-worker shared store is future work. |
 | R-021 | `sts-http` owns route names, response headers, form parsing, and OAuth error rendering. | must | implemented | http | `crates/sts-http/src/lib.rs:3` | HTTP contract tests | HTTP must call lower crates for policy. |
-| R-022 | `sts-cli` is currently a thin ops boundary with no hidden runtime behavior. | policy | partial | cli | `crates/sts-cli/src/main.rs:3` | compile only | Full CLI is planned, not shipped. |
+| R-022 | `sts-cli` owns operator/runtime commands and must keep offline checks free of hidden network access. | policy | implemented | cli | `crates/sts-cli/src/main.rs:1`; issue #20 | `cargo test -p sts-cli` | `smoke` requires `IDP_JWKS_FILE` unless `--allow-network` is explicit. |
 | R-023 | The public HTTP surface is `POST /token`, `GET /jwks`, and `GET /.well-known/oauth-authorization-server`. | must | implemented | http | `crates/sts-http/src/lib.rs:104`; Python `transport.py:150` | `contract_discovery_and_jwks_match_python_oracle_shape` | `/exchange` must not return. |
 | R-024 | Path-bearing issuers must have live path-aware metadata, token, and JWKS aliases. | must | implemented | http | RFC 8414 Section 3.1; `crates/sts-http/src/lib.rs:110` | `contract_path_bearing_issuer_advertised_endpoints_are_live` | Root aliases remain live during alpha. |
 | R-025 | Metadata must use GET; POST to metadata must be method-not-allowed. | must | implemented | http | RFC 8414 Section 3.1; `crates/sts-http/src/lib.rs:108` | `contract_metadata_is_public_and_get_only` | Authorization header does not block metadata. |
@@ -151,14 +151,14 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-121 | Runtime config must require IdP issuer and expected subject audience. | must | implemented | config | `crates/sts-config/src/lib.rs:373` | config tests | OKTA_ISSUER is compatibility alias for IDP_ISSUER. |
 | R-122 | Runtime config must require at least one actor identity. | must | implemented | config | `crates/sts-config/src/lib.rs:425` | config tests | `GATEWAY_ACTOR_ID` contributes to actor IDs. |
 | R-123 | Target policy JSON or file must parse to object entries with string array scopes. | must | implemented | config | `crates/sts-config/src/lib.rs:584` | config tests | Entries beginning `_` are ignored. |
-| R-124 | Invalid config values must fail startup/config load before serving traffic. | must | partial | config/http | Python `tests/test_integration.py:597`; `crates/sts-config/src/lib.rs:211` | config tests | HTTP bootstrap still needs product entrypoint. |
+| R-124 | Invalid config values must fail startup/config load before serving traffic. | must | implemented | config/http/cli | Python `tests/test_integration.py:597`; `crates/sts-config/src/lib.rs:211`; `crates/sts-cli/src/main.rs` | config tests; `bootstrap-check`; CLI smoke | HTTP server and CLI bootstrap refuse bad config before serving. |
 | R-125 | Source releases are GitHub tag archives until crates.io publishing is explicitly planned. | policy | implemented | release | `README.md:20`; issue #9 | release audit | `cargo package --workspace` is not the alpha gate. |
 | R-126 | Release validation requires fmt, workspace tests, clippy, architecture guard, oracle smoke, and diff check. | policy | implemented | release | issue #2 comments; `README.md:24` | alpha.4 validation | Supply-chain helper CLIs remain optional until installed. |
 | R-127 | The requirements ledger must not close #2 until 100+ requirements and 20+ use cases are canonical. | must | implemented | PM | issue #2 | this ledger | Close only after issue update and validation. |
 | R-128 | Full Authorization Server features such as authorization endpoint, revocation, introspection, and registration are non-goals for current STS alpha. | non-goal | implemented | PM/http | Python docs; `README.md:3` | no routes | Future AS expansion requires new milestone. |
-| R-129 | Full CLI, rotation, canary, and ops helpers are planned v2 product work but not shipped in alpha. | policy | missing | cli/ops | `README.md:14`; `crates/sts-cli/src/main.rs:3` | compile only | Needs dedicated issue. |
+| R-129 | CLI parser, runtime bootstrap, offline smoke, canary config check, and public key/JWKS inspection are shipped; mutation/rotation workflows remain planned. | policy | partial | cli/ops | `README.md:22`; `crates/sts-cli/src/main.rs:12`; issue #20 | `cargo test -p sts-cli` | Rotation must preserve key custody and overlap semantics before closing full CLI scope. |
 | R-130 | Native PQC signing/JWKS/downstream verification is a v2 requirement, but alpha currently only provides fail-closed selection. | must | missing | jose/security | repo instructions; `crates/sts-jose/src/lib.rs:5` | JOSE fail-closed tests | Needs dedicated implementation issue before claim. |
-| R-131 | Live tenant validation must use the configured real Okta trial issuer; `example.com`, `issuer.example`, `sts.example`, and `*.example.*` are fixture-only and must not close readiness issues. | must | partial | tests/security | issue #21; Python `run-real-idp-canary.md`; `/Users/Shared/claude/obo-lab/okta.env` | ad hoc live Rust/Python Okta harness | Needs committed canary script before readiness closeout. |
+| R-131 | Live tenant validation must use the configured real Okta trial issuer; `example.com`, `issuer.example`, `sts.example`, and `*.example.*` are fixture-only and must not close readiness issues. | must | partial | tests/security/cli | issue #21; `scripts/real_tenant_endpoint_loop.py`; `crates/sts-cli/src/main.rs`; `/Users/Shared/claude/obo-lab/okta.env` | redaction self-test; FastMCP loops; CLI canary config tests | Rust STS live base remains gated by `CANARY_STS_BASE_URL`. |
 | R-132 | Runtime STS issuer values must reject query components, fragment components, and non-loopback HTTP while preserving Python's loopback HTTP dev exception. | must | implemented | config/security | issue #13; Python `tests/test_stress.py:920`; Python `infrastructure/config_env.py:47` | Rust config/verify issuer tests | Canonicalizes trailing slash to keep issuer/audience/metadata stable. |
 
 ## Use Cases
@@ -302,10 +302,10 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | #17 | http/parity | Residual Python parity gaps for token form and route errors | Request/error surface | closed | Keep route/error contract tests. |
 | #18 | runtime/security | Production bootstrap now composes config, keys, trust anchors, replay, and startup validation before serving | Runtime startup | closed | Keep bootstrap smoke and fail-closed startup tests in release gates. |
 | #19 | jose/pqc/security | Native PQC signing, JWKS publication, and downstream verification are missing | JOSE/PQC | open | Implement RFC 9964-compatible ML-DSA/AKP support before any PQC capability claim. |
-| #20 | cli/ops | CLI is a stub with no rotation, canary, smoke, or key-inspection commands | CLI/ops | open | Add explicit operator command surface or document deferral. |
-| #21 | tests/security | Real Okta proof must not be substituted with synthetic issuer evidence | Live canary | open | Add committed not-configured/redacted Rust canary path before readiness closeout. |
+| #20 | cli/ops | CLI now has explicit parser, bootstrap, offline smoke, canary config check, and public key/JWKS inspection; rotation remains incomplete | CLI/ops | open | Add or explicitly defer mutation/rotation workflow. |
+| #21 | tests/security | Real Okta proof must not be substituted with synthetic issuer evidence | Live canary | open | Configure Rust STS live base and keep redacted real-tenant evidence green. |
 | #22 | http/ops | Metrics/OpenAPI parity is undecided and unimplemented | Metrics/OpenAPI | open | Port Python behavior and gates or mark explicit non-goal/deferred. |
-| #23 | security/tests | Secure Rust audit loop has normal monitoring plus pinned strict supply-chain tooling/policy, but strict mode is blocked by `rsa` advisory and geiger stability | Security loop | open | Resolve RustSec RSA advisory and make strict mode pass before release readiness. |
+| #23 | security/tests | Secure Rust audit loop has normal monitoring plus pinned strict supply-chain tooling/policy; strict mode is green after #27 | Security loop | closed | Keep strict supply-chain gate in release evidence. |
 | #24 | replay/security | Poisoned replay mutex locks could panic instead of failing closed | Replay availability | closed | Keep poisoned-lock fail-closed tests in release gate. |
 | #25 | http/security | `may_act` delegation/impersonation behavior lacked Rust contract coverage | Delegation authorization | closed | Keep may_act Rust contracts and Python oracle smoke entries. |
 | #26 | validation/security | Configured gateway MCP paths returned 401 after edge Okta auth | Gateway MCP proof | closed | Keep configured FastMCP proof and obo-lab gateway passthrough config aligned. |
@@ -319,11 +319,9 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 ## Current Freeze Gaps
 
 - Native PQC signing/JWKS/downstream verification is missing; only fail-closed selection is shipped (#19).
-- Runtime JOSE still depends on `rsa 0.9.10`, which strict supply-chain tools flag for RUSTSEC-2023-0071 (#27).
-- CLI/ops helpers are only a crate boundary, not a complete product surface (#20).
-- Real Okta canary readiness still lacks a committed Rust not-configured/redacted live-tenant validation path (#21).
+- CLI mutation/rotation workflow remains incomplete (#20).
+- Rust STS live-base canary remains not configured in this environment because `CANARY_STS_BASE_URL` is absent (#21).
 - Metrics/OpenAPI parity is unresolved; Rust must either port Python behavior and gates or mark the scope explicit non-goal/deferred (#22).
-- Strict supply-chain release evidence is not green until the RustSec RSA advisory and geiger stability findings are resolved (#23).
 - Full Authorization Server features remain non-goals for this STS alpha.
 
 ## Executive Conclusion

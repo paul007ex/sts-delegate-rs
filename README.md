@@ -36,6 +36,24 @@ Required environment includes `IDP_ISSUER` or `OKTA_ISSUER`,
 `IDP_JWKS_URI`/OIDC discovery. `STS_HTTP_ADDR` defaults to
 `127.0.0.1:8888`.
 
+## Operator CLI
+
+`sts-cli` also includes offline-safe operator checks:
+
+```bash
+cargo run -p sts-cli -- smoke
+cargo run -p sts-cli -- smoke --allow-network
+cargo run -p sts-cli -- canary check-config
+cargo run -p sts-cli -- jwks inspect --file public_jwks.json
+cargo run -p sts-cli -- key inspect --file public_jwk.json
+```
+
+`smoke` runs the same startup bootstrap path as the server, but defaults to
+offline mode and requires `IDP_JWKS_FILE`; pass `--allow-network` only when live
+IdP JWKS retrieval is intentional. `canary check-config` reports only missing
+`CANARY_*` names. Key and JWKS inspection print public metadata only and refuse
+private or symmetric JWK input.
+
 ## Release shape
 
 Current releases are source releases from GitHub tags. Workspace crates inherit `publish = false`; crates.io publication is intentionally out of scope until the internal crate graph, package names, and public API stability are ready for an explicit publishing milestone.
