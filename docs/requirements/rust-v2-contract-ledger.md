@@ -20,7 +20,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
   `sts_delegate/domain/payload.py`, `sts_delegate/transport.py`,
   `sts_delegate/dpop.py`, `sts_delegate/client_auth.py`,
   `sts_delegate/application/replay_records.py`
-- Rust issues: #1 through #12, with #2 as the active freeze tracker
+- Rust issues: #1 through #21, with #2 as the active freeze tracker
 - Primary specs: RFC 6749, RFC 7523, RFC 7519, RFC 8414, RFC 8693, RFC 9068,
   RFC 9449
 
@@ -63,12 +63,12 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-033 | `/jwks` responses must be public cacheable with max-age. | policy | implemented | http | Python `tests/test_integration.py:612`; `crates/sts-http/src/lib.rs:295` | `contract_discovery_and_jwks_match_python_oracle_shape` | Token responses use no-store instead. |
 | R-034 | `/token` must accept only `application/x-www-form-urlencoded`. | must | implemented | http | RFC 8693 Section 2.1; `crates/sts-http/src/lib.rs:316` | `contract_token_rejects_wrong_content_type_and_duplicate_form_params` | JSON/multipart fail 4xx, not 500. |
 | R-035 | `/token` must reject duplicate recognized form parameters. | must | implemented | http | RFC 6749 Section 3.1; `crates/sts-http/src/lib.rs:320` | duplicate form test | Duplicate target parameters map to invalid_target. |
-| R-036 | Unknown extension request parameters must be ignored unless a recognized gate fails. | policy | open | http/core | Python `tests/test_integration.py:206` | missing Rust test | Add Rust parity test. |
+| R-036 | Unknown extension request parameters must be ignored unless a recognized gate fails. | policy | implemented | http/core | Python `tests/test_integration.py:206`; issue #17 | `contract_unknown_extension_params_are_ignored` | Fresh actor assertion required when testing around replay. |
 | R-037 | `/token` must reject Authorization header client auth and direct callers to private_key_jwt. | policy | implemented | http/client-auth | `crates/sts-http/src/lib.rs:350`; issue #4 | `contract_authorization_header_client_auth_is_rejected` | Preserve WWW-Authenticate scheme. |
 | R-038 | `/token` responses and errors must include `Cache-Control: no-store` and `Pragma: no-cache`. | must | implemented | http | RFC 6749 Section 5.1; Python `tests/test_integration.py:550`; `crates/sts-http/src/lib.rs:267` | token/error contract tests | Metadata/JWKS are public-cacheable. |
 | R-039 | OAuth error responses must be JSON and include stable `error` and `error_description` when OAuth-shaped. | must | implemented | http | RFC 6749 Section 5.2; `crates/sts-http/src/lib.rs:282` | HTTP contract tests | Service-unavailable may omit OAuth `error`. |
 | R-040 | Unexpected internal failures must map to clean `server_error` without leaking internal detail. | must | open | http | Python `tests/test_integration.py:732` | missing Rust test | Add catch-all/panic-safe HTTP test. |
-| R-041 | Old `/exchange` route must remain absent. | must-not | open | http | Python `tests/test_integration.py:751` | missing Rust test | Add Rust 404 contract test. |
+| R-041 | Old `/exchange` route must remain absent. | must-not | implemented | http | Python `tests/test_integration.py:751`; issue #17 | `contract_exchange_route_remains_absent` | `/token` is the only token-exchange route. |
 | R-042 | Interactive docs must be off by default if/when served. | policy | open | http/ops | Python `transport.py:78` | missing Rust scope | Rust has no docs UI yet. |
 | R-043 | OpenAPI, if shipped, must be curated and drift-checked. | policy | missing | http/docs | Python `transport.py:78` | no Rust OpenAPI | Future issue needed before full HTTP release. |
 | R-044 | Metrics, if shipped, must be opt-in and not alter protocol behavior. | policy | missing | http/ops | Python `transport.py:85` | no Rust metrics | Future issue. |
@@ -76,7 +76,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-046 | `subject_token` is required and must not exceed configured max token length. | must | implemented | http/verify | RFC 8693 Section 2.1; `crates/sts-http/src/lib.rs:388` | HTTP unit tests | Oversized input fails before crypto. |
 | R-047 | `subject_token_type` is required and only access_token or jwt are accepted for inbound subject tokens. | policy | implemented | http/verify | `crates/sts-http/src/lib.rs:28`; issue #11 | HTTP contract tests | Unsupported type is invalid_request. |
 | R-048 | `actor_token_type` is required when `actor_token` is present. | must | implemented | http | RFC 8693 Section 2.1; Python `tests/test_integration.py:220` | HTTP tests | Empty actor token remains present and malformed. |
-| R-049 | `actor_token_type` must not be accepted without actor token. | must | open | http | RFC 8693 Section 2.1 | missing Rust test | Add negative test. |
+| R-049 | `actor_token_type` must not be accepted without actor token. | must | implemented | http | RFC 8693 Section 2.1; issue #17 | `contract_actor_token_type_without_actor_token_is_rejected` | Rejected before subject-token verification. |
 | R-050 | `requested_token_type` absent means the STS mints its default access_token type. | policy | implemented | core/http | RFC 8693 Section 2.1; issue #11 | requested-token contract test | Default issued_token_type is access_token. |
 | R-051 | `requested_token_type=access_token` is accepted. | must | implemented | http | issue #11; Python `tests/test_integration.py:178` | requested-token contract test | Response still JWT-formatted at+jwt token. |
 | R-052 | `requested_token_type=jwt` is rejected to avoid acknowledging one type while reporting access_token. | policy | implemented | http | issue #11; Python `tests/test_integration.py:178` | requested-token contract test | Intentional Python parity choice. |
@@ -102,9 +102,9 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-072 | `client_id` in impersonation mode equals authenticated private_key_jwt client. | policy | implemented | http/core | issue #12; Python `tests/test_impersonation.py:299` | impersonation contract tests | Actor-token-only cannot impersonate. |
 | R-073 | Optional auth-context claims `auth_time`, `acr`, and `amr` are copied when present and omitted when absent. | must | partial | core/http | Python `domain/payload.py:18`; Python `tests/test_integration.py:232` | core omits absent | Rust carry-forward not fully wired. |
 | R-074 | Minted token `exp` must be no later than now + configured scoped token TTL. | must | implemented | http/core | `crates/sts-http/src/lib.rs`; Python `domain/payload.py:28` | HTTP tests | TTL defaults to 300. |
-| R-075 | Minted token `exp` must not outlive the subject token. | must | open | http/core | Python `tests/test_integration.py:678`; Python `domain/payload.py:28` | missing Rust test | Add parity test. |
-| R-076 | Delegation minted token `exp` must not outlive the actor token. | must | open | http/core | Python `tests/test_integration.py:693`; Python `domain/payload.py:28` | missing Rust test | Add parity test. |
-| R-077 | `expires_in` must reflect actual minted lifetime after any cap. | must | open | http | RFC 6749 Section 5.1; Python `tests/test_integration.py:709` | missing Rust test | Avoid over-stating token validity. |
+| R-075 | Minted token `exp` must not outlive the subject token. | must | implemented | http/core | Python `tests/test_integration.py:678`; Python `domain/payload.py:28` | `contract_delegation_lifetime_is_capped_by_subject_and_actor_exp` | Covers delegation and impersonation subject cap. |
+| R-076 | Delegation minted token `exp` must not outlive the actor token. | must | implemented | http/core | Python `tests/test_integration.py:693`; Python `domain/payload.py:28` | `contract_delegation_lifetime_is_capped_by_subject_and_actor_exp` | Actor cap is delegation-specific. |
+| R-077 | `expires_in` must reflect actual minted lifetime after any cap. | must | implemented | http | RFC 6749 Section 5.1; Python `tests/test_integration.py:709` | `contract_delegation_lifetime_is_capped_by_subject_and_actor_exp` | Avoids over-stating token validity. |
 | R-078 | Minted token `jti` must be a non-empty generated string. | must | implemented | http/core | RFC 7519 Section 4.1.7; `crates/sts-http/src/lib.rs` | HTTP contract tests | Resource server can do replay checks. |
 | R-079 | The STS signing JWKS must not include private members. | must-not | implemented | jose/http | `crates/sts-jose/src/lib.rs:88`; Python `tests/test_integration.py:620` | JWKS contract test | Extra-JWKS file loading not yet in Rust. |
 | R-080 | Classical signing backend selection accepts blank, `classical`, and `RS256`. | policy | implemented | jose | `crates/sts-jose/src/lib.rs:31` | JOSE tests | Case-insensitive parsing. |
@@ -158,6 +158,8 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-128 | Full Authorization Server features such as authorization endpoint, revocation, introspection, and registration are non-goals for current STS alpha. | non-goal | implemented | PM/http | Python docs; `README.md:3` | no routes | Future AS expansion requires new milestone. |
 | R-129 | Full CLI, rotation, canary, and ops helpers are planned v2 product work but not shipped in alpha. | policy | missing | cli/ops | `README.md:14`; `crates/sts-cli/src/main.rs:3` | compile only | Needs dedicated issue. |
 | R-130 | Native PQC signing/JWKS/downstream verification is a v2 requirement, but alpha currently only provides fail-closed selection. | must | missing | jose/security | repo instructions; `crates/sts-jose/src/lib.rs:5` | JOSE fail-closed tests | Needs dedicated implementation issue before claim. |
+| R-131 | Live tenant validation must use the configured real Okta trial issuer; `example.com`, `issuer.example`, `sts.example`, and `*.example.*` are fixture-only and must not close readiness issues. | must | partial | tests/security | issue #21; Python `run-real-idp-canary.md`; `/Users/Shared/claude/obo-lab/okta.env` | ad hoc live Rust/Python Okta harness | Needs committed canary script before readiness closeout. |
+| R-132 | Runtime STS issuer values must reject query components, fragment components, and non-loopback HTTP. | must | open | config/security | issue #13; Python `tests/test_stress.py:920`; Python `infrastructure/config_env.py:47` | missing Rust config test | Decide and test whether Python's loopback HTTP dev exception is preserved. |
 
 ## Use Cases
 
@@ -167,14 +169,14 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | UC-02 | MCP server actor | Exchange with DPoP sender constraint | UC-01 plus valid DPoP proof | Validate proof; mint token with `cnf.jkt`; record DPoP replay | No proof preserves Bearer path | Replayed proof returns invalid_dpop_proof | Token type is DPoP and token is bound to holder key | R-107 through R-119 |
 | UC-03 | Private client | Delegation with private_key_jwt plus actor token | Client assertion and actor assertion both valid | Authenticate client; validate actor; mint delegated token | Actor-token compatibility path may work without client assertion | Missing actor token fails delegation | Delegation still requires actor proof | R-083 through R-093 |
 | UC-04 | Private client | Impersonation token exchange | Impersonation mode enabled, client policy permits target/subject | Authenticate client; verify subject; gate impersonation policy; mint without act | DPoP may bind impersonation token | No policy denies invalid_request | Token has subject sub, no act, client_id of client | R-069, R-094 through R-101 |
-| UC-05 | Operator | Start service from env config | Required issuer, subject audience, actor IDs, target policy available | Load RuntimeConfig from env/source map | OKTA_ISSUER can supply issuer alias | Missing issuer/audience/actor fails load | Bad config fails before useful traffic | R-121 through R-124 |
+| UC-05 | Operator | Start service from env config | Required issuer, subject audience, actor IDs, target policy available | Load RuntimeConfig from env/source map | OKTA_ISSUER can supply issuer alias | Missing issuer/audience/actor fails load | Bad config, including unsafe or ambiguous issuer values, fails before useful traffic | R-121 through R-124, R-132 |
 | UC-06 | Resource server | Discover STS metadata | STS issuer configured | GET metadata endpoint | Path-bearing issuer uses RFC 8414 inserted path | POST metadata returns 405 | Metadata identifies issuer, token endpoint, JWKS URI, auth methods | R-024 through R-031 |
 | UC-07 | Resource server | Fetch signing keys | STS signer initialized | GET `/jwks` | Path alias works for path-bearing issuer | Private key members never appear | Public JWKS can verify minted tokens | R-032, R-033, R-079 |
 | UC-08 | Security reviewer | Validate architecture boundary | Rust workspace present | Run architecture guard | Add new crate only with guard update | Transport/network deps in lower crates fail | Dependency direction stays explicit | R-009 through R-014 |
 | UC-09 | Release manager | Cut source alpha tag | Clean main, validation green | Run fmt/test/clippy/guards/oracle smoke; tag release | Source-only release allowed | crates.io package failure does not block alpha | GitHub prerelease with caveats | R-125, R-126 |
-| UC-10 | Test engineer | Compare Python oracle and Rust | Sibling Python repo or override path exists | Run oracle smoke script | Custom PYTHON_ORACLE_REPO/PYTHON_BIN allowed | Missing oracle repo exits 2 | Focused Python and Rust parity tests pass | R-002, R-126 |
+| UC-10 | Test engineer | Compare Python oracle and Rust | Sibling Python repo or override path exists | Run oracle smoke script | Custom PYTHON_ORACLE_REPO/PYTHON_BIN allowed | Missing oracle repo exits 2 | Focused offline Python and Rust parity tests pass without implying live tenant readiness | R-002, R-126, R-131 |
 | UC-11 | Client developer | Send malformed form | `/token` reachable | POST invalid content type or duplicate param | Unknown extension params ignored | Recognized duplicate returns OAuth error | Clean 4xx JSON, not 500 | R-034 through R-040 |
-| UC-12 | Tenant operator | Use issuer path `/tenant1` | `OBO_STS_ISSUER=https://sts.example/tenant1` | Discover at `/.well-known/oauth-authorization-server/tenant1`; call aliases | Root `/token` and `/jwks` remain live in alpha | Advertised endpoint 404 is regression | Multi-tenant issuer metadata is usable | R-024, R-027 |
+| UC-12 | Tenant operator | Use issuer path `/tenant1` | Real configured Okta trial issuer and STS issuer path are available; synthetic issuer values are fixture-only | Discover at `/.well-known/oauth-authorization-server/tenant1`; call aliases | Root `/token` and `/jwks` remain live in alpha | Advertised endpoint 404 is regression | Multi-tenant issuer metadata is usable and live proof does not rely on `example.com` | R-024, R-027, R-131 |
 | UC-13 | Actor service | Reuse actor jti accidentally | First exchange already recorded jti | Second exchange attempts same actor/jti | Different actor may reuse same raw jti | Same actor reuse rejected | Actor replay is per-actor namespace | R-102 |
 | UC-14 | DPoP client | Send proof with future-edge iat | `iat` within leeway | Record replay until `iat + leeway` | Normal iat expires at same formula | Reuse before expiry rejected | Future-skew replay gap closed | R-115, R-116 |
 | UC-15 | Client | Request `requested_token_type=jwt` | Valid otherwise | POST token exchange with jwt requested type | access_token requested type succeeds | jwt returns invalid_request | Python parity is preserved | R-050 through R-053 |
@@ -220,6 +222,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | N-28 | Transport dependency added to lower crate | architecture guard failure | issue #3 | R-011 |
 | N-29 | Unsafe code added silently | architecture/security failure | workspace lints | R-007 |
 | N-30 | Full OAuth AS capability claimed in alpha | must not claim | README release shape | R-128 |
+| N-31 | STS issuer contains query, fragment, or non-loopback HTTP scheme | reject config load | issue #13; Python stress tests | R-132 |
 
 ## Edge Case Register
 
@@ -255,6 +258,8 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | E-28 | Source release package check fails for unpublished path deps | not alpha blocker | README; issue #9 | R-125 |
 | E-29 | Missing Python oracle repo for smoke script | exit 2 | script | R-010, R-126 |
 | E-30 | Supply-chain helper CLIs absent | report caveat, do not fake audit | release audit notes | R-126 |
+| E-31 | Real Okta tenant config absent during live validation | report not configured; do not substitute `example.com` | issue #21 | R-131 |
+| E-32 | Loopback HTTP STS issuer in local development | preserve or reject only by explicit #13 decision | Python config policy; issue #13 | R-132 |
 
 ## v2 Rust Migration Map
 
@@ -290,19 +295,18 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | #10 | security | Actor assertion kid could be cross-domain | Actor auth | closed | Keep cross-domain test. |
 | #11 | parity | `requested_token_type=jwt` divergence from Python | Token request | closed | Any future change is intentional divergence issue. |
 | #12 | parity/security | Impersonation policy needed Python target/subject shape | Impersonation | closed | Add more both-mode/empty-token parity tests. |
-| Python #210 | bug/parity | Scoped token cannot outlive subject | Token lifetime | open in Rust ledger | Add Rust contract test. |
-| Python #280 | bug/parity | Scoped token cannot outlive actor | Token lifetime | open in Rust ledger | Add Rust contract test. |
-| Python #279 | bug/parity | `expires_in` must reflect capped lifetime | Token response | open in Rust ledger | Add Rust contract test. |
+| #13 | config/security | RuntimeConfig accepts query/fragment/non-loopback HTTP STS issuers rejected by Python | Startup config and metadata truth | open | Close only after Rust config tests and final loopback policy decision. |
+| Python #210 | bug/parity | Scoped token cannot outlive subject | Token lifetime | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
+| Python #280 | bug/parity | Scoped token cannot outlive actor | Token lifetime | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
+| Python #279 | bug/parity | `expires_in` must reflect capped lifetime | Token response | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
 | Python #580 | bug/parity | Empty actor_token is present malformed | Mode dispatch | open in Rust ledger | Add Rust contract test. |
 | Python #602 | bug/parity | DPoP jti/proof anti-DoS and replay key bounds | DPoP/replay | implemented in Rust | Keep DPoP tests. |
 
 ## Current Freeze Gaps
 
-- Rust still needs explicit parity tests for unknown extension parameter handling.
-- Rust still needs explicit parity tests for old `/exchange` staying absent.
-- Rust still needs explicit parity tests for subject/actor expiration caps and `expires_in`.
 - Rust still needs an explicit catch-all clean 500 test for unexpected HTTP failures.
 - Rust still needs explicit both-mode empty actor_token parity coverage.
+- Rust still needs #13 config issuer validation for query, fragment, and non-loopback HTTP values.
 - Native PQC signing/JWKS/downstream verification is missing; only fail-closed selection is shipped.
 - CLI/ops helpers are only a crate boundary, not a complete product surface.
 - Full Authorization Server features remain non-goals for this STS alpha.

@@ -104,25 +104,38 @@ fn unix_now() -> i64 {
 }
 
 fn signed_subject_token(signer: &RsaJoseSigner, now: i64) -> String {
+    signed_subject_token_with_exp_delta(signer, now, 600)
+}
+
+fn signed_subject_token_with_exp_delta(signer: &RsaJoseSigner, now: i64, exp_delta: i64) -> String {
     signer
         .sign_json_claims(&SubjectWireClaims {
             iss: "https://issuer.example/oauth2/default".to_string(),
             sub: "alice@example.com".to_string(),
             aud: "api://obo".to_string(),
             scope: "chat.read chat.write".to_string(),
-            exp: now + 600,
+            exp: now + exp_delta,
             iat: now,
         })
         .expect("subject token")
 }
 
 fn signed_assertion(signer: &RsaJoseSigner, now: i64, jti: &str) -> String {
+    signed_assertion_with_exp_delta(signer, now, jti, 300)
+}
+
+fn signed_assertion_with_exp_delta(
+    signer: &RsaJoseSigner,
+    now: i64,
+    jti: &str,
+    exp_delta: i64,
+) -> String {
     signer
         .sign_json_claims(&AssertionWireClaims {
             iss: "chat-mcp".to_string(),
             sub: "chat-mcp".to_string(),
             aud: "https://sts.example".to_string(),
-            exp: now + 300,
+            exp: now + exp_delta,
             iat: now,
             jti: jti.to_string(),
         })
@@ -271,10 +284,80 @@ async fn contract_authorization_header_client_auth_is_rejected() {
     assert_eq!(body["error"], "invalid_client");
 }
 
+#[tokio::test]
+async fn contract_unknown_extension_params_are_ignored() {
+    let (state, subject_signer, actor_signer, _) = test_state();
+    let now = unix_now();
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let actor_token = signed_assertion(&actor_signer, now, "actor-unknown-extension");
+    let body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", actor_token.as_str()),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+        ("unknown_extension", "ignored"),
+    ])
+    .expect("form");
+
+    let response = post_token_form(state, body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["issued_token_type"], ACCESS_TOKEN_TYPE);
+    assert_eq!(body["token_type"], "Bearer");
+    assert_eq!(body["scope"], "chat.read");
+}
+
+#[tokio::test]
+async fn contract_actor_token_type_without_actor_token_is_rejected() {
+    let (state, _, _, _) = test_state();
+    let body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", "bad-subject"),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+    ])
+    .expect("form");
+
+    let response = post_token_form(state, body).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_request");
+    assert_eq!(body["error_description"], "actor_token_type present without actor_token");
+}
+
+#[tokio::test]
+async fn contract_exchange_route_remains_absent() {
+    let (state, _, _, _) = test_state();
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/exchange")
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("grant_type=x"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
 fn jwt_segment(token: &str, index: usize) -> Value {
     let segment = token.split('.').nth(index).expect("jwt segment");
     let bytes = URL_SAFE_NO_PAD.decode(segment.as_bytes()).expect("base64url");
     serde_json::from_slice(&bytes).expect("json segment")
+}
+
+fn assert_expires_in_matches_payload_lifetime(response_body: &Value, payload: &Value) {
+    let exp = payload["exp"].as_i64().expect("exp");
+    let iat = payload["iat"].as_i64().expect("iat");
+    let expires_in = response_body["expires_in"].as_i64().expect("expires_in");
+    assert_eq!(expires_in, (exp - iat).max(0), "expires_in must match the minted token lifetime");
 }
 
 fn dpop_proof(now: i64, jti: &str, htm: &str, htu: &str) -> String {
@@ -587,6 +670,109 @@ async fn contract_delegation_token_matches_python_oracle_wire_shape() {
     assert!(payload.get("auth_time").is_none());
     assert!(payload.get("acr").is_none());
     assert!(payload.get("amr").is_none());
+}
+
+#[tokio::test]
+async fn contract_delegation_lifetime_is_capped_by_subject_and_actor_exp() {
+    let (mut state, subject_signer, actor_signer, client_signer) = test_state();
+    let now = unix_now();
+
+    let subject_limited_token = signed_subject_token_with_exp_delta(&subject_signer, now, 30);
+    let actor_token = signed_assertion(&actor_signer, now, "actor-lifetime-subject-cap");
+    let body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_limited_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", actor_token.as_str()),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+    ])
+    .expect("form");
+
+    let response = post_token_form(state.clone(), body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = read_json(response).await;
+    let token = response_body["access_token"].as_str().expect("access token");
+    let payload = jwt_segment(token, 1);
+    let exp = payload["exp"].as_i64().expect("exp");
+    assert!(exp <= now + 30, "subject exp must cap minted token exp");
+    assert_expires_in_matches_payload_lifetime(&response_body, &payload);
+
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let actor_limited_token =
+        signed_assertion_with_exp_delta(&actor_signer, now, "actor-lifetime-actor-cap", 40);
+    let body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", actor_limited_token.as_str()),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+    ])
+    .expect("form");
+
+    let response = post_token_form(state.clone(), body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = read_json(response).await;
+    let token = response_body["access_token"].as_str().expect("access token");
+    let payload = jwt_segment(token, 1);
+    let exp = payload["exp"].as_i64().expect("exp");
+    assert!(exp <= now + 40, "actor exp must cap delegated token exp");
+    assert_expires_in_matches_payload_lifetime(&response_body, &payload);
+
+    let mut ttl_limited_state = state.clone();
+    ttl_limited_state.config.scoped_token_ttl = 25;
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let actor_token = signed_assertion(&actor_signer, now, "actor-lifetime-ttl-cap");
+    let body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", actor_token.as_str()),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+    ])
+    .expect("form");
+
+    let response = post_token_form(ttl_limited_state, body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = read_json(response).await;
+    let token = response_body["access_token"].as_str().expect("access token");
+    let payload = jwt_segment(token, 1);
+    let exp = payload["exp"].as_i64().expect("exp");
+    let iat = payload["iat"].as_i64().expect("iat");
+    assert!(exp <= iat + 25, "configured TTL must cap delegated token exp");
+    assert_expires_in_matches_payload_lifetime(&response_body, &payload);
+
+    state.config.token_exchange_mode = TokenExchangeMode::Impersonation;
+    allow_impersonation_anywhere(&mut state, "chat-mcp");
+    let subject_limited_token = signed_subject_token_with_exp_delta(&subject_signer, now, 35);
+    let client_assertion =
+        signed_assertion(&client_signer, now, "client-lifetime-impersonation-subject-cap");
+    let body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_limited_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+        ("client_id", "chat-mcp"),
+        ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+        ("client_assertion", client_assertion.as_str()),
+    ])
+    .expect("form");
+
+    let response = post_token_form(state, body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = read_json(response).await;
+    let token = response_body["access_token"].as_str().expect("access token");
+    let payload = jwt_segment(token, 1);
+    let exp = payload["exp"].as_i64().expect("exp");
+    assert!(exp <= now + 35, "subject exp must cap impersonation token exp");
+    assert!(payload.get("act").is_none(), "impersonation must omit act");
+    assert_expires_in_matches_payload_lifetime(&response_body, &payload);
 }
 
 #[tokio::test]
