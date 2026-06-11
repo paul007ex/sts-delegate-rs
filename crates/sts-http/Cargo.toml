@@ -1,7 +1,12 @@
 [package]
 name = "sts-http"
-version = "0.1.0"
-edition = "2024"
+description.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+readme.workspace = true
+repository.workspace = true
+version.workspace = true
 
 [dependencies]
 axum = "0.8.9"
@@ -10,11 +15,11 @@ http = "1"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sts-config = { path = "../sts-config" }
-sts-core = { path = "../sts-core" }
-sts-jose = { path = "../sts-jose" }
-sts-replay = { path = "../sts-replay" }
-sts-verify = { path = "../sts-verify" }
+sts-config = { version = "0.1.0", path = "../sts-config" }
+sts-core = { version = "0.1.0", path = "../sts-core" }
+sts-jose = { version = "0.1.0", path = "../sts-jose" }
+sts-replay = { version = "0.1.0", path = "../sts-replay" }
+sts-verify = { version = "0.1.0", path = "../sts-verify" }
 url = "2"
 
 [dev-dependencies]

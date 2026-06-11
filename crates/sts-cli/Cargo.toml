@@ -1,6 +1,11 @@
 [package]
 name = "sts-cli"
-version = "0.1.0"
-edition = "2024"
+description.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+readme.workspace = true
+repository.workspace = true
+version.workspace = true
 
 [dependencies]

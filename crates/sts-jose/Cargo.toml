@@ -1,7 +1,12 @@
 [package]
 name = "sts-jose"
-version = "0.1.0"
-edition = "2024"
+description.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+readme.workspace = true
+repository.workspace = true
+version.workspace = true
 
 [dependencies]
 base64 = "0.22"
@@ -10,7 +15,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = { version = "0.10", features = ["oid"] }
 signature = "2"
-sts-core = { path = "../sts-core" }
+sts-core = { version = "0.1.0", path = "../sts-core" }
 
 [dev-dependencies]
 rand = "0.8"
