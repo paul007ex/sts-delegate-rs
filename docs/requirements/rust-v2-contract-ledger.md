@@ -20,7 +20,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
   `sts_delegate/domain/payload.py`, `sts_delegate/transport.py`,
   `sts_delegate/dpop.py`, `sts_delegate/client_auth.py`,
   `sts_delegate/application/replay_records.py`
-- Rust issues: #1 through #21, with #2 as the active freeze tracker
+- Rust issues: #1 through #25, with #2 as the active freeze tracker
 - Primary specs: RFC 6749, RFC 7523, RFC 7519, RFC 8414, RFC 8693, RFC 9068,
   RFC 9449
 
@@ -295,7 +295,19 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | #10 | security | Actor assertion kid could be cross-domain | Actor auth | closed | Keep cross-domain test. |
 | #11 | parity | `requested_token_type=jwt` divergence from Python | Token request | closed | Any future change is intentional divergence issue. |
 | #12 | parity/security | Impersonation policy needed Python target/subject shape | Impersonation | closed | Add more both-mode/empty-token parity tests. |
-| #13 | config/security | RuntimeConfig accepted query/fragment/non-loopback HTTP STS issuers rejected by Python | Startup config and metadata truth | implemented in Rust config/verify | Keep issuer-policy tests in release gate. |
+| #13 | config/security | RuntimeConfig accepted query/fragment/non-loopback HTTP STS issuers rejected by Python | Startup config and metadata truth | closed | Keep issuer-policy tests in release gate. |
+| #14 | core/http | Minted token lifetime and `expires_in` could outlive input credentials | Token lifetime | closed | Keep subject/actor lifetime cap tests in release gate. |
+| #15 | http/security | Both-mode empty `actor_token` could dispatch incorrectly | Mode dispatch | closed | Empty present actor token must remain malformed. |
+| #16 | core/http | Subject auth-context claims needed Python parity | Minted claims | closed | Keep auth-context carry contract test. |
+| #17 | http/parity | Residual Python parity gaps for token form and route errors | Request/error surface | closed | Keep route/error contract tests. |
+| #18 | runtime/security | No production bootstrap composes config, keys, trust anchors, replay, and startup validation | Runtime startup | open | Requires executable bootstrap and startup smoke before release readiness. |
+| #19 | jose/pqc/security | Native PQC signing, JWKS publication, and downstream verification are missing | JOSE/PQC | open | Implement RFC 9964-compatible ML-DSA/AKP support before any PQC capability claim. |
+| #20 | cli/ops | CLI is a stub with no rotation, canary, smoke, or key-inspection commands | CLI/ops | open | Add explicit operator command surface or document deferral. |
+| #21 | tests/security | Real Okta proof must not be substituted with synthetic issuer evidence | Live canary | open | Add committed not-configured/redacted Rust canary path before readiness closeout. |
+| #22 | http/ops | Metrics/OpenAPI parity is undecided and unimplemented | Metrics/OpenAPI | open | Port Python behavior and gates or mark explicit non-goal/deferred. |
+| #23 | security/tests | Secure Rust audit loop is normal-mode usable but strict supply-chain mode lacks tools/policy | Security loop | open | Install/pin supply-chain tools and add deny policy before strict release gate. |
+| #24 | replay/security | Poisoned replay mutex locks could panic instead of failing closed | Replay availability | closed | Keep poisoned-lock fail-closed tests in release gate. |
+| #25 | http/security | `may_act` delegation/impersonation behavior lacked Rust contract coverage | Delegation authorization | closed | Keep may_act Rust contracts and Python oracle smoke entries. |
 | Python #210 | bug/parity | Scoped token cannot outlive subject | Token lifetime | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
 | Python #280 | bug/parity | Scoped token cannot outlive actor | Token lifetime | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
 | Python #279 | bug/parity | `expires_in` must reflect capped lifetime | Token response | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
@@ -304,8 +316,12 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 
 ## Current Freeze Gaps
 
-- Native PQC signing/JWKS/downstream verification is missing; only fail-closed selection is shipped.
-- CLI/ops helpers are only a crate boundary, not a complete product surface.
+- Runtime bootstrap is still missing: no executable boundary loads config, signing keys, trust anchors, replay policy, and startup validation before serving (#18).
+- Native PQC signing/JWKS/downstream verification is missing; only fail-closed selection is shipped (#19).
+- CLI/ops helpers are only a crate boundary, not a complete product surface (#20).
+- Real Okta canary readiness still lacks a committed Rust not-configured/redacted live-tenant validation path (#21).
+- Metrics/OpenAPI parity is unresolved; Rust must either port Python behavior and gates or mark the scope explicit non-goal/deferred (#22).
+- Strict supply-chain release evidence is not available until `cargo-audit`, `cargo-deny`, `cargo-geiger`, and `cargo-vet` are installed/pinned and policy config is committed (#23).
 - Full Authorization Server features remain non-goals for this STS alpha.
 
 ## Executive Conclusion
