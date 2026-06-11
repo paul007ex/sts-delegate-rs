@@ -8,6 +8,7 @@ import base64
 import datetime as dt
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.error
@@ -20,10 +21,65 @@ from typing import Any
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_OBO_ENV = Path("/Users/Shared/claude/obo-lab/okta.env")
 DEFAULT_MCP_CONFIG = Path("/Users/Shared/claude/obo-lab/.mcp.json")
+DEFAULT_FASTMCP_PYTHON = Path("/Users/Shared/claude/obo-lab/.venv/bin/python3")
 
 EXAMPLE_HOST_FRAGMENTS = ("example.com", "example.test", "example.org", "issuer.example", "sts.example")
 PRIVATE_JWK_MEMBERS = {"d", "p", "q", "dp", "dq", "qi", "oth"}
 TOKEN_FIELD_NAMES = {"authorization", "access_token", "subject_token", "actor_token", "client_assertion"}
+MCP_TOOL_PROBES = {
+    "chat-mcp": ("say", {"message": "hello from sts-delegate-rs canary"}),
+    "databricks-mcp": ("run_sql_query", {"sql": "SELECT 1"}),
+    "servicenow-mcp": ("list_incidents", {}),
+}
+
+FASTMCP_CLIENT_PROGRAM = r"""
+from __future__ import annotations
+
+import asyncio
+import json
+import sys
+
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
+
+
+async def call_one(server: dict) -> dict:
+    transport = StreamableHttpTransport(server["url"], headers=server["headers"])
+    async with Client(transport) as client:
+        tools = await client.list_tools()
+        tool_names = sorted(tool.name for tool in tools)
+        tool_name = server.get("tool")
+        result = {"tools": tool_names, "tool": tool_name, "call_status": "not_configured"}
+        if tool_name:
+            response = await client.call_tool(tool_name, server.get("args") or {})
+            data = getattr(response, "data", None)
+            if isinstance(data, dict):
+                via_actor = data.get("via_actor")
+                result["data_keys"] = sorted(str(key) for key in data)
+                result["via_actor"] = via_actor.get("sub") if isinstance(via_actor, dict) else via_actor
+            else:
+                result["data_type"] = type(data).__name__
+            result["call_status"] = "ok"
+        return result
+
+
+async def main() -> None:
+    payload = json.load(sys.stdin)
+    results = {}
+    for name, server in sorted(payload["servers"].items()):
+        try:
+            results[name] = {"ok": True, **await call_one(server)}
+        except Exception as exc:  # noqa: BLE001 - subprocess returns sanitized diagnostics.
+            results[name] = {
+                "ok": False,
+                "error_type": type(exc).__name__,
+                "message": str(exc)[:300],
+            }
+    print(json.dumps(results, sort_keys=True))
+
+
+asyncio.run(main())
+"""
 
 
 class CanaryError(RuntimeError):
@@ -154,6 +210,13 @@ def bearer_from_headers(headers: dict[str, Any]) -> str | None:
     return authorization[len("Bearer ") :].strip()
 
 
+def token_seconds_remaining(claims: dict[str, Any]) -> int | None:
+    exp = claims.get("exp")
+    if not isinstance(exp, (int, float)):
+        return None
+    return int(exp - time.time())
+
+
 def check_okta(env_file: dict[str, str]) -> dict[str, Any]:
     issuer = env_value("CANARY_IDP_ISSUER", env_file) or env_value("OKTA_ISSUER", env_file) or env_value(
         "IDP_ISSUER", env_file
@@ -204,7 +267,42 @@ def mcp_rpc(url: str, authorization: str, method: str, params: dict[str, Any] | 
     return status
 
 
-def check_mcp(config_path: Path, okta_issuer: str | None, require_mcp: bool) -> dict[str, Any]:
+def fastmcp_call_servers(
+    servers: dict[str, dict[str, Any]],
+    *,
+    fastmcp_python: Path,
+    timeout: int,
+) -> dict[str, dict[str, Any]]:
+    if not fastmcp_python.exists():
+        raise CanaryError(f"FastMCP Python interpreter missing: {fastmcp_python}")
+    completed = subprocess.run(
+        [str(fastmcp_python), "-c", FASTMCP_CLIENT_PROGRAM],
+        input=json.dumps({"servers": servers}),
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip().splitlines()[-1:] or ["<no stderr>"]
+        raise CanaryError(f"FastMCP client subprocess failed rc={completed.returncode}: {stderr[0][:240]}")
+    try:
+        parsed = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise CanaryError("FastMCP client subprocess returned non-JSON output") from exc
+    if not isinstance(parsed, dict):
+        raise CanaryError("FastMCP client subprocess returned invalid result shape")
+    return {str(name): result for name, result in parsed.items() if isinstance(result, dict)}
+
+
+def check_mcp(
+    config_path: Path,
+    okta_issuer: str | None,
+    require_mcp: bool,
+    *,
+    call_mode: str,
+    fastmcp_python: Path,
+) -> dict[str, Any]:
     if not config_path.exists():
         event = "mcp_not_configured"
         log(event, config=str(config_path), missing=["mcp config"])
@@ -221,6 +319,7 @@ def check_mcp(config_path: Path, okta_issuer: str | None, require_mcp: bool) -> 
         return {"configured": False}
 
     checked: list[dict[str, Any]] = []
+    mcp_servers: dict[str, dict[str, Any]] = {}
     for name, server in sorted(servers.items()):
         if not isinstance(server, dict):
             continue
@@ -237,7 +336,50 @@ def check_mcp(config_path: Path, okta_issuer: str | None, require_mcp: bool) -> 
         if okta_issuer and token_issuer != okta_issuer.rstrip("/"):
             raise CanaryError(f"MCP bearer issuer for {name} does not match configured Okta issuer")
         authorization = headers.get("Authorization") or headers.get("authorization")
-        assert isinstance(authorization, str)
+        if not isinstance(authorization, str):
+            raise CanaryError(f"MCP server {name} missing string Authorization header")
+        tool_name, tool_args = MCP_TOOL_PROBES.get(name, (None, {}))
+        mcp_servers[name] = {
+            "url": url,
+            "headers": {"Authorization": authorization},
+            "tool": tool_name,
+            "args": tool_args,
+        }
+        checked.append(
+            {
+                "name": name,
+                "url": url,
+                "token_issuer": token_issuer,
+                "token_subject_present": bool(claims.get("sub")),
+                "token_seconds_remaining": token_seconds_remaining(claims),
+            }
+        )
+
+    if not checked:
+        log("mcp_not_configured", config=str(config_path), missing=["valid mcpServers"])
+        if require_mcp:
+            raise CanaryError("MCP config has no valid mcpServers entries")
+        return {"configured": False}
+
+    fastmcp_results: dict[str, dict[str, Any]] = {}
+    use_fastmcp = call_mode == "fastmcp" or (call_mode == "auto" and fastmcp_python.exists())
+    if use_fastmcp:
+        fastmcp_results = fastmcp_call_servers(mcp_servers, fastmcp_python=fastmcp_python, timeout=45)
+
+    failures: list[str] = []
+    for entry in checked:
+        name = str(entry["name"])
+        authorization = mcp_servers[name]["headers"]["Authorization"]
+        url = str(mcp_servers[name]["url"])
+        if fastmcp_results:
+            result = fastmcp_results.get(name, {"ok": False, "error_type": "missing_result"})
+            safe_result = redact(result)
+            entry["client"] = "fastmcp"
+            entry["tool"] = mcp_servers[name].get("tool")
+            entry["fastmcp"] = safe_result
+            if not bool(result.get("ok")):
+                failures.append(f"{name}: {result.get('error_type', 'error')}")
+            continue
         try:
             initialize_status = mcp_rpc(
                 url,
@@ -255,19 +397,14 @@ def check_mcp(config_path: Path, okta_issuer: str | None, require_mcp: bool) -> 
                 raise
             initialize_status = 0
             tools_status = 0
-        checked.append(
-            {
-                "name": name,
-                "url": url,
-                "token_issuer": token_issuer,
-                "token_subject_present": bool(claims.get("sub")),
-                "initialize_status": initialize_status,
-                "tools_list_status": tools_status,
-            }
-        )
+        entry["client"] = "raw-jsonrpc"
+        entry["initialize_status"] = initialize_status
+        entry["tools_list_status"] = tools_status
         if require_mcp and initialize_status >= 400 and tools_status >= 400:
-            raise CanaryError(f"MCP server {name} rejected authenticated endpoint calls")
+            failures.append(f"{name}: raw initialize/tools rejected")
     log("mcp_endpoints_checked", servers=checked)
+    if require_mcp and failures:
+        raise CanaryError(f"MCP endpoint proof failed: {', '.join(failures)}")
     return {"configured": True, "servers": checked}
 
 
@@ -319,7 +456,13 @@ def run_once(args: argparse.Namespace) -> bool:
     env_file = parse_env_file(args.env_file)
     try:
         okta = check_okta(env_file)
-        check_mcp(args.mcp_config, okta.get("issuer") if okta.get("configured") else None, args.require_mcp)
+        check_mcp(
+            args.mcp_config,
+            okta.get("issuer") if okta.get("configured") else None,
+            args.require_mcp,
+            call_mode=args.mcp_call_mode,
+            fastmcp_python=args.fastmcp_python,
+        )
         check_sts(env_file)
     except Exception as exc:
         log("real_tenant_endpoint_loop_result", result="fail", error_type=type(exc).__name__, message=str(exc))
@@ -334,6 +477,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-file", type=Path, default=DEFAULT_OBO_ENV)
     parser.add_argument("--mcp-config", type=Path, default=DEFAULT_MCP_CONFIG)
     parser.add_argument("--require-mcp", action="store_true", help="fail when configured MCP endpoints are unreachable")
+    parser.add_argument(
+        "--mcp-call-mode",
+        choices=("auto", "raw", "fastmcp"),
+        default="auto",
+        help="MCP endpoint proof mode; auto uses FastMCP when available",
+    )
+    parser.add_argument("--fastmcp-python", type=Path, default=DEFAULT_FASTMCP_PYTHON)
     return parser.parse_args()
 
 
