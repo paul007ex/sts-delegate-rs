@@ -82,6 +82,13 @@ Use the Rust-native skills for Rust work:
 - `rust-security-code-anti-pattern-audit`
 - `sts-delegate-rust-pm`
 
+Use the Rust sts-delegate adapters when the work is repo-specific:
+
+- `sts-delegate-rs-anti-pattern-audit` for Rust STS issue/code/security/parity QA
+- `rust-dpop-sender-constraint` for RFC 9449 DPoP and `cnf.jkt` behavior
+- `rust-oss-release-auditor` for Rust release, artifact, and supply-chain gates
+- `sts-delegate-rs-docs` for Rust contract docs, ADRs, parity matrices, and issue text
+
 GitHub issues are canonical for all work items, bugs, features, and acceptance criteria.
 The `/tmp/sts-delegate-rs-coordination-log.md` file is a monitoring trail only.
 
@@ -106,4 +113,3 @@ If the issue scope is vague, tighten the scope before touching code.
 5. Run the relevant tests or parity checks.
 6. Update the issue thread with evidence and follow-up.
 7. Move immediately to the next unblocked issue.
-
