@@ -300,14 +300,16 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | #15 | http/security | Both-mode empty `actor_token` could dispatch incorrectly | Mode dispatch | closed | Empty present actor token must remain malformed. |
 | #16 | core/http | Subject auth-context claims needed Python parity | Minted claims | closed | Keep auth-context carry contract test. |
 | #17 | http/parity | Residual Python parity gaps for token form and route errors | Request/error surface | closed | Keep route/error contract tests. |
-| #18 | runtime/security | No production bootstrap composes config, keys, trust anchors, replay, and startup validation | Runtime startup | open | Requires executable bootstrap and startup smoke before release readiness. |
+| #18 | runtime/security | Production bootstrap now composes config, keys, trust anchors, replay, and startup validation before serving | Runtime startup | closed | Keep bootstrap smoke and fail-closed startup tests in release gates. |
 | #19 | jose/pqc/security | Native PQC signing, JWKS publication, and downstream verification are missing | JOSE/PQC | open | Implement RFC 9964-compatible ML-DSA/AKP support before any PQC capability claim. |
 | #20 | cli/ops | CLI is a stub with no rotation, canary, smoke, or key-inspection commands | CLI/ops | open | Add explicit operator command surface or document deferral. |
 | #21 | tests/security | Real Okta proof must not be substituted with synthetic issuer evidence | Live canary | open | Add committed not-configured/redacted Rust canary path before readiness closeout. |
 | #22 | http/ops | Metrics/OpenAPI parity is undecided and unimplemented | Metrics/OpenAPI | open | Port Python behavior and gates or mark explicit non-goal/deferred. |
-| #23 | security/tests | Secure Rust audit loop is normal-mode usable but strict supply-chain mode lacks tools/policy | Security loop | open | Install/pin supply-chain tools and add deny policy before strict release gate. |
+| #23 | security/tests | Secure Rust audit loop has normal monitoring plus pinned strict supply-chain tooling/policy, but strict mode is blocked by `rsa` advisory and geiger stability | Security loop | open | Resolve RustSec RSA advisory and make strict mode pass before release readiness. |
 | #24 | replay/security | Poisoned replay mutex locks could panic instead of failing closed | Replay availability | closed | Keep poisoned-lock fail-closed tests in release gate. |
 | #25 | http/security | `may_act` delegation/impersonation behavior lacked Rust contract coverage | Delegation authorization | closed | Keep may_act Rust contracts and Python oracle smoke entries. |
+| #26 | validation/security | Configured gateway MCP paths returned 401 after edge Okta auth | Gateway MCP proof | closed | Keep configured FastMCP proof and obo-lab gateway passthrough config aligned. |
+| #27 | jose/security | `rsa 0.9.10` is flagged by RustSec RUSTSEC-2023-0071 and has no fixed upgrade | JOSE signing/verification dependency | open | Replace or explicitly mitigate the RSA backend before release readiness. |
 | Python #210 | bug/parity | Scoped token cannot outlive subject | Token lifetime | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
 | Python #280 | bug/parity | Scoped token cannot outlive actor | Token lifetime | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
 | Python #279 | bug/parity | `expires_in` must reflect capped lifetime | Token response | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
@@ -316,12 +318,12 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 
 ## Current Freeze Gaps
 
-- Runtime bootstrap is still missing: no executable boundary loads config, signing keys, trust anchors, replay policy, and startup validation before serving (#18).
 - Native PQC signing/JWKS/downstream verification is missing; only fail-closed selection is shipped (#19).
+- Runtime JOSE still depends on `rsa 0.9.10`, which strict supply-chain tools flag for RUSTSEC-2023-0071 (#27).
 - CLI/ops helpers are only a crate boundary, not a complete product surface (#20).
 - Real Okta canary readiness still lacks a committed Rust not-configured/redacted live-tenant validation path (#21).
 - Metrics/OpenAPI parity is unresolved; Rust must either port Python behavior and gates or mark the scope explicit non-goal/deferred (#22).
-- Strict supply-chain release evidence is not available until `cargo-audit`, `cargo-deny`, `cargo-geiger`, and `cargo-vet` are installed/pinned and policy config is committed (#23).
+- Strict supply-chain release evidence is not green until the RustSec RSA advisory and geiger stability findings are resolved (#23).
 - Full Authorization Server features remain non-goals for this STS alpha.
 
 ## Executive Conclusion

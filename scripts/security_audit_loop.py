@@ -28,20 +28,26 @@ SECRET_LOG_PATTERN = re.compile(
 )
 
 OPTIONAL_SUPPLY_CHAIN_TOOLS = {
-    "cargo-audit": ["cargo", "audit"],
-    "cargo-deny": ["cargo", "deny", "check"],
-    "cargo-geiger": ["cargo", "geiger", "--all-features"],
-    "cargo-vet": ["cargo", "vet"],
+    "cargo-audit": "cargo audit",
+    "cargo-deny": "cargo deny check",
+    "cargo-geiger": "cargo geiger",
+    "cargo-vet": "cargo vet",
 }
+
+STRICT_SUPPLY_CHAIN_TIMEOUT_SECONDS = 180
 
 
 def timestamp() -> str:
     return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def run_command(label: str, command: list[str]) -> bool:
+def run_command(label: str, command: list[str], timeout: int | None = None) -> bool:
     print(f"check={label} command={' '.join(command)}")
-    completed = subprocess.run(command, cwd=REPO, text=True, check=False)
+    try:
+        completed = subprocess.run(command, cwd=REPO, text=True, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print(f"check={label} result=fail reason=timeout seconds={timeout}")
+        return False
     if completed.returncode == 0:
         print(f"check={label} result=pass")
         return True
@@ -126,14 +132,37 @@ def scan_production_rust() -> bool:
     return False
 
 
-def run_supply_chain_tools(strict_missing: bool) -> bool:
+def strict_supply_chain_commands() -> dict[str, list[str]]:
+    cli_manifest = REPO / "crates/sts-cli/Cargo.toml"
+    return {
+        "cargo-audit": ["cargo", "audit"],
+        "cargo-deny": ["cargo", "deny", "check"],
+        "cargo-geiger": [
+            "cargo",
+            "geiger",
+            "--manifest-path",
+            str(cli_manifest),
+            "--all-features",
+            "--forbid-only",
+            "--locked",
+            "--output-format",
+            "Ratio",
+        ],
+        "cargo-vet": ["cargo", "vet"],
+    }
+
+
+def run_supply_chain_tools(strict: bool) -> bool:
     ok = True
-    for binary, command in OPTIONAL_SUPPLY_CHAIN_TOOLS.items():
+    commands = strict_supply_chain_commands()
+    for binary, description in OPTIONAL_SUPPLY_CHAIN_TOOLS.items():
         if shutil.which(binary) is None:
             print(f"check={binary} result=missing")
-            ok = ok and not strict_missing
+            ok = ok and not strict
             continue
-        ok = run_command(binary, command) and ok
+        print(f"check={binary} result=installed command='{description}'")
+        if strict:
+            ok = run_command(binary, commands[binary], timeout=STRICT_SUPPLY_CHAIN_TIMEOUT_SECONDS) and ok
     return ok
 
 

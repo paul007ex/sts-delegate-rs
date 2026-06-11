@@ -33,9 +33,12 @@ environment unless an issue explicitly requires a pinned toolchain.
 
 For substantive security, protocol, JOSE, DPoP, replay, runtime, or release changes,
 run the secure Rust audit loop after the focused tests. For background monitoring, run
-`python3 scripts/security_audit_loop.py --loop 180`. For release or CI gates, add
-`--strict-supply-chain`; that mode requires `cargo-audit`, `cargo-deny`,
-`cargo-geiger`, and `cargo-vet` to be installed and passing.
+`python3 scripts/security_audit_loop.py --loop 180`. Normal mode reports
+installed/missing supply-chain tools without executing the full release gate. For
+release gates, add `--strict-supply-chain`; that mode requires `cargo-audit`,
+`cargo-deny`, `cargo-geiger`, and `cargo-vet` to be installed and passing.
+Use `scripts/install_supply_chain_tools.sh` to install the pinned local/CI tool
+versions.
 
 For live tenant/MCP evidence, run `python3 scripts/real_tenant_endpoint_loop.py`.
 Use `--mcp-call-mode fastmcp --require-mcp` when proving Claude/MCP client calls
@@ -94,8 +97,9 @@ Keep key custody out of protocol glue.
 
 The secure Rust loop must stay active during product work. It checks formatting,
 Clippy, crate boundaries, duplicate dependencies, production panic/placeholder/unsafe
-patterns, sensitive logging patterns, and installed supply-chain tools. Confirmed
-findings belong in GitHub issues before they are treated as resolved.
+patterns, sensitive logging patterns, and supply-chain tool availability. Strict
+mode executes the installed supply-chain tools. Confirmed findings belong in GitHub
+issues before they are treated as resolved.
 
 ## Agent-Specific Review Rules
 
