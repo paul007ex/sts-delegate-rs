@@ -6,6 +6,7 @@
 small, explicit, and layered. The initial crates are:
 
 - `sts-core` for token-exchange policy and claim shaping
+- `sts-dpop` for RFC 9449 DPoP proof validation and holder-key binding
 - `sts-verify` for issuer/trust-anchor validation
 - `sts-replay` for replay policy and state
 - `sts-jose` for JOSE/JWK/JWKS and signing backend selection

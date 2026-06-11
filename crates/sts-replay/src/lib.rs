@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Mutex;
 
+use sha2::{Digest, Sha256};
+
 /// Failure categories for replay enforcement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayErrorKind {
@@ -151,6 +153,29 @@ impl ReplayPolicy {
     }
 }
 
+/// Build the bounded replay key for a DPoP proof.
+///
+/// RFC 9449 makes the proof `jti` single-use per holder key. Hashing
+/// `jkt || NUL || jti` keeps the replay-store key fixed-size even though both
+/// values are caller-controlled.
+pub fn dpop_replay_key(jkt: &str, jti: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(jkt.as_bytes());
+    hasher.update([0]);
+    hasher.update(jti.as_bytes());
+    format!("dpop:{}", hex_lower(&hasher.finalize()))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +208,13 @@ mod tests {
         let policy = ReplayPolicy::in_memory();
         assert!(policy.check_and_record("jti-1", 10, 1).is_ok());
         assert_eq!(policy.cache_size(), 1);
+    }
+
+    #[test]
+    fn dpop_replay_key_is_bounded_and_namespaced() {
+        let key = dpop_replay_key("holder-thumbprint", &"x".repeat(4096));
+        assert!(key.starts_with("dpop:"));
+        assert_eq!(key.len(), "dpop:".len() + 64);
+        assert_ne!(key, dpop_replay_key("holder-thumbprintx", ""));
     }
 }

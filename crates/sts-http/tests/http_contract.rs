@@ -3,6 +3,9 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::header::{CACHE_CONTROL, CONTENT_TYPE, PRAGMA};
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::BodyExt;
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use p256::ecdsa::SigningKey;
+use p256::pkcs8::EncodePrivateKey;
 use rand::{SeedableRng, rngs::StdRng};
 use rsa::RsaPrivateKey;
 use serde::Serialize;
@@ -32,6 +35,14 @@ struct AssertionWireClaims {
     exp: i64,
     iat: i64,
     jti: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DpopProofClaims {
+    jti: String,
+    htm: String,
+    htu: String,
+    iat: i64,
 }
 
 fn signer(seed: u64, kid: &str) -> RsaJoseSigner {
@@ -106,23 +117,56 @@ async fn read_json(response: Response<Body>) -> Value {
 }
 
 async fn post_token_form(state: HttpState, body: String) -> Response<Body> {
-    router(state)
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/token")
-                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap()
+    post_token_form_with_dpop_values(state, body, &[]).await
+}
+
+async fn post_token_form_with_dpop_values(
+    state: HttpState,
+    body: String,
+    dpop_values: &[&str],
+) -> Response<Body> {
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri("/token")
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded");
+    for value in dpop_values {
+        builder = builder.header("DPoP", *value);
+    }
+    router(state).oneshot(builder.body(Body::from(body)).unwrap()).await.unwrap()
 }
 
 fn jwt_segment(token: &str, index: usize) -> Value {
     let segment = token.split('.').nth(index).expect("jwt segment");
     let bytes = URL_SAFE_NO_PAD.decode(segment.as_bytes()).expect("base64url");
     serde_json::from_slice(&bytes).expect("json segment")
+}
+
+fn dpop_proof(now: i64, jti: &str, htm: &str, htu: &str) -> String {
+    let signing_key = SigningKey::from_slice(&[7_u8; 32]).expect("p256 key");
+    let verifying_key = signing_key.verifying_key();
+    let point = verifying_key.to_encoded_point(false);
+    let jwk = json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "x": URL_SAFE_NO_PAD.encode(point.x().expect("x coordinate")),
+        "y": URL_SAFE_NO_PAD.encode(point.y().expect("y coordinate")),
+        "alg": "ES256",
+    });
+    let mut header = Header::new(Algorithm::ES256);
+    header.typ = Some("dpop+jwt".to_string());
+    header.jwk = Some(serde_json::from_value(jwk).expect("jwk"));
+    let der = signing_key.to_pkcs8_der().expect("pkcs8 der");
+    encode(
+        &header,
+        &DpopProofClaims {
+            jti: jti.to_string(),
+            htm: htm.to_string(),
+            htu: htu.to_string(),
+            iat: now,
+        },
+        &EncodingKey::from_ec_der(der.as_bytes()),
+    )
+    .expect("dpop proof")
 }
 
 #[tokio::test]
@@ -151,6 +195,18 @@ async fn contract_discovery_and_jwks_match_python_oracle_shape() {
     assert_eq!(metadata["grant_types_supported"], json!([TOKEN_EXCHANGE_GRANT_TYPE]));
     assert_eq!(metadata["token_endpoint_auth_methods_supported"], json!(["private_key_jwt"]));
     assert_eq!(metadata["token_endpoint_auth_signing_alg_values_supported"], json!(["RS256"]));
+    assert!(
+        metadata["dpop_signing_alg_values_supported"]
+            .as_array()
+            .expect("dpop algs")
+            .contains(&json!("ES256"))
+    );
+    assert!(
+        !metadata["dpop_signing_alg_values_supported"]
+            .as_array()
+            .expect("dpop algs")
+            .contains(&json!("HS256"))
+    );
 
     let jwks_response = router(state)
         .oneshot(Request::builder().method(Method::GET).uri("/jwks").body(Body::empty()).unwrap())
@@ -166,6 +222,90 @@ async fn contract_discovery_and_jwks_match_python_oracle_shape() {
     for private_member in ["d", "p", "q", "dp", "dq", "qi"] {
         assert!(key.get(private_member).is_none(), "JWKS leaked {private_member}");
     }
+}
+
+#[tokio::test]
+async fn contract_dpop_delegation_binds_token_and_returns_dpop_type() {
+    let (state, subject_signer, actor_signer, _) = test_state();
+    let now = unix_now();
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let actor_token = signed_assertion(&actor_signer, now, "actor-dpop-contract-1");
+    let proof = dpop_proof(now, "dpop-contract-1", "POST", "https://sts.example/token?ignored=1");
+    let body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", actor_token.as_str()),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+    ])
+    .expect("form");
+
+    let response = post_token_form_with_dpop_values(state, body, &[&proof]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = read_json(response).await;
+    assert_eq!(response_body["token_type"], "DPoP");
+    let token = response_body["access_token"].as_str().expect("access token");
+    let payload = jwt_segment(token, 1);
+    assert!(payload["cnf"]["jkt"].as_str().is_some_and(|value| !value.is_empty()));
+    assert!(payload.get("cnf_jkt").is_none());
+}
+
+#[tokio::test]
+async fn contract_dpop_replay_reuses_holder_key_and_jti_fail_closed() {
+    let (state, subject_signer, actor_signer, _) = test_state();
+    let now = unix_now();
+    let proof = dpop_proof(now, "dpop-contract-replay", "POST", "https://sts.example/token");
+
+    for actor_jti in ["actor-dpop-replay-1", "actor-dpop-replay-2"] {
+        let subject_token = signed_subject_token(&subject_signer, now);
+        let actor_token = signed_assertion(&actor_signer, now, actor_jti);
+        let body = serde_urlencoded::to_string([
+            ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+            ("subject_token", subject_token.as_str()),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("actor_token", actor_token.as_str()),
+            ("actor_token_type", JWT_TOKEN_TYPE),
+            ("audience", "api://chat-mcp"),
+            ("scope", "chat.read"),
+        ])
+        .expect("form");
+        let response = post_token_form_with_dpop_values(state.clone(), body, &[&proof]).await;
+        if actor_jti.ends_with("-1") {
+            assert_eq!(response.status(), StatusCode::OK);
+        } else {
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = read_json(response).await;
+            assert_eq!(body["error"], "invalid_dpop_proof");
+            assert!(body["error_description"].as_str().unwrap_or("").contains("replay"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn contract_dpop_duplicate_or_malformed_header_is_invalid_dpop_proof() {
+    let (state, _, _, _) = test_state();
+    let body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", "bad-subject"),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", "bad-actor"),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+    ])
+    .expect("form");
+    let proof = dpop_proof(unix_now(), "dpop-duplicate", "POST", "https://sts.example/token");
+    let response =
+        post_token_form_with_dpop_values(state.clone(), body.clone(), &[&proof, &proof]).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body_json = read_json(response).await;
+    assert_eq!(body_json["error"], "invalid_dpop_proof");
+
+    let response = post_token_form_with_dpop_values(state, body, &["not.a.jwt"]).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body_json = read_json(response).await;
+    assert_eq!(body_json["error"], "invalid_dpop_proof");
 }
 
 #[tokio::test]
@@ -245,6 +385,40 @@ async fn contract_impersonation_omits_act_claim() {
     assert_eq!(payload["sub"], "alice@example.com");
     assert_eq!(payload["client_id"], "chat-mcp");
     assert!(payload.get("act").is_none(), "impersonation must omit act");
+}
+
+#[tokio::test]
+async fn contract_dpop_impersonation_binds_token_without_act_claim() {
+    let (mut state, subject_signer, _, client_signer) = test_state();
+    state.config.token_exchange_mode = TokenExchangeMode::Impersonation;
+    state.config.impersonation_policy.allowed_clients.insert("chat-mcp".to_string());
+    let now = unix_now();
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let client_assertion = signed_assertion(&client_signer, now, "client-dpop-contract-1");
+    let proof =
+        dpop_proof(now, "dpop-impersonation-contract-1", "POST", "https://sts.example/token");
+    let body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+        ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+        ("client_assertion", client_assertion.as_str()),
+        ("client_id", "chat-mcp"),
+    ])
+    .expect("form");
+
+    let response = post_token_form_with_dpop_values(state, body, &[&proof]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = read_json(response).await;
+    assert_eq!(response_body["token_type"], "DPoP");
+    let token = response_body["access_token"].as_str().expect("access token");
+    let payload = jwt_segment(token, 1);
+    assert_eq!(payload["sub"], "alice@example.com");
+    assert_eq!(payload["client_id"], "chat-mcp");
+    assert!(payload.get("act").is_none(), "impersonation must omit act");
+    assert!(payload["cnf"]["jkt"].as_str().is_some_and(|value| !value.is_empty()));
 }
 
 #[tokio::test]

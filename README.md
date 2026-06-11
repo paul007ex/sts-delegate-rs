@@ -5,6 +5,7 @@ Rust-native successor to `sts-delegate`: an OAuth 2.1 / RFC 8693 security token 
 ## Workspace shape
 
 - `sts-core` - token exchange policy, claims, and request/response contract
+- `sts-dpop` - RFC 9449 DPoP proof validation and holder-key binding
 - `sts-jose` - JOSE/JWK/JWKS, signing, and algorithm/backend selection
 - `sts-verify` - trust anchors, issuer verification, client/actor assertion checks
 - `sts-replay` - jti replay state and sender-constraining replay keys

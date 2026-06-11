@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/sts-core",
+    "crates/sts-dpop",
     "crates/sts-jose",
     "crates/sts-verify",
     "crates/sts-replay",

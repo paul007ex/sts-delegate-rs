@@ -25,8 +25,11 @@ use sts_core::{
     ACCESS_TOKEN_TYPE, ActClaim, ExchangeRequest, JWT_TOKEN_TYPE, TOKEN_EXCHANGE_GRANT_TYPE,
     build_act, build_scoped_payload, downscope, resolve_target,
 };
+use sts_dpop::{
+    DPOP_SIGNING_ALGS_SUPPORTED, DpopBinding, DpopError, DpopProofRequest, validate_dpop_proof,
+};
 use sts_jose::{JoseSigner, JwksDocument, RsaJoseSigner};
-use sts_replay::{ReplayErrorKind, ReplayPolicy};
+use sts_replay::{ReplayErrorKind, ReplayPolicy, dpop_replay_key};
 use sts_verify::{
     AssertionClaims, AssertionVerificationOptions, SubjectTokenClaims, VerifyError,
     VerifyErrorKind, verify_assertion, verify_subject_token,
@@ -35,11 +38,21 @@ use url::Url;
 
 const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
+const DPOP_HEADER: HeaderName = HeaderName::from_static("dpop");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EffectiveExchangeMode {
     Delegation,
     Impersonation,
+}
+
+struct VerifiedExchange {
+    subject_claims: SubjectTokenClaims,
+    subject_sub: String,
+    target: String,
+    scope: String,
+    client_claims: Option<AssertionClaims>,
+    dpop_binding: Option<DpopBinding>,
 }
 
 /// Shared HTTP runtime state.
@@ -111,6 +124,7 @@ pub struct AuthorizationServerMetadata {
     pub grant_types_supported: Vec<String>,
     pub token_endpoint_auth_methods_supported: Vec<String>,
     pub token_endpoint_auth_signing_alg_values_supported: Vec<String>,
+    pub dpop_signing_alg_values_supported: Vec<String>,
 }
 
 /// OAuth token response for RFC 8693 token exchange.
@@ -196,6 +210,10 @@ impl HttpError {
         Self::oauth(StatusCode::BAD_REQUEST, "unsupported_grant_type", description)
     }
 
+    fn invalid_dpop_proof(description: impl Into<String>) -> Self {
+        Self::oauth(StatusCode::BAD_REQUEST, "invalid_dpop_proof", description)
+    }
+
     fn service_unavailable(description: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -258,11 +276,16 @@ async fn metadata(State(state): State<HttpState>) -> impl IntoResponse {
         grant_types_supported: vec![TOKEN_EXCHANGE_GRANT_TYPE.to_string()],
         token_endpoint_auth_methods_supported: vec!["private_key_jwt".to_string()],
         token_endpoint_auth_signing_alg_values_supported: vec!["RS256".to_string()],
+        dpop_signing_alg_values_supported: DPOP_SIGNING_ALGS_SUPPORTED
+            .iter()
+            .map(|alg| (*alg).to_string())
+            .collect(),
     };
     (public_cache_headers(state.config.jwks_cache_max_age), Json(document))
 }
 
 async fn token(
+    headers: HeaderMap,
     State(state): State<HttpState>,
     Form(form): Form<TokenForm>,
 ) -> Result<(HeaderMap, Json<TokenResponse>), HttpError> {
@@ -270,6 +293,7 @@ async fn token(
     validate_request_params(&request, state.config.max_token_len)?;
     let mode = effective_exchange_mode(&state.config, &request);
     let client_claims = authenticate_client_if_present(&state, &request, mode)?;
+    let dpop_binding = validate_dpop_header(&headers, &state, unix_now())?;
 
     let expected_subject_audiences =
         state.config.expected_subject_aud.iter().cloned().collect::<Vec<_>>();
@@ -289,39 +313,27 @@ async fn token(
         .clone()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| HttpError::invalid_grant("subject token missing sub"))?;
+    let exchange = VerifiedExchange {
+        subject_claims,
+        subject_sub,
+        target,
+        scope,
+        client_claims,
+        dpop_binding,
+    };
 
     match mode {
-        EffectiveExchangeMode::Delegation => exchange_delegation(
-            state,
-            request,
-            subject_claims,
-            subject_sub,
-            target,
-            scope,
-            client_claims,
-        ),
-        EffectiveExchangeMode::Impersonation => exchange_impersonation(
-            state,
-            request,
-            subject_claims,
-            subject_sub,
-            target,
-            scope,
-            client_claims,
-        ),
+        EffectiveExchangeMode::Delegation => exchange_delegation(state, request, exchange),
+        EffectiveExchangeMode::Impersonation => exchange_impersonation(state, request, exchange),
     }
 }
 
 fn exchange_delegation(
     state: HttpState,
     request: ExchangeRequest,
-    subject_claims: SubjectTokenClaims,
-    subject_sub: String,
-    target: String,
-    scope: String,
-    client_claims: Option<AssertionClaims>,
+    exchange: VerifiedExchange,
 ) -> Result<(HeaderMap, Json<TokenResponse>), HttpError> {
-    let client_authenticated = client_claims.is_some();
+    let client_authenticated = exchange.client_claims.is_some();
     let actor_token = request.actor_token.as_deref().ok_or_else(|| {
         if client_authenticated {
             HttpError::invalid_request("actor_token required for delegation")
@@ -333,7 +345,7 @@ fn exchange_delegation(
     })?;
     let actor_claims = verify_actor_token(&state, actor_token, &request.subject_token)?;
     validate_actor_identity(&state, &actor_claims)?;
-    gate_may_act(&subject_claims, &actor_claims)?;
+    gate_may_act(&exchange.subject_claims, &actor_claims)?;
 
     let now = unix_now();
     let actor_jti =
@@ -344,31 +356,34 @@ fn exchange_delegation(
         .replay
         .check_and_record(&format!("act:{}:{actor_jti}", actor_claims.sub), actor_claims.exp, now)
         .map_err(map_replay_error)?;
-    if let Some(client_claims) = &client_claims {
+    if let Some(client_claims) = &exchange.client_claims {
         record_client_assertion_replay(&state, client_claims, now)?;
     }
+    if let Some(binding) = &exchange.dpop_binding {
+        record_dpop_replay(&state, binding, now)?;
+    }
 
-    let exp = [now + state.config.scoped_token_ttl, subject_claims.exp, actor_claims.exp]
+    let exp = [now + state.config.scoped_token_ttl, exchange.subject_claims.exp, actor_claims.exp]
         .into_iter()
         .min()
         .unwrap_or(now + state.config.scoped_token_ttl);
-    let prior_act = subject_claims.act.as_ref().map(act_claim_from_value).transpose()?;
+    let prior_act = exchange.subject_claims.act.as_ref().map(act_claim_from_value).transpose()?;
     let act = build_act(actor_claims.sub.clone(), prior_act);
     let mut payload = build_scoped_payload(
         state.config.our_issuer.clone(),
-        subject_sub,
-        target,
-        scope.clone(),
+        exchange.subject_sub,
+        exchange.target,
+        exchange.scope.clone(),
         now,
         exp,
         new_jti(),
         actor_claims.sub.clone(),
         Some(act),
-        None,
+        exchange.dpop_binding.as_ref().map(|binding| binding.jkt.clone()),
     );
-    payload.auth_time = subject_claims.auth_time;
-    payload.acr = subject_claims.acr.clone();
-    payload.amr = subject_claims.amr.clone().unwrap_or_default();
+    payload.auth_time = exchange.subject_claims.auth_time;
+    payload.acr = exchange.subject_claims.acr.clone();
+    payload.amr = exchange.subject_claims.amr.clone().unwrap_or_default();
 
     let access_token = state.signer.sign_claims(&payload).map_err(|err| {
         HttpError::server_error(format!("failed to sign scoped token: {}", err.message))
@@ -379,9 +394,9 @@ fn exchange_delegation(
         Json(TokenResponse {
             access_token,
             issued_token_type: ACCESS_TOKEN_TYPE.to_string(),
-            token_type: "Bearer".to_string(),
+            token_type: token_type_for_sender(&exchange.dpop_binding).to_string(),
             expires_in: (exp - now).max(0),
-            scope,
+            scope: exchange.scope,
         }),
     ))
 }
@@ -389,18 +404,15 @@ fn exchange_delegation(
 fn exchange_impersonation(
     state: HttpState,
     request: ExchangeRequest,
-    subject_claims: SubjectTokenClaims,
-    subject_sub: String,
-    target: String,
-    scope: String,
-    client_claims: Option<AssertionClaims>,
+    exchange: VerifiedExchange,
 ) -> Result<(HeaderMap, Json<TokenResponse>), HttpError> {
     if request.actor_token.is_some() {
         return Err(HttpError::invalid_client(
             "impersonation requires client_assertion, not actor_token",
         ));
     }
-    let client_claims = client_claims
+    let client_claims = exchange
+        .client_claims
         .ok_or_else(|| HttpError::invalid_client("impersonation requires client_assertion"))?;
     if !state.config.impersonation_policy.allowed_clients.contains(&client_claims.sub) {
         return Err(HttpError::invalid_request(format!(
@@ -411,25 +423,28 @@ fn exchange_impersonation(
 
     let now = unix_now();
     record_client_assertion_replay(&state, &client_claims, now)?;
-    let exp = [now + state.config.scoped_token_ttl, subject_claims.exp, client_claims.exp]
+    if let Some(binding) = &exchange.dpop_binding {
+        record_dpop_replay(&state, binding, now)?;
+    }
+    let exp = [now + state.config.scoped_token_ttl, exchange.subject_claims.exp, client_claims.exp]
         .into_iter()
         .min()
         .unwrap_or(now + state.config.scoped_token_ttl);
     let mut payload = build_scoped_payload(
         state.config.our_issuer.clone(),
-        subject_sub,
-        target,
-        scope.clone(),
+        exchange.subject_sub,
+        exchange.target,
+        exchange.scope.clone(),
         now,
         exp,
         new_jti(),
         client_claims.sub.clone(),
         None,
-        None,
+        exchange.dpop_binding.as_ref().map(|binding| binding.jkt.clone()),
     );
-    payload.auth_time = subject_claims.auth_time;
-    payload.acr = subject_claims.acr.clone();
-    payload.amr = subject_claims.amr.clone().unwrap_or_default();
+    payload.auth_time = exchange.subject_claims.auth_time;
+    payload.acr = exchange.subject_claims.acr.clone();
+    payload.amr = exchange.subject_claims.amr.clone().unwrap_or_default();
 
     let access_token = state.signer.sign_claims(&payload).map_err(|err| {
         HttpError::server_error(format!("failed to sign scoped token: {}", err.message))
@@ -440,11 +455,52 @@ fn exchange_impersonation(
         Json(TokenResponse {
             access_token,
             issued_token_type: ACCESS_TOKEN_TYPE.to_string(),
-            token_type: "Bearer".to_string(),
+            token_type: token_type_for_sender(&exchange.dpop_binding).to_string(),
             expires_in: (exp - now).max(0),
-            scope,
+            scope: exchange.scope,
         }),
     ))
+}
+
+fn validate_dpop_header(
+    headers: &HeaderMap,
+    state: &HttpState,
+    now: i64,
+) -> Result<Option<DpopBinding>, HttpError> {
+    let mut proofs = headers.get_all(&DPOP_HEADER).iter();
+    let Some(proof) = proofs.next() else {
+        return Ok(None);
+    };
+    if proofs.next().is_some() {
+        return Err(HttpError::invalid_dpop_proof("multiple DPoP header fields are not allowed"));
+    }
+    let proof = proof
+        .to_str()
+        .map_err(|_| HttpError::invalid_dpop_proof("DPoP proof missing or not a string"))?;
+    validate_dpop_proof(DpopProofRequest {
+        proof,
+        htm: "POST",
+        htu: &state.token_endpoint(),
+        now,
+        clock_skew_leeway: state.config.clock_skew_leeway,
+    })
+    .map(Some)
+    .map_err(map_dpop_error)
+}
+
+fn record_dpop_replay(state: &HttpState, binding: &DpopBinding, now: i64) -> Result<(), HttpError> {
+    state
+        .replay
+        .check_and_record(
+            &dpop_replay_key(&binding.jkt, &binding.jti),
+            binding.replay_expires_at,
+            now,
+        )
+        .map_err(map_dpop_replay_error)
+}
+
+fn token_type_for_sender(binding: &Option<DpopBinding>) -> &'static str {
+    if binding.is_some() { "DPoP" } else { "Bearer" }
 }
 
 /// Resolve RFC 8693 delegation versus impersonation before caller authentication.
@@ -833,6 +889,19 @@ fn map_replay_error(err: sts_replay::ReplayError) -> HttpError {
     match err.kind {
         ReplayErrorKind::InvalidRequest | ReplayErrorKind::ReplayDetected => {
             HttpError::invalid_request(err.message)
+        }
+        ReplayErrorKind::StoreFull => HttpError::service_unavailable(err.message),
+    }
+}
+
+fn map_dpop_error(err: DpopError) -> HttpError {
+    HttpError::invalid_dpop_proof(err.message)
+}
+
+fn map_dpop_replay_error(err: sts_replay::ReplayError) -> HttpError {
+    match err.kind {
+        ReplayErrorKind::InvalidRequest | ReplayErrorKind::ReplayDetected => {
+            HttpError::invalid_dpop_proof("DPoP proof replay detected")
         }
         ReplayErrorKind::StoreFull => HttpError::service_unavailable(err.message),
     }

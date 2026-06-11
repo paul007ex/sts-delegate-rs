@@ -17,6 +17,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sts-config = { version = "0.1.0", path = "../sts-config" }
 sts-core = { version = "0.1.0", path = "../sts-core" }
+sts-dpop = { version = "0.1.0", path = "../sts-dpop" }
 sts-jose = { version = "0.1.0", path = "../sts-jose" }
 sts-replay = { version = "0.1.0", path = "../sts-replay" }
 sts-verify = { version = "0.1.0", path = "../sts-verify" }
@@ -24,6 +25,9 @@ url = "2"
 
 [dev-dependencies]
 http-body-util = "0.1"
+jsonwebtoken = { version = "10.4.0", default-features = false, features = ["rust_crypto"] }
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 rsa = { version = "0.9", features = ["pem"] }
 serde_urlencoded = "0.7"
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
