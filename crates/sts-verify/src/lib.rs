@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sts_jose::{JwksDocument, verify_claims_against_jwks, verify_claims_against_jwks_with_header};
 use subtle::ConstantTimeEq;
+use url::{Host, Url};
 
 /// The class of trust anchor being configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,16 +172,40 @@ pub fn validate_issuer(value: &str) -> Result<String, VerifyError> {
     if trimmed.is_empty() {
         return Err(VerifyError::new(VerifyErrorKind::InvalidIssuer, "issuer must not be empty"));
     }
-    if !trimmed.starts_with("https://") {
-        return Err(VerifyError::new(VerifyErrorKind::InvalidIssuer, "issuer must use https://"));
-    }
-    if trimmed.contains('#') {
+    if trimmed.chars().any(char::is_whitespace) {
         return Err(VerifyError::new(
             VerifyErrorKind::InvalidIssuer,
-            "issuer must not contain a fragment",
+            "issuer must not contain whitespace",
         ));
     }
-    Ok(trimmed.to_string())
+    let parsed = Url::parse(trimmed).map_err(|err| {
+        VerifyError::new(
+            VerifyErrorKind::InvalidIssuer,
+            format!("issuer must be an absolute URL: {err}"),
+        )
+    })?;
+    if parsed.host_str().is_none() {
+        return Err(VerifyError::new(VerifyErrorKind::InvalidIssuer, "issuer must include a host"));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(VerifyError::new(
+            VerifyErrorKind::InvalidIssuer,
+            "issuer must not contain a query or fragment component",
+        ));
+    }
+    let is_loopback = match parsed.host() {
+        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(host)) => host.is_loopback(),
+        Some(Host::Ipv6(host)) => host.is_loopback(),
+        None => false,
+    };
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && is_loopback) {
+        return Err(VerifyError::new(
+            VerifyErrorKind::InvalidIssuer,
+            "issuer must use https, except http is allowed for loopback local development",
+        ));
+    }
+    Ok(trimmed.trim_end_matches('/').to_string())
 }
 
 /// Validate a JWKS URL without making network calls.
@@ -516,13 +541,30 @@ mod tests {
 
     #[test]
     fn validate_issuer_accepts_https_urls() {
-        assert_eq!(validate_issuer("https://issuer.example/").unwrap(), "https://issuer.example/");
+        assert_eq!(validate_issuer("https://issuer.example/").unwrap(), "https://issuer.example");
     }
 
     #[test]
-    fn validate_issuer_rejects_plain_http() {
-        let err = validate_issuer("http://issuer.example/").unwrap_err();
-        assert_eq!(err.kind, VerifyErrorKind::InvalidIssuer);
+    fn validate_issuer_accepts_loopback_http_urls() {
+        for (raw, expected) in [
+            ("http://localhost:8888/", "http://localhost:8888"),
+            ("http://127.0.0.1:9000/", "http://127.0.0.1:9000"),
+            ("http://[::1]:9000/", "http://[::1]:9000"),
+        ] {
+            assert_eq!(validate_issuer(raw).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn validate_issuer_rejects_unsafe_components() {
+        for raw in [
+            "https://issuer.example/?q=1",
+            "https://issuer.example#fragment",
+            "http://issuer.example/",
+        ] {
+            let err = validate_issuer(raw).unwrap_err();
+            assert_eq!(err.kind, VerifyErrorKind::InvalidIssuer);
+        }
     }
 
     #[test]
@@ -601,8 +643,10 @@ mod tests {
             axum::serve(listener, app).await.expect("serve");
         });
         let client = Client::new();
-        let doc = discover_document(&client, &format!("http://{}", addr)).await.unwrap_err();
-        assert_eq!(doc.kind, VerifyErrorKind::InvalidIssuer);
+        let doc = discover_document(&client, &format!("http://{}", addr))
+            .await
+            .expect("loopback discovery should be allowed for local development");
+        assert_eq!(doc.jwks_uri, "https://issuer.example/oauth2/default/jwks");
     }
 
     #[test]

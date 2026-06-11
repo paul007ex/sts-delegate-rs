@@ -159,7 +159,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-129 | Full CLI, rotation, canary, and ops helpers are planned v2 product work but not shipped in alpha. | policy | missing | cli/ops | `README.md:14`; `crates/sts-cli/src/main.rs:3` | compile only | Needs dedicated issue. |
 | R-130 | Native PQC signing/JWKS/downstream verification is a v2 requirement, but alpha currently only provides fail-closed selection. | must | missing | jose/security | repo instructions; `crates/sts-jose/src/lib.rs:5` | JOSE fail-closed tests | Needs dedicated implementation issue before claim. |
 | R-131 | Live tenant validation must use the configured real Okta trial issuer; `example.com`, `issuer.example`, `sts.example`, and `*.example.*` are fixture-only and must not close readiness issues. | must | partial | tests/security | issue #21; Python `run-real-idp-canary.md`; `/Users/Shared/claude/obo-lab/okta.env` | ad hoc live Rust/Python Okta harness | Needs committed canary script before readiness closeout. |
-| R-132 | Runtime STS issuer values must reject query components, fragment components, and non-loopback HTTP. | must | open | config/security | issue #13; Python `tests/test_stress.py:920`; Python `infrastructure/config_env.py:47` | missing Rust config test | Decide and test whether Python's loopback HTTP dev exception is preserved. |
+| R-132 | Runtime STS issuer values must reject query components, fragment components, and non-loopback HTTP while preserving Python's loopback HTTP dev exception. | must | implemented | config/security | issue #13; Python `tests/test_stress.py:920`; Python `infrastructure/config_env.py:47` | Rust config/verify issuer tests | Canonicalizes trailing slash to keep issuer/audience/metadata stable. |
 
 ## Use Cases
 
@@ -259,7 +259,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | E-29 | Missing Python oracle repo for smoke script | exit 2 | script | R-010, R-126 |
 | E-30 | Supply-chain helper CLIs absent | report caveat, do not fake audit | release audit notes | R-126 |
 | E-31 | Real Okta tenant config absent during live validation | report not configured; do not substitute `example.com` | issue #21 | R-131 |
-| E-32 | Loopback HTTP STS issuer in local development | preserve or reject only by explicit #13 decision | Python config policy; issue #13 | R-132 |
+| E-32 | Loopback HTTP STS issuer in local development | preserved as explicit local-dev exception | Python config policy; Rust config/verify tests; issue #13 | R-132 |
 
 ## v2 Rust Migration Map
 
@@ -295,7 +295,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | #10 | security | Actor assertion kid could be cross-domain | Actor auth | closed | Keep cross-domain test. |
 | #11 | parity | `requested_token_type=jwt` divergence from Python | Token request | closed | Any future change is intentional divergence issue. |
 | #12 | parity/security | Impersonation policy needed Python target/subject shape | Impersonation | closed | Add more both-mode/empty-token parity tests. |
-| #13 | config/security | RuntimeConfig accepts query/fragment/non-loopback HTTP STS issuers rejected by Python | Startup config and metadata truth | open | Close only after Rust config tests and final loopback policy decision. |
+| #13 | config/security | RuntimeConfig accepted query/fragment/non-loopback HTTP STS issuers rejected by Python | Startup config and metadata truth | implemented in Rust config/verify | Keep issuer-policy tests in release gate. |
 | Python #210 | bug/parity | Scoped token cannot outlive subject | Token lifetime | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
 | Python #280 | bug/parity | Scoped token cannot outlive actor | Token lifetime | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
 | Python #279 | bug/parity | `expires_in` must reflect capped lifetime | Token response | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
@@ -305,7 +305,6 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 ## Current Freeze Gaps
 
 - Rust still needs an explicit catch-all clean 500 test for unexpected HTTP failures.
-- Rust still needs #13 config issuer validation for query, fragment, and non-loopback HTTP values.
 - Native PQC signing/JWKS/downstream verification is missing; only fail-closed selection is shipped.
 - CLI/ops helpers are only a crate boundary, not a complete product surface.
 - Full Authorization Server features remain non-goals for this STS alpha.

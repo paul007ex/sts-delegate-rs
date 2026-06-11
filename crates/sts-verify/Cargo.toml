@@ -17,6 +17,7 @@ sha2 = { version = "0.10", features = ["oid"] }
 subtle = "2"
 sts-jose = { version = "0.1.0", path = "../sts-jose" }
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
+url = "2"
 
 [dev-dependencies]
 axum = "0.8.9"

@@ -13,6 +13,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use url::{Host, Url};
 
 const DEFAULT_ISSUER: &str = "http://localhost:8888/";
 const DEFAULT_KID: &str = "sts-delegate-key-1";
@@ -269,7 +270,10 @@ impl RuntimeConfig {
         Ok(Self {
             idp_issuer,
             expected_subject_aud,
-            our_issuer: validate_issuer(source.get("OBO_STS_ISSUER").unwrap_or(DEFAULT_ISSUER))?,
+            our_issuer: validate_issuer(
+                source.get("OBO_STS_ISSUER").unwrap_or(DEFAULT_ISSUER),
+                "OBO_STS_ISSUER",
+            )?,
             our_kid: DEFAULT_KID.to_string(),
             sts_secrets_dir,
             actor_jwks_file,
@@ -372,10 +376,10 @@ fn default_secrets_dir() -> PathBuf {
 
 fn require_issuer(source: &ConfigSource) -> Result<String, ConfigError> {
     if let Some(value) = source.get("IDP_ISSUER") {
-        return validate_issuer(value);
+        return validate_issuer(value, "IDP_ISSUER");
     }
     if let Some(value) = source.get("OKTA_ISSUER") {
-        return validate_issuer(value);
+        return validate_issuer(value, "OKTA_ISSUER");
     }
     Err(ConfigError::new(
         ConfigErrorKind::MissingEnv,
@@ -403,23 +407,57 @@ fn require_expected_aud(source: &ConfigSource) -> Result<BTreeSet<String>, Confi
     Ok(values)
 }
 
-fn validate_issuer(value: &str) -> Result<String, ConfigError> {
+fn validate_issuer(value: &str, key: &str) -> Result<String, ConfigError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(ConfigError::new(
             ConfigErrorKind::InvalidValue,
-            Some("IDP_ISSUER".to_string()),
+            Some(key.to_string()),
             "issuer must not be empty",
         ));
     }
-    if trimmed.contains(' ') {
+    if trimmed.chars().any(char::is_whitespace) {
         return Err(ConfigError::new(
             ConfigErrorKind::InvalidValue,
-            Some("IDP_ISSUER".to_string()),
+            Some(key.to_string()),
             "issuer must not contain whitespace",
         ));
     }
-    Ok(trimmed.to_string())
+    let parsed = Url::parse(trimmed).map_err(|err| {
+        ConfigError::new(
+            ConfigErrorKind::InvalidValue,
+            Some(key.to_string()),
+            format!("issuer must be an absolute URL: {err}"),
+        )
+    })?;
+    if parsed.host_str().is_none() {
+        return Err(ConfigError::new(
+            ConfigErrorKind::InvalidValue,
+            Some(key.to_string()),
+            "issuer must include a host",
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(ConfigError::new(
+            ConfigErrorKind::InvalidValue,
+            Some(key.to_string()),
+            "issuer must not contain a query or fragment component",
+        ));
+    }
+    let is_loopback = match parsed.host() {
+        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(host)) => host.is_loopback(),
+        Some(Host::Ipv6(host)) => host.is_loopback(),
+        None => false,
+    };
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && is_loopback) {
+        return Err(ConfigError::new(
+            ConfigErrorKind::InvalidValue,
+            Some(key.to_string()),
+            "issuer must use https, except http is allowed for loopback local development",
+        ));
+    }
+    Ok(trimmed.trim_end_matches('/').to_string())
 }
 
 fn parse_actor_ids(source: &ConfigSource) -> Result<BTreeSet<String>, ConfigError> {
@@ -809,5 +847,40 @@ mod tests {
         assert_eq!(cfg.actor_id, "chat-mcp");
         assert_eq!(cfg.target_policy.targets.len(), 1);
         assert_eq!(cfg.client_ids.len(), 1);
+    }
+
+    fn minimal_source_with_sts_issuer(issuer: &str) -> ConfigSource {
+        ConfigSource::from_pairs([
+            ("IDP_ISSUER", "https://issuer.example/oauth2/default"),
+            ("EXPECTED_SUBJECT_AUD", "api://obo"),
+            ("ACTOR_IDS", "chat-mcp"),
+            ("OBO_STS_ISSUER", issuer),
+        ])
+    }
+
+    #[test]
+    fn runtime_config_rejects_unsafe_sts_issuer_components() {
+        for issuer in
+            ["https://sts.example/?q=1", "https://sts.example#fragment", "http://sts.example"]
+        {
+            let err = RuntimeConfig::from_source(&minimal_source_with_sts_issuer(issuer))
+                .expect_err("unsafe issuer must fail config load");
+            assert_eq!(err.kind, ConfigErrorKind::InvalidValue);
+            assert_eq!(err.key.as_deref(), Some("OBO_STS_ISSUER"));
+        }
+    }
+
+    #[test]
+    fn runtime_config_canonicalizes_https_and_loopback_http_sts_issuers() {
+        for (raw, expected) in [
+            ("https://sts.example/", "https://sts.example"),
+            ("http://localhost:8888/", "http://localhost:8888"),
+            ("http://127.0.0.1:9000/", "http://127.0.0.1:9000"),
+            ("http://[::1]:9000/", "http://[::1]:9000"),
+        ] {
+            let cfg = RuntimeConfig::from_source(&minimal_source_with_sts_issuer(raw))
+                .expect("safe issuer must load");
+            assert_eq!(cfg.our_issuer, expected);
+        }
     }
 }
