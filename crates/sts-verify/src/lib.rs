@@ -120,11 +120,23 @@ pub struct SubjectTokenClaims {
     pub iss: String,
     pub sub: Option<String>,
     pub aud: serde_json::Value,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub scp: Option<serde_json::Value>,
     pub exp: i64,
     pub nbf: Option<i64>,
     pub iat: Option<i64>,
     #[serde(default)]
+    pub act: Option<serde_json::Value>,
+    #[serde(default)]
     pub may_act: Option<serde_json::Value>,
+    #[serde(default)]
+    pub auth_time: Option<i64>,
+    #[serde(default)]
+    pub acr: Option<String>,
+    #[serde(default)]
+    pub amr: Option<Vec<String>>,
 }
 
 /// JWT claims used for inbound actor/client assertion verification.

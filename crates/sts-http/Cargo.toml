@@ -4,3 +4,22 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+axum = "0.8.9"
+base64 = "0.22"
+http = "1"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sts-config = { path = "../sts-config" }
+sts-core = { path = "../sts-core" }
+sts-jose = { path = "../sts-jose" }
+sts-replay = { path = "../sts-replay" }
+sts-verify = { path = "../sts-verify" }
+url = "2"
+
+[dev-dependencies]
+http-body-util = "0.1"
+rsa = { version = "0.9", features = ["pem"] }
+serde_urlencoded = "0.7"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5.3", features = ["util"] }
