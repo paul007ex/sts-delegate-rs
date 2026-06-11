@@ -96,7 +96,7 @@ impl ReplayStore for InMemoryReplayStore {
             return Err(ReplayError::new(ReplayErrorKind::InvalidRequest, "jti must not be empty"));
         }
 
-        let mut seen = self.seen.lock().expect("replay store poisoned");
+        let mut seen = self.seen.lock().map_err(|_| replay_store_unavailable())?;
         if seen.contains_key(jti) {
             return Err(ReplayError::new(
                 ReplayErrorKind::ReplayDetected,
@@ -104,7 +104,8 @@ impl ReplayStore for InMemoryReplayStore {
             ));
         }
 
-        let mut calls_since_sweep = self.calls_since_sweep.lock().expect("replay counter poisoned");
+        let mut calls_since_sweep =
+            self.calls_since_sweep.lock().map_err(|_| replay_store_unavailable())?;
         *calls_since_sweep += 1;
         if *calls_since_sweep >= self.sweep_every {
             self.sweep_expired(&mut seen, now);
@@ -126,8 +127,12 @@ impl ReplayStore for InMemoryReplayStore {
     }
 
     fn cache_size(&self) -> usize {
-        self.seen.lock().expect("replay store poisoned").len()
+        self.seen.lock().map(|seen| seen.len()).unwrap_or(0)
     }
+}
+
+fn replay_store_unavailable() -> ReplayError {
+    ReplayError::new(ReplayErrorKind::StoreFull, "replay store unavailable, retry shortly")
 }
 
 /// The active replay-store boundary for the current process.
@@ -208,6 +213,33 @@ mod tests {
         let policy = ReplayPolicy::in_memory();
         assert!(policy.check_and_record("jti-1", 10, 1).is_ok());
         assert_eq!(policy.cache_size(), 1);
+    }
+
+    #[test]
+    fn in_memory_store_fails_closed_when_seen_lock_is_poisoned() {
+        let store = InMemoryReplayStore::new(8, 4);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.seen.lock().expect("lock");
+            panic!("poison replay store");
+        }));
+
+        let err = store.check_and_record("jti-2", 10, 1).unwrap_err();
+        assert_eq!(err.kind, ReplayErrorKind::StoreFull);
+        assert_eq!(err.message, "replay store unavailable, retry shortly");
+        assert_eq!(store.cache_size(), 0);
+    }
+
+    #[test]
+    fn in_memory_store_fails_closed_when_counter_lock_is_poisoned() {
+        let store = InMemoryReplayStore::new(8, 4);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.calls_since_sweep.lock().expect("lock");
+            panic!("poison replay counter");
+        }));
+
+        let err = store.check_and_record("jti-2", 10, 1).unwrap_err();
+        assert_eq!(err.kind, ReplayErrorKind::StoreFull);
+        assert_eq!(err.message, "replay store unavailable, retry shortly");
     }
 
     #[test]

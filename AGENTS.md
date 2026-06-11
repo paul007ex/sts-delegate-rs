@@ -24,11 +24,18 @@ rustup update stable
 cargo fmt --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+python3 scripts/security_audit_loop.py
 ```
 
 Use `cargo test --workspace` as the baseline. Add focused crate tests when working on a
 single lane. Keep the workspace on the latest stable Rust toolchain available in the
 environment unless an issue explicitly requires a pinned toolchain.
+
+For substantive security, protocol, JOSE, DPoP, replay, runtime, or release changes,
+run the secure Rust audit loop after the focused tests. For background monitoring, run
+`python3 scripts/security_audit_loop.py --loop 180`. For release or CI gates, add
+`--strict-supply-chain`; that mode requires `cargo-audit`, `cargo-deny`,
+`cargo-geiger`, and `cargo-vet` to be installed and passing.
 
 ## Coding Style & Naming Conventions
 
@@ -73,6 +80,11 @@ issue says otherwise.
 Keep signing, trust-anchor validation, replay policy, and HTTP transport separated.
 Keep key custody out of protocol glue.
 
+The secure Rust loop must stay active during product work. It checks formatting,
+Clippy, crate boundaries, duplicate dependencies, production panic/placeholder/unsafe
+patterns, sensitive logging patterns, and installed supply-chain tools. Confirmed
+findings belong in GitHub issues before they are treated as resolved.
+
 ## Agent-Specific Review Rules
 
 Use the Rust-native skills for Rust work:
@@ -112,5 +124,6 @@ If the issue scope is vague, tighten the scope before touching code.
 3. Append a short status entry to `/tmp/sts-delegate-rs-coordination-log.md`.
 4. Make the smallest useful change or file the smallest useful issue.
 5. Run the relevant tests or parity checks.
-6. Update the issue thread with evidence and follow-up.
-7. Move immediately to the next unblocked issue.
+6. Run `python3 scripts/security_audit_loop.py` after substantive code changes.
+7. Update the issue thread with evidence and follow-up.
+8. Move immediately to the next unblocked issue.
