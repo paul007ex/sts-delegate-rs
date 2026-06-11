@@ -1,6 +1,6 @@
 use axum::body::Body;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use http::header::{CACHE_CONTROL, CONTENT_TYPE, PRAGMA};
+use http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, PRAGMA, WWW_AUTHENTICATE};
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -120,6 +120,22 @@ async fn post_token_form(state: HttpState, body: String) -> Response<Body> {
     post_token_form_with_dpop_values(state, body, &[]).await
 }
 
+async fn post_token_raw(
+    state: HttpState,
+    body: impl Into<Body>,
+    content_type: Option<&str>,
+    extra_headers: &[(&str, &str)],
+) -> Response<Body> {
+    let mut builder = Request::builder().method(Method::POST).uri("/token");
+    if let Some(content_type) = content_type {
+        builder = builder.header(CONTENT_TYPE, content_type);
+    }
+    for (name, value) in extra_headers {
+        builder = builder.header(*name, *value);
+    }
+    router(state).oneshot(builder.body(body.into()).unwrap()).await.unwrap()
+}
+
 async fn post_token_form_with_dpop_values(
     state: HttpState,
     body: String,
@@ -133,6 +149,94 @@ async fn post_token_form_with_dpop_values(
         builder = builder.header("DPoP", *value);
     }
     router(state).oneshot(builder.body(Body::from(body)).unwrap()).await.unwrap()
+}
+
+#[tokio::test]
+async fn contract_token_rejects_wrong_content_type_and_duplicate_form_params() {
+    let (state, _, _, _) = test_state();
+
+    let response = post_token_raw(state.clone(), "{}", Some("application/json"), &[]).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_request");
+    assert!(body["error_description"].as_str().unwrap_or("").contains("Content-Type"));
+
+    let duplicate_grant = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+    ])
+    .expect("form");
+    let response = post_token_form(state.clone(), duplicate_grant).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_request");
+    assert!(body["error_description"].as_str().unwrap_or("").contains("grant_type"));
+
+    let duplicate_audience = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", "bad-subject"),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("audience", "api://one"),
+        ("audience", "api://two"),
+    ])
+    .expect("form");
+    let response = post_token_form(state, duplicate_audience).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_target");
+    assert!(body["error_description"].as_str().unwrap_or("").contains("multiple audience"));
+}
+
+#[tokio::test]
+async fn contract_authorization_header_client_auth_is_rejected() {
+    let (state, _, _, _) = test_state();
+    let body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", "bad-subject"),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+    ])
+    .expect("form");
+    let response = post_token_raw(
+        state.clone(),
+        body,
+        Some("application/x-www-form-urlencoded"),
+        &[(AUTHORIZATION.as_str(), "Basic abc123")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response.headers().get(WWW_AUTHENTICATE).and_then(|value| value.to_str().ok()),
+        Some("Basic")
+    );
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_client");
+    assert!(body["error_description"].as_str().unwrap_or("").contains("Authorization header"));
+
+    let mixed = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", "bad-subject"),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+        ("client_assertion", "bad-assertion"),
+        ("client_id", "chat-mcp"),
+    ])
+    .expect("form");
+    let response = post_token_raw(
+        state,
+        mixed,
+        Some("application/x-www-form-urlencoded"),
+        &[(AUTHORIZATION.as_str(), "Bearer abc123")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response.headers().get(WWW_AUTHENTICATE).and_then(|value| value.to_str().ok()),
+        Some("Bearer")
+    );
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_client");
 }
 
 fn jwt_segment(token: &str, index: usize) -> Value {

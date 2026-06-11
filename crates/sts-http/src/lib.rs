@@ -11,12 +11,15 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Form, State};
+use axum::body::Bytes;
+use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use http::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderName, HeaderValue, PRAGMA};
+use http::header::{
+    AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, HeaderName, HeaderValue, PRAGMA, WWW_AUTHENTICATE,
+};
 use http::{HeaderMap, StatusCode};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -179,11 +182,18 @@ pub struct HttpError {
     error: Option<&'static str>,
     description: String,
     retry_after: Option<&'static str>,
+    www_authenticate: Option<String>,
 }
 
 impl HttpError {
     fn oauth(status: StatusCode, error: &'static str, description: impl Into<String>) -> Self {
-        Self { status, error: Some(error), description: description.into(), retry_after: None }
+        Self {
+            status,
+            error: Some(error),
+            description: description.into(),
+            retry_after: None,
+            www_authenticate: None,
+        }
     }
 
     fn invalid_request(description: impl Into<String>) -> Self {
@@ -192,6 +202,19 @@ impl HttpError {
 
     fn invalid_client(description: impl Into<String>) -> Self {
         Self::oauth(StatusCode::UNAUTHORIZED, "invalid_client", description)
+    }
+
+    fn unsupported_authorization_client_auth(
+        description: impl Into<String>,
+        challenge: &str,
+    ) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            error: Some("invalid_client"),
+            description: description.into(),
+            retry_after: None,
+            www_authenticate: Some(challenge.to_string()),
+        }
     }
 
     fn invalid_target(description: impl Into<String>) -> Self {
@@ -220,6 +243,7 @@ impl HttpError {
             error: None,
             description: description.into(),
             retry_after: Some("2"),
+            www_authenticate: None,
         }
     }
 
@@ -249,6 +273,11 @@ impl IntoResponse for HttpError {
         headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
         if let Some(retry_after) = self.retry_after {
             headers.insert("retry-after", HeaderValue::from_static(retry_after));
+        }
+        if let Some(challenge) = self.www_authenticate
+            && let Ok(value) = HeaderValue::from_str(&challenge)
+        {
+            headers.insert(WWW_AUTHENTICATE, value);
         }
         let body = match self.error {
             Some(error) => serde_json::json!({
@@ -284,11 +313,77 @@ async fn metadata(State(state): State<HttpState>) -> impl IntoResponse {
     (public_cache_headers(state.config.jwks_cache_max_age), Json(document))
 }
 
+fn parse_token_form(headers: &HeaderMap, body: &[u8]) -> Result<TokenForm, HttpError> {
+    require_form_urlencoded(headers)?;
+    reject_authorization_header_client_auth(headers)?;
+    let pairs = url::form_urlencoded::parse(body).into_owned().collect::<Vec<_>>();
+    let mut seen = BTreeSet::new();
+    let mut form = TokenForm::default();
+    for (key, value) in pairs {
+        if !seen.insert(key.clone()) {
+            if matches!(key.as_str(), "audience" | "resource") {
+                return Err(HttpError::invalid_target(format!(
+                    "multiple {key} values are not supported; send one target"
+                )));
+            }
+            return Err(HttpError::invalid_request(format!(
+                "parameter {key:?} is included more than once"
+            )));
+        }
+        assign_token_form_value(&mut form, &key, value);
+    }
+    Ok(form)
+}
+
+fn require_form_urlencoded(headers: &HeaderMap) -> Result<(), HttpError> {
+    let content_type =
+        headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok()).unwrap_or("");
+    let media_type = content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if media_type != "application/x-www-form-urlencoded" {
+        return Err(HttpError::invalid_request(
+            "Content-Type must be application/x-www-form-urlencoded",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_authorization_header_client_auth(headers: &HeaderMap) -> Result<(), HttpError> {
+    let Some(value) = headers.get(AUTHORIZATION) else {
+        return Ok(());
+    };
+    let authorization = value.to_str().unwrap_or("");
+    let scheme = authorization.split_whitespace().next().unwrap_or("Basic");
+    let challenge = if scheme.eq_ignore_ascii_case("basic") { "Basic" } else { scheme };
+    Err(HttpError::unsupported_authorization_client_auth(
+        "Authorization header client authentication is not supported; use private_key_jwt",
+        challenge,
+    ))
+}
+
+fn assign_token_form_value(form: &mut TokenForm, key: &str, value: String) {
+    match key {
+        "grant_type" => form.grant_type = Some(value),
+        "subject_token" => form.subject_token = Some(value),
+        "subject_token_type" => form.subject_token_type = Some(value),
+        "actor_token" => form.actor_token = Some(value),
+        "actor_token_type" => form.actor_token_type = Some(value),
+        "audience" => form.audience = Some(value),
+        "resource" => form.resource = Some(value),
+        "scope" => form.scope = Some(value),
+        "requested_token_type" => form.requested_token_type = Some(value),
+        "client_id" => form.client_id = Some(value),
+        "client_assertion" => form.client_assertion = Some(value),
+        "client_assertion_type" => form.client_assertion_type = Some(value),
+        _ => {}
+    }
+}
+
 async fn token(
     headers: HeaderMap,
     State(state): State<HttpState>,
-    Form(form): Form<TokenForm>,
+    body: Bytes,
 ) -> Result<(HeaderMap, Json<TokenResponse>), HttpError> {
+    let form = parse_token_form(&headers, &body)?;
     let request = form.into_exchange_request();
     validate_request_params(&request, state.config.max_token_len)?;
     let mode = effective_exchange_mode(&state.config, &request);
