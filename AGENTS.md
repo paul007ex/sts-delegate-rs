@@ -39,7 +39,10 @@ run the secure Rust audit loop after the focused tests. For background monitorin
 
 For live tenant/MCP evidence, run `python3 scripts/real_tenant_endpoint_loop.py`.
 Use `--mcp-call-mode fastmcp --require-mcp` when proving Claude/MCP client calls
-through the configured `.mcp.json` gateway URLs.
+through the configured `.mcp.json` gateway URLs. Use
+`--mcp-url-set obo-lab-direct` only for the owned-server pattern where the MCP
+servers validate the real Okta user token directly; keep gateway failures tracked
+separately.
 This loop must use a configured real Okta issuer such as `CANARY_IDP_ISSUER` or
 `OKTA_ISSUER`; `example.com`, `issuer.example`, `sts.example`, and `*.example.*`
 are fixture-only and must not be accepted as live proof. Redact bearer tokens,

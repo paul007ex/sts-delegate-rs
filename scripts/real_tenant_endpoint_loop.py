@@ -27,6 +27,11 @@ DEFAULT_FASTMCP_PYTHON = Path("/Users/Shared/claude/obo-lab/.venv/bin/python3")
 EXAMPLE_HOST_FRAGMENTS = ("example.com", "example.test", "example.org", "issuer.example", "sts.example")
 PRIVATE_JWK_MEMBERS = {"d", "p", "q", "dp", "dq", "qi", "oth"}
 TOKEN_FIELD_NAMES = {"authorization", "access_token", "subject_token", "actor_token", "client_assertion"}
+OBO_LAB_DIRECT_MCP_URLS = {
+    "chat-mcp": "http://127.0.0.1:8103/mcp",
+    "databricks-mcp": "http://127.0.0.1:8101/mcp",
+    "servicenow-mcp": "http://127.0.0.1:8102/mcp",
+}
 SECRET_QUERY_RE = re.compile(
     r"(?i)([?&](?:access_token|subject_token|actor_token|client_assertion|client_secret|authorization)=)[^&\s]+"
 )
@@ -326,6 +331,7 @@ def check_mcp(
     *,
     call_mode: str,
     fastmcp_python: Path,
+    url_set: str,
 ) -> dict[str, Any]:
     if not config_path.exists():
         event = "mcp_not_configured"
@@ -351,6 +357,9 @@ def check_mcp(
         headers = server.get("headers", {})
         if not isinstance(url, str) or not isinstance(headers, dict):
             continue
+        configured_url = url
+        if url_set == "obo-lab-direct":
+            url = OBO_LAB_DIRECT_MCP_URLS.get(name, url)
         token = bearer_from_headers(headers)
         if not token:
             raise CanaryError(f"MCP server {name} missing bearer Authorization header")
@@ -369,15 +378,16 @@ def check_mcp(
             "tool": tool_name,
             "args": tool_args,
         }
-        checked.append(
-            {
-                "name": name,
-                "url": url,
-                "token_issuer": token_issuer,
-                "token_subject_present": bool(claims.get("sub")),
-                "token_seconds_remaining": token_seconds_remaining(claims),
-            }
-        )
+        entry = {
+            "name": name,
+            "url": url,
+            "token_issuer": token_issuer,
+            "token_subject_present": bool(claims.get("sub")),
+            "token_seconds_remaining": token_seconds_remaining(claims),
+        }
+        if configured_url != url:
+            entry["configured_url"] = configured_url
+        checked.append(entry)
 
     if not checked:
         log("mcp_not_configured", config=str(config_path), missing=["valid mcpServers"])
@@ -486,6 +496,7 @@ def run_once(args: argparse.Namespace) -> bool:
             args.require_mcp,
             call_mode=args.mcp_call_mode,
             fastmcp_python=args.fastmcp_python,
+            url_set=args.mcp_url_set,
         )
         check_sts(env_file)
     except Exception as exc:
@@ -506,6 +517,12 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "raw", "fastmcp"),
         default="auto",
         help="MCP endpoint proof mode; auto uses FastMCP when available",
+    )
+    parser.add_argument(
+        "--mcp-url-set",
+        choices=("configured", "obo-lab-direct"),
+        default="configured",
+        help="use configured .mcp.json URLs or known direct obo-lab backend URLs",
     )
     parser.add_argument("--fastmcp-python", type=Path, default=DEFAULT_FASTMCP_PYTHON)
     parser.add_argument("--self-test-redaction", action="store_true", help="run the local log-redaction self-test")
