@@ -37,6 +37,13 @@ run the secure Rust audit loop after the focused tests. For background monitorin
 `--strict-supply-chain`; that mode requires `cargo-audit`, `cargo-deny`,
 `cargo-geiger`, and `cargo-vet` to be installed and passing.
 
+For live tenant/MCP evidence, run `python3 scripts/real_tenant_endpoint_loop.py`.
+This loop must use a configured real Okta issuer such as `CANARY_IDP_ISSUER` or
+`OKTA_ISSUER`; `example.com`, `issuer.example`, `sts.example`, and `*.example.*`
+are fixture-only and must not be accepted as live proof. Redact bearer tokens,
+subject tokens, assertions, private keys, Authorization headers, and raw replay
+identifiers from logs and issue comments.
+
 ## Coding Style & Naming Conventions
 
 Target Rust 2024. Keep `unsafe` out of the codebase unless an issue explicitly approves
