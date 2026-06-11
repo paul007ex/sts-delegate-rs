@@ -257,6 +257,29 @@ impl RsaJoseSigner {
         format!("{header_b64}.{payload_b64}")
     }
 
+    /// Sign an arbitrary JSON payload as a compact JWS.
+    ///
+    /// This keeps compact-JWS construction in the JOSE layer while allowing
+    /// verifier tests and adjacent JWT-shaped payloads to reuse the same RSA
+    /// signing boundary.
+    pub fn sign_json_claims<T: Serialize>(&self, claims: &T) -> Result<String, JoseError> {
+        let header = serde_json::json!({
+            "alg": self.alg(),
+            "kid": self.kid,
+            "typ": "JWT",
+        });
+        let header_json = serde_json::to_vec(&header).map_err(|e| {
+            JoseError::new(JoseErrorKind::InvalidClaims, format!("encode header failed: {e}"))
+        })?;
+        let payload_json = serde_json::to_vec(claims).map_err(|e| {
+            JoseError::new(JoseErrorKind::InvalidClaims, format!("encode claims failed: {e}"))
+        })?;
+        let signing_input = Self::signing_input(&header_json, &payload_json);
+        let signing_key = SigningKey::<Sha256>::new(self.private_key.clone());
+        let signature: RsaSignature = signing_key.sign(signing_input.as_bytes());
+        Ok(format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes())))
+    }
+
     fn parse_compact_jws(token: &str) -> Result<(&str, &str, &str), JoseError> {
         let mut parts = token.split('.');
         let header = parts.next().ok_or_else(|| {
@@ -284,21 +307,7 @@ impl JoseSigner for RsaJoseSigner {
     }
 
     fn sign_claims(&self, claims: &MintedClaims) -> Result<String, JoseError> {
-        let header = serde_json::json!({
-            "alg": self.alg(),
-            "kid": self.kid,
-            "typ": "JWT",
-        });
-        let header_json = serde_json::to_vec(&header).map_err(|e| {
-            JoseError::new(JoseErrorKind::InvalidClaims, format!("encode header failed: {e}"))
-        })?;
-        let payload_json = serde_json::to_vec(claims).map_err(|e| {
-            JoseError::new(JoseErrorKind::InvalidClaims, format!("encode claims failed: {e}"))
-        })?;
-        let signing_input = Self::signing_input(&header_json, &payload_json);
-        let signing_key = SigningKey::<Sha256>::new(self.private_key.clone());
-        let signature: RsaSignature = signing_key.sign(signing_input.as_bytes());
-        Ok(format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes())))
+        self.sign_json_claims(claims)
     }
 
     fn public_jwks(&self) -> JwksDocument {
