@@ -20,7 +20,7 @@ use http::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderName, HeaderValue, PRAGMA}
 use http::{HeaderMap, StatusCode};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sts_config::RuntimeConfig;
+use sts_config::{ClientAuthPolicy, RuntimeConfig, TokenExchangeMode};
 use sts_core::{
     ACCESS_TOKEN_TYPE, ActClaim, ExchangeRequest, JWT_TOKEN_TYPE, TOKEN_EXCHANGE_GRANT_TYPE,
     build_act, build_scoped_payload, downscope, resolve_target,
@@ -35,6 +35,12 @@ use url::Url;
 
 const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectiveExchangeMode {
+    Delegation,
+    Impersonation,
+}
 
 /// Shared HTTP runtime state.
 #[derive(Clone)]
@@ -257,12 +263,11 @@ async fn metadata(State(state): State<HttpState>) -> impl IntoResponse {
 async fn token(
     State(state): State<HttpState>,
     Form(form): Form<TokenForm>,
-) -> Result<impl IntoResponse, HttpError> {
+) -> Result<(HeaderMap, Json<TokenResponse>), HttpError> {
     let request = form.into_exchange_request();
     validate_request_params(&request, state.config.max_token_len)?;
-    if request.client_assertion.is_some() || request.client_assertion_type.is_some() {
-        validate_client_assertion_type(&request)?;
-    }
+    let mode = effective_exchange_mode(&state.config, &request);
+    let client_claims = authenticate_client_if_present(&state, &request, mode)?;
 
     let expected_subject_audiences =
         state.config.expected_subject_aud.iter().cloned().collect::<Vec<_>>();
@@ -275,15 +280,6 @@ async fn token(
     )
     .map_err(|err| map_subject_verify_error(&err))?;
 
-    let actor_token = request.actor_token.as_deref().ok_or_else(|| {
-        HttpError::invalid_client(
-            "no client authentication: send a client_assertion or an actor_token",
-        )
-    })?;
-    let actor_claims = verify_actor_token(&state, actor_token, &request.subject_token)?;
-    validate_actor_identity(&state, &actor_claims)?;
-    gate_may_act(&subject_claims, &actor_claims)?;
-
     let target = resolve_target_for_request(&request, &state)?;
     let scope = resolve_scope_for_request(&request, &state, &subject_claims, &target)?;
     let subject_sub = subject_claims
@@ -291,6 +287,51 @@ async fn token(
         .clone()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| HttpError::invalid_grant("subject token missing sub"))?;
+
+    match mode {
+        EffectiveExchangeMode::Delegation => exchange_delegation(
+            state,
+            request,
+            subject_claims,
+            subject_sub,
+            target,
+            scope,
+            client_claims,
+        ),
+        EffectiveExchangeMode::Impersonation => exchange_impersonation(
+            state,
+            request,
+            subject_claims,
+            subject_sub,
+            target,
+            scope,
+            client_claims,
+        ),
+    }
+}
+
+fn exchange_delegation(
+    state: HttpState,
+    request: ExchangeRequest,
+    subject_claims: SubjectTokenClaims,
+    subject_sub: String,
+    target: String,
+    scope: String,
+    client_claims: Option<AssertionClaims>,
+) -> Result<(HeaderMap, Json<TokenResponse>), HttpError> {
+    let client_authenticated = client_claims.is_some();
+    let actor_token = request.actor_token.as_deref().ok_or_else(|| {
+        if client_authenticated {
+            HttpError::invalid_request("actor_token required for delegation")
+        } else {
+            HttpError::invalid_client(
+                "no client authentication: send a client_assertion or an actor_token",
+            )
+        }
+    })?;
+    let actor_claims = verify_actor_token(&state, actor_token, &request.subject_token)?;
+    validate_actor_identity(&state, &actor_claims)?;
+    gate_may_act(&subject_claims, &actor_claims)?;
 
     let now = unix_now();
     let actor_jti =
@@ -301,6 +342,9 @@ async fn token(
         .replay
         .check_and_record(&format!("act:{}:{actor_jti}", actor_claims.sub), actor_claims.exp, now)
         .map_err(map_replay_error)?;
+    if let Some(client_claims) = &client_claims {
+        record_client_assertion_replay(&state, client_claims, now)?;
+    }
 
     let exp = [now + state.config.scoped_token_ttl, subject_claims.exp, actor_claims.exp]
         .into_iter()
@@ -338,6 +382,189 @@ async fn token(
             scope,
         }),
     ))
+}
+
+fn exchange_impersonation(
+    state: HttpState,
+    request: ExchangeRequest,
+    subject_claims: SubjectTokenClaims,
+    subject_sub: String,
+    target: String,
+    scope: String,
+    client_claims: Option<AssertionClaims>,
+) -> Result<(HeaderMap, Json<TokenResponse>), HttpError> {
+    if request.actor_token.is_some() {
+        return Err(HttpError::invalid_client(
+            "impersonation requires client_assertion, not actor_token",
+        ));
+    }
+    let client_claims = client_claims
+        .ok_or_else(|| HttpError::invalid_client("impersonation requires client_assertion"))?;
+    if !state.config.impersonation_policy.allowed_clients.contains(&client_claims.sub) {
+        return Err(HttpError::invalid_request(format!(
+            "impersonation not authorized for client {:?}",
+            client_claims.sub
+        )));
+    }
+
+    let now = unix_now();
+    record_client_assertion_replay(&state, &client_claims, now)?;
+    let exp = [now + state.config.scoped_token_ttl, subject_claims.exp, client_claims.exp]
+        .into_iter()
+        .min()
+        .unwrap_or(now + state.config.scoped_token_ttl);
+    let mut payload = build_scoped_payload(
+        state.config.our_issuer.clone(),
+        subject_sub,
+        target,
+        scope.clone(),
+        now,
+        exp,
+        new_jti(),
+        client_claims.sub.clone(),
+        None,
+        None,
+    );
+    payload.auth_time = subject_claims.auth_time;
+    payload.acr = subject_claims.acr.clone();
+    payload.amr = subject_claims.amr.clone().unwrap_or_default();
+
+    let access_token = state.signer.sign_claims(&payload).map_err(|err| {
+        HttpError::server_error(format!("failed to sign scoped token: {}", err.message))
+    })?;
+
+    Ok((
+        token_headers(),
+        Json(TokenResponse {
+            access_token,
+            issued_token_type: ACCESS_TOKEN_TYPE.to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: (exp - now).max(0),
+            scope,
+        }),
+    ))
+}
+
+/// Resolve RFC 8693 delegation versus impersonation before caller authentication.
+///
+/// In `Both`, request shape is the dispatch signal: an `actor_token` selects
+/// delegation, and its absence selects the private_key_jwt impersonation path.
+fn effective_exchange_mode(
+    config: &RuntimeConfig,
+    request: &ExchangeRequest,
+) -> EffectiveExchangeMode {
+    match config.token_exchange_mode {
+        TokenExchangeMode::Delegation => EffectiveExchangeMode::Delegation,
+        TokenExchangeMode::Impersonation => EffectiveExchangeMode::Impersonation,
+        TokenExchangeMode::Both => {
+            if request.actor_token.is_some() {
+                EffectiveExchangeMode::Delegation
+            } else {
+                EffectiveExchangeMode::Impersonation
+            }
+        }
+    }
+}
+
+/// Validate RFC 7523 private_key_jwt when any client-auth parameter is present.
+///
+/// This is intentionally stateless. Replay recording happens only after subject,
+/// target, scope, actor/impersonation, and signing preconditions all pass.
+fn authenticate_client_if_present(
+    state: &HttpState,
+    request: &ExchangeRequest,
+    mode: EffectiveExchangeMode,
+) -> Result<Option<AssertionClaims>, HttpError> {
+    let has_client_auth = request.client_assertion.is_some()
+        || request.client_assertion_type.is_some()
+        || request.client_id.is_some();
+
+    if mode == EffectiveExchangeMode::Impersonation {
+        if request.actor_token.is_some() {
+            return Err(HttpError::invalid_client(
+                "impersonation requires client_assertion, not actor_token",
+            ));
+        }
+        if !has_client_auth {
+            return Err(HttpError::invalid_client("impersonation requires client_assertion"));
+        }
+    }
+
+    if matches!(state.config.client_auth_policy, ClientAuthPolicy::PrivateKeyJwtRequired)
+        && !has_client_auth
+    {
+        return Err(HttpError::invalid_client("client_assertion required by CLIENT_AUTH_POLICY"));
+    }
+    if !has_client_auth {
+        return Ok(None);
+    }
+
+    for (field, value) in [
+        ("client_assertion", request.client_assertion.as_ref()),
+        ("client_assertion_type", request.client_assertion_type.as_ref()),
+        ("client_id", request.client_id.as_ref()),
+    ] {
+        if value.is_some_and(|value| value.trim().is_empty()) {
+            return Err(HttpError::invalid_client(format!("{field} present but empty")));
+        }
+    }
+
+    validate_client_assertion_type(request)?;
+    let assertion = request
+        .client_assertion
+        .as_deref()
+        .ok_or_else(|| HttpError::invalid_client("client_assertion required"))?;
+    let audiences = vec![state.config.our_issuer.clone(), state.token_endpoint()];
+    let claims = verify_assertion(
+        assertion,
+        &state.client_jwks,
+        AssertionVerificationOptions {
+            expected_issuer: &state.config.our_issuer,
+            expected_audiences: &audiences,
+            clock_skew_leeway: state.config.clock_skew_leeway,
+            max_ttl: state.config.assertion_max_ttl,
+            binding_subject_token: None,
+            require_subject_binding: false,
+        },
+    )
+    .map_err(|err| HttpError::invalid_client(err.message))?;
+
+    if !state.config.client_ids.contains(&claims.sub) {
+        return Err(HttpError::invalid_client(format!("client {:?} not permitted", claims.sub)));
+    }
+    if let Some(client_id) = request.client_id.as_deref()
+        && client_id != claims.sub
+    {
+        return Err(HttpError::invalid_client(
+            "client_id does not match the authenticated client_assertion",
+        ));
+    }
+    client_assertion_jti(&claims)?;
+    if mode == EffectiveExchangeMode::Delegation && request.actor_token.is_none() {
+        return Err(HttpError::invalid_request("actor_token required for delegation"));
+    }
+    Ok(Some(claims))
+}
+
+fn record_client_assertion_replay(
+    state: &HttpState,
+    claims: &AssertionClaims,
+    now: i64,
+) -> Result<(), HttpError> {
+    let jti = client_assertion_jti(claims)?;
+    state
+        .replay
+        .check_and_record(&format!("ca:{}:{jti}", claims.sub), claims.exp, now)
+        .map_err(map_replay_error)
+}
+
+fn client_assertion_jti(claims: &AssertionClaims) -> Result<&str, HttpError> {
+    claims
+        .jti
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| HttpError::invalid_client("client_assertion jti must be a non-empty string"))
 }
 
 fn validate_request_params(
@@ -656,7 +883,7 @@ mod tests {
     use rand::{SeedableRng, rngs::StdRng};
     use rsa::RsaPrivateKey;
     use serde_json::Value;
-    use sts_config::ConfigSource;
+    use sts_config::{ConfigSource, TokenExchangeMode};
     use tower::ServiceExt;
 
     #[derive(Debug, Clone, Serialize)]
@@ -685,10 +912,11 @@ mod tests {
         RsaJoseSigner::from_generated(&private_key, kid).expect("signer")
     }
 
-    fn test_state() -> (HttpState, RsaJoseSigner, RsaJoseSigner) {
+    fn test_state() -> (HttpState, RsaJoseSigner, RsaJoseSigner, RsaJoseSigner) {
         let sts_signer = signer(1, "sts-kid");
         let subject_signer = signer(2, "subject-kid");
         let actor_signer = signer(3, "actor-kid");
+        let client_signer = signer(4, "client-kid");
         let mut config = RuntimeConfig::from_source(&ConfigSource::from_pairs([
             ("IDP_ISSUER", "https://issuer.example/oauth2/default"),
             ("EXPECTED_SUBJECT_AUD", "api://obo"),
@@ -706,10 +934,10 @@ mod tests {
             sts_signer.clone(),
             subject_signer.public_jwks(),
             actor_signer.public_jwks(),
-            actor_signer.public_jwks(),
+            client_signer.public_jwks(),
             ReplayPolicy::in_memory(),
         );
-        (state, subject_signer, actor_signer)
+        (state, subject_signer, actor_signer, client_signer)
     }
 
     async fn read_json(response: Response) -> Value {
@@ -717,9 +945,49 @@ mod tests {
         serde_json::from_slice(&bytes).expect("json")
     }
 
+    fn signed_subject_token(signer: &RsaJoseSigner, now: i64) -> String {
+        signer
+            .sign_json_claims(&SubjectWireClaims {
+                iss: "https://issuer.example/oauth2/default".to_string(),
+                sub: "user@example.com".to_string(),
+                aud: "api://obo".to_string(),
+                scope: "chat.read chat.write".to_string(),
+                exp: now + 600,
+                iat: now,
+            })
+            .expect("subject token")
+    }
+
+    fn signed_assertion(signer: &RsaJoseSigner, now: i64, jti: &str) -> String {
+        signer
+            .sign_json_claims(&AssertionWireClaims {
+                iss: "chat-mcp".to_string(),
+                sub: "chat-mcp".to_string(),
+                aud: "https://sts.example".to_string(),
+                exp: now + 300,
+                iat: now,
+                jti: jti.to_string(),
+            })
+            .expect("assertion")
+    }
+
+    async fn post_token_form(state: HttpState, body: String) -> Response {
+        router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/token")
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn metadata_route_advertises_the_public_contract() {
-        let (state, _, _) = test_state();
+        let (state, _, _, _) = test_state();
         let response = router(state)
             .oneshot(
                 Request::builder()
@@ -744,7 +1012,7 @@ mod tests {
 
     #[tokio::test]
     async fn jwks_route_publishes_the_sts_public_key() {
-        let (state, _, _) = test_state();
+        let (state, _, _, _) = test_state();
         let response = router(state)
             .oneshot(
                 Request::builder().method(Method::GET).uri("/jwks").body(Body::empty()).unwrap(),
@@ -759,28 +1027,10 @@ mod tests {
 
     #[tokio::test]
     async fn token_route_mints_a_delegated_bearer_token() {
-        let (state, subject_signer, actor_signer) = test_state();
+        let (state, subject_signer, actor_signer, _) = test_state();
         let now = unix_now();
-        let subject_token = subject_signer
-            .sign_json_claims(&SubjectWireClaims {
-                iss: "https://issuer.example/oauth2/default".to_string(),
-                sub: "user@example.com".to_string(),
-                aud: "api://obo".to_string(),
-                scope: "chat.read chat.write".to_string(),
-                exp: now + 600,
-                iat: now,
-            })
-            .expect("subject token");
-        let actor_token = actor_signer
-            .sign_json_claims(&AssertionWireClaims {
-                iss: "chat-mcp".to_string(),
-                sub: "chat-mcp".to_string(),
-                aud: "https://sts.example".to_string(),
-                exp: now + 300,
-                iat: now,
-                jti: "actor-jti-1".to_string(),
-            })
-            .expect("actor token");
+        let subject_token = signed_subject_token(&subject_signer, now);
+        let actor_token = signed_assertion(&actor_signer, now, "actor-jti-1");
 
         let body = serde_urlencoded::to_string([
             ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
@@ -792,18 +1042,7 @@ mod tests {
             ("scope", "chat.read"),
         ])
         .expect("form");
-        let app = router(state.clone());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/token")
-                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let response = post_token_form(state.clone(), body).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(CACHE_CONTROL).and_then(|v| v.to_str().ok()),
@@ -824,18 +1063,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_route_accepts_private_key_jwt_client_auth_with_actor_delegation() {
+        let (state, subject_signer, actor_signer, client_signer) = test_state();
+        let now = unix_now();
+        let subject_token = signed_subject_token(&subject_signer, now);
+        let actor_token = signed_assertion(&actor_signer, now, "actor-jti-private-key-jwt");
+        let client_assertion = signed_assertion(&client_signer, now, "client-jti-1");
+
+        let body = serde_urlencoded::to_string([
+            ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+            ("subject_token", subject_token.as_str()),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("actor_token", actor_token.as_str()),
+            ("actor_token_type", JWT_TOKEN_TYPE),
+            ("audience", "api://chat-mcp"),
+            ("scope", "chat.read"),
+            ("client_assertion_type", CLIENT_ASSERTION_TYPE),
+            ("client_assertion", client_assertion.as_str()),
+            ("client_id", "chat-mcp"),
+        ])
+        .expect("form");
+
+        let response = post_token_form(state.clone(), body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        let token = body["access_token"].as_str().expect("access token");
+        let minted: sts_core::MintedClaims =
+            sts_jose::verify_claims_against_jwks(token, &state.signer.public_jwks())
+                .expect("minted token verifies");
+        assert_eq!(minted.sub, "user@example.com");
+        assert_eq!(minted.client_id, "chat-mcp");
+        assert_eq!(minted.act.expect("act").sub, "chat-mcp");
+    }
+
+    #[tokio::test]
+    async fn token_route_mints_impersonation_token_without_act() {
+        let (mut state, subject_signer, _, client_signer) = test_state();
+        state.config.token_exchange_mode = TokenExchangeMode::Impersonation;
+        state.config.impersonation_policy.allowed_clients.insert("chat-mcp".to_string());
+        let now = unix_now();
+        let subject_token = signed_subject_token(&subject_signer, now);
+        let client_assertion = signed_assertion(&client_signer, now, "client-jti-impersonation");
+
+        let body = serde_urlencoded::to_string([
+            ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+            ("subject_token", subject_token.as_str()),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("audience", "api://chat-mcp"),
+            ("scope", "chat.read"),
+            ("client_assertion_type", CLIENT_ASSERTION_TYPE),
+            ("client_assertion", client_assertion.as_str()),
+            ("client_id", "chat-mcp"),
+        ])
+        .expect("form");
+
+        let response = post_token_form(state.clone(), body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        let token = body["access_token"].as_str().expect("access token");
+        let minted: sts_core::MintedClaims =
+            sts_jose::verify_claims_against_jwks(token, &state.signer.public_jwks())
+                .expect("minted token verifies");
+        assert_eq!(minted.sub, "user@example.com");
+        assert_eq!(minted.client_id, "chat-mcp");
+        assert!(minted.act.is_none());
+    }
+
+    #[tokio::test]
+    async fn token_route_rejects_client_assertion_client_id_mismatch() {
+        let (state, subject_signer, actor_signer, client_signer) = test_state();
+        let now = unix_now();
+        let subject_token = signed_subject_token(&subject_signer, now);
+        let actor_token = signed_assertion(&actor_signer, now, "actor-jti-mismatch");
+        let client_assertion = signed_assertion(&client_signer, now, "client-jti-mismatch");
+
+        let body = serde_urlencoded::to_string([
+            ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+            ("subject_token", subject_token.as_str()),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("actor_token", actor_token.as_str()),
+            ("actor_token_type", JWT_TOKEN_TYPE),
+            ("audience", "api://chat-mcp"),
+            ("client_assertion_type", CLIENT_ASSERTION_TYPE),
+            ("client_assertion", client_assertion.as_str()),
+            ("client_id", "other-client"),
+        ])
+        .expect("form");
+
+        let response = post_token_form(state, body).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = read_json(response).await;
+        assert_eq!(body["error"], "invalid_client");
+        assert_eq!(
+            body["error_description"],
+            "client_id does not match the authenticated client_assertion"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_route_rejects_private_key_jwt_delegation_without_actor_token() {
+        let (state, subject_signer, _, client_signer) = test_state();
+        let now = unix_now();
+        let subject_token = signed_subject_token(&subject_signer, now);
+        let client_assertion = signed_assertion(&client_signer, now, "client-jti-no-actor");
+
+        let body = serde_urlencoded::to_string([
+            ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+            ("subject_token", subject_token.as_str()),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("audience", "api://chat-mcp"),
+            ("client_assertion_type", CLIENT_ASSERTION_TYPE),
+            ("client_assertion", client_assertion.as_str()),
+            ("client_id", "chat-mcp"),
+        ])
+        .expect("form");
+
+        let response = post_token_form(state, body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = read_json(response).await;
+        assert_eq!(body["error"], "invalid_request");
+        assert_eq!(body["error_description"], "actor_token required for delegation");
+    }
+
+    #[tokio::test]
     async fn token_route_rejects_missing_actor_token() {
-        let (state, subject_signer, _) = test_state();
-        let subject_token = subject_signer
-            .sign_json_claims(&SubjectWireClaims {
-                iss: "https://issuer.example/oauth2/default".to_string(),
-                sub: "user@example.com".to_string(),
-                aud: "api://obo".to_string(),
-                scope: "chat.read".to_string(),
-                exp: unix_now() + 600,
-                iat: unix_now(),
-            })
-            .expect("subject token");
+        let (state, subject_signer, _, _) = test_state();
+        let subject_token = signed_subject_token(&subject_signer, unix_now());
         let body = serde_urlencoded::to_string([
             ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
             ("subject_token", subject_token.as_str()),
@@ -843,17 +1196,7 @@ mod tests {
             ("audience", "api://chat-mcp"),
         ])
         .expect("form");
-        let response = router(state)
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/token")
-                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let response = post_token_form(state, body).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let body = read_json(response).await;
         assert_eq!(body["error"], "invalid_client");
