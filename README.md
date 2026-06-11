@@ -17,6 +17,25 @@ Rust-native successor to `sts-delegate`: an OAuth 2.1 / RFC 8693 security token 
 
 The current Python implementation remains the behavior oracle until the Rust contract tests prove parity. The Rust repo must preserve observable endpoints, claim shapes, and failure classes while keeping the architecture explicit and maintainable.
 
+## Runtime bootstrap
+
+`sts-cli` now exposes the Rust HTTP runtime boundary:
+
+```bash
+cargo run -p sts-cli -- bootstrap-check
+cargo run -p sts-cli -- serve
+```
+
+`bootstrap-check` loads runtime config, the STS signing key, IdP/actor/client
+JWKS, and replay policy, then exits before binding a socket. `serve` performs the
+same checks and starts the Axum server only after they pass.
+
+Required environment includes `IDP_ISSUER` or `OKTA_ISSUER`,
+`EXPECTED_SUBJECT_AUD`, `ACTOR_IDS` or `GATEWAY_ACTOR_ID`,
+`OBO_STS_KEY_FILE`, `ACTOR_JWKS_FILE`, and either `IDP_JWKS_FILE` or
+`IDP_JWKS_URI`/OIDC discovery. `STS_HTTP_ADDR` defaults to
+`127.0.0.1:8888`.
+
 ## Release shape
 
 Current releases are source releases from GitHub tags. Workspace crates inherit `publish = false`; crates.io publication is intentionally out of scope until the internal crate graph, package names, and public API stability are ready for an explicit publishing milestone.

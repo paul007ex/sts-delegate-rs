@@ -90,8 +90,10 @@ impl std::error::Error for JoseError {}
 pub struct PublicJwk {
     pub kty: String,
     pub kid: String,
+    #[serde(default = "default_jwk_use")]
     #[serde(rename = "use")]
     pub use_: String,
+    #[serde(default = "default_jwk_alg")]
     pub alg: String,
     pub n: String,
     pub e: String,
@@ -107,6 +109,25 @@ impl JwksDocument {
     pub fn new(keys: Vec<PublicJwk>) -> Self {
         Self { keys }
     }
+}
+
+fn default_jwk_use() -> String {
+    "sig".to_string()
+}
+
+fn default_jwk_alg() -> String {
+    "RS256".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+struct PrivateRsaJwk {
+    kty: String,
+    kid: Option<String>,
+    n: String,
+    e: String,
+    d: String,
+    p: String,
+    q: String,
 }
 
 /// Deserialized claims plus the protected-header key id selected for verification.
@@ -144,6 +165,12 @@ pub fn rsa_public_key_from_jwk(jwk: &PublicJwk) -> Result<RsaPublicKey, JoseErro
     RsaPublicKey::new(rsa::BigUint::from_bytes_be(&n), rsa::BigUint::from_bytes_be(&e)).map_err(
         |e| JoseError::new(JoseErrorKind::InvalidKey, format!("invalid RSA public key: {e}")),
     )
+}
+
+/// Return the RSA modulus size for public-key policy checks.
+pub fn rsa_public_key_bits_from_jwk(jwk: &PublicJwk) -> Result<usize, JoseError> {
+    let public_key = rsa_public_key_from_jwk(jwk)?;
+    Ok(public_key.n().bits())
 }
 
 /// Verify a compact JWS against a JWKS and deserialize the payload.
@@ -249,6 +276,49 @@ impl RsaJoseSigner {
         Self::from_pkcs1_pem(private_pem, kid)
     }
 
+    /// Build the RS256 signer from a private RSA JWK only when the selected
+    /// backend is classical.
+    pub fn from_private_jwk_for_backend(
+        selection: &BackendSelection,
+        private_jwk_json: impl AsRef<str>,
+        fallback_kid: impl Into<String>,
+    ) -> Result<Self, JoseError> {
+        resolve_backend(selection)?;
+        Self::from_private_jwk(private_jwk_json, fallback_kid)
+    }
+
+    /// Build the RS256 signer from a private RSA JWK.
+    pub fn from_private_jwk(
+        private_jwk_json: impl AsRef<str>,
+        fallback_kid: impl Into<String>,
+    ) -> Result<Self, JoseError> {
+        let jwk: PrivateRsaJwk = serde_json::from_str(private_jwk_json.as_ref()).map_err(|e| {
+            JoseError::new(JoseErrorKind::InvalidKey, format!("invalid RSA private JWK JSON: {e}"))
+        })?;
+        if jwk.kty != "RSA" {
+            return Err(JoseError::new(
+                JoseErrorKind::InvalidKey,
+                format!("unsupported private JWK key type {}", jwk.kty),
+            ));
+        }
+        let n = decode_biguint("n", &jwk.n)?;
+        if n.bits() < 2048 {
+            return Err(JoseError::new(
+                JoseErrorKind::InvalidKey,
+                "RSA signing key modulus must be at least 2048 bits",
+            ));
+        }
+        let e = decode_biguint("e", &jwk.e)?;
+        let d = decode_biguint("d", &jwk.d)?;
+        let p = decode_biguint("p", &jwk.p)?;
+        let q = decode_biguint("q", &jwk.q)?;
+        let private_key = RsaPrivateKey::from_components(n, e, d, vec![p, q]).map_err(|e| {
+            JoseError::new(JoseErrorKind::InvalidKey, format!("invalid RSA private JWK: {e}"))
+        })?;
+        let kid = jwk.kid.unwrap_or_else(|| fallback_kid.into());
+        Self::from_generated(&private_key, kid)
+    }
+
     pub fn from_pkcs1_pem(
         private_pem: impl AsRef<str>,
         kid: impl Into<String>,
@@ -346,6 +416,16 @@ impl RsaJoseSigner {
         }
         Ok((header, payload, signature))
     }
+}
+
+fn decode_biguint(name: &str, value: &str) -> Result<rsa::BigUint, JoseError> {
+    let bytes = URL_SAFE_NO_PAD.decode(value.as_bytes()).map_err(|e| {
+        JoseError::new(
+            JoseErrorKind::InvalidKey,
+            format!("invalid RSA private JWK {name} encoding: {e}"),
+        )
+    })?;
+    Ok(rsa::BigUint::from_bytes_be(&bytes))
 }
 
 impl JoseSigner for RsaJoseSigner {

@@ -18,6 +18,7 @@ use url::{Host, Url};
 const DEFAULT_ISSUER: &str = "http://localhost:8888/";
 const DEFAULT_KID: &str = "sts-delegate-key-1";
 const DEFAULT_SECRETS_DIR: &str = "./secrets";
+const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8888";
 const DEFAULT_CLOCK_SKEW_LEEWAY: i64 = 30;
 const DEFAULT_SCOPED_TOKEN_TTL: i64 = 300;
 const DEFAULT_JWKS_CACHE_MAX_AGE: i64 = 300;
@@ -178,6 +179,9 @@ pub struct RuntimeConfig {
     pub our_issuer: String,
     pub our_kid: String,
     pub sts_secrets_dir: PathBuf,
+    pub obo_sts_key_file: PathBuf,
+    pub idp_jwks_file: Option<PathBuf>,
+    pub idp_jwks_uri: Option<String>,
     pub actor_jwks_file: PathBuf,
     pub client_jwks_file: PathBuf,
     pub obo_sts_extra_jwks_file: Option<PathBuf>,
@@ -202,8 +206,10 @@ pub struct RuntimeConfig {
     pub allow_insecure_actor_jwks: bool,
     pub allow_insecure_client_jwks: bool,
     pub allow_insecure_key_file: bool,
+    pub allow_insecure_http_bind: bool,
     pub actor_jwks_sha256: Option<String>,
     pub client_jwks_sha256: Option<String>,
+    pub http_addr: String,
     pub log_format_json: bool,
     pub log_level: String,
     pub audit_hash_chain: bool,
@@ -238,6 +244,21 @@ impl RuntimeConfig {
                 .map(str::to_string)
                 .unwrap_or_else(|| sts_secrets_dir.join("actor_jwks.json").display().to_string()),
         );
+        let obo_sts_key_file =
+            PathBuf::from(source.get("OBO_STS_KEY_FILE").map(str::to_string).unwrap_or_else(
+                || sts_secrets_dir.join("obo_sts_private_key.json").display().to_string(),
+            ));
+        let idp_jwks_file = source
+            .get("IDP_JWKS_FILE")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let idp_jwks_uri = source
+            .get("IDP_JWKS_URI")
+            .or_else(|| source.get("OKTA_JWKS_URL"))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
         let client_jwks_file = PathBuf::from(
             source
                 .get("CLIENT_JWKS_FILE")
@@ -276,6 +297,9 @@ impl RuntimeConfig {
             )?,
             our_kid: DEFAULT_KID.to_string(),
             sts_secrets_dir,
+            obo_sts_key_file,
+            idp_jwks_file,
+            idp_jwks_uri,
             actor_jwks_file,
             client_jwks_file,
             obo_sts_extra_jwks_file,
@@ -345,6 +369,7 @@ impl RuntimeConfig {
                 false,
             ),
             allow_insecure_key_file: parse_bool(source, "ALLOW_INSECURE_KEY_FILE", false),
+            allow_insecure_http_bind: parse_bool(source, "ALLOW_INSECURE_HTTP_BIND", false),
             actor_jwks_sha256: source
                 .get("ACTOR_JWKS_SHA256")
                 .map(str::trim)
@@ -362,6 +387,7 @@ impl RuntimeConfig {
                         .filter(|v| !v.is_empty())
                         .map(ToString::to_string)
                 }),
+            http_addr: source.get("STS_HTTP_ADDR").unwrap_or(DEFAULT_HTTP_ADDR).trim().to_string(),
             log_format_json: parse_bool(source, "LOG_FORMAT_JSON", false)
                 || source.get("LOG_FORMAT").is_some_and(|v| v.trim().eq_ignore_ascii_case("json")),
             log_level: parse_log_level(source),

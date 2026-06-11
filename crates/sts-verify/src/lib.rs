@@ -315,6 +315,28 @@ pub async fn fetch_jwks(http: &Client, jwks_url: &str) -> Result<JwksDocument, V
     })
 }
 
+/// Resolve the IdP JWKS with an optional explicit JWKS URI.
+///
+/// An explicit URI mirrors the Python oracle's `IDP_JWKS_URI` /
+/// `OKTA_JWKS_URL` escape hatch. Without it, bootstrap uses OIDC discovery.
+pub async fn resolve_idp_jwks(
+    issuer: &str,
+    explicit_jwks_uri: Option<&str>,
+) -> Result<JwksDocument, VerifyError> {
+    let http = Client::new();
+    if let Some(jwks_uri) = explicit_jwks_uri.map(str::trim).filter(|value| !value.is_empty()) {
+        return fetch_jwks(&http, jwks_uri).await;
+    }
+    let discovery = discover_document(&http, issuer).await?;
+    if discovery.issuer.trim_end_matches('/') != validate_issuer(issuer)? {
+        return Err(VerifyError::new(
+            VerifyErrorKind::DiscoveryFailed,
+            "OIDC discovery issuer did not match configured issuer",
+        ));
+    }
+    fetch_jwks(&http, &discovery.jwks_uri).await
+}
+
 /// Verify an inbound subject token against a JWKS document and expected audience.
 ///
 /// RFC 8693 requires the subject token to be validated before token exchange; the

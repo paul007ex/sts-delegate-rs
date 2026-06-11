@@ -8,6 +8,9 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::fs;
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,7 +26,7 @@ use http::header::{
 use http::{HeaderMap, StatusCode};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sts_config::{ClientAuthPolicy, RuntimeConfig, TokenExchangeMode};
+use sts_config::{ClientAuthPolicy, ConfigError, ConfigSource, RuntimeConfig, TokenExchangeMode};
 use sts_core::{
     ACCESS_TOKEN_TYPE, ActClaim, ExchangeRequest, JWT_TOKEN_TYPE, TOKEN_EXCHANGE_GRANT_TYPE,
     build_act, build_scoped_payload, downscope, resolve_target,
@@ -31,11 +34,14 @@ use sts_core::{
 use sts_dpop::{
     DPOP_SIGNING_ALGS_SUPPORTED, DpopBinding, DpopError, DpopProofRequest, validate_dpop_proof,
 };
-use sts_jose::{JoseSigner, JwksDocument};
-use sts_replay::{ReplayErrorKind, ReplayPolicy, dpop_replay_key};
+use sts_jose::{
+    BackendSelection, JoseError, JoseSigner, JwksDocument, PublicJwk, RsaJoseSigner,
+    rsa_public_key_bits_from_jwk,
+};
+use sts_replay::{InMemoryReplayStore, ReplayErrorKind, ReplayPolicy, dpop_replay_key};
 use sts_verify::{
     AssertionClaims, AssertionVerificationOptions, SubjectTokenClaims, VerifyError,
-    VerifyErrorKind, verify_assertion, verify_subject_token,
+    VerifyErrorKind, resolve_idp_jwks, verify_assertion, verify_subject_token,
 };
 use url::Url;
 
@@ -63,6 +69,7 @@ struct VerifiedExchange {
 pub struct HttpState {
     pub config: RuntimeConfig,
     pub signer: Arc<dyn JoseSigner>,
+    pub published_jwks: JwksDocument,
     pub subject_jwks: JwksDocument,
     pub actor_jwks: JwksDocument,
     pub client_jwks: JwksDocument,
@@ -81,9 +88,34 @@ impl HttpState {
     where
         S: JoseSigner + 'static,
     {
+        let published_jwks = signer.public_jwks();
+        Self::new_with_published_jwks(
+            config,
+            signer,
+            published_jwks,
+            subject_jwks,
+            actor_jwks,
+            client_jwks,
+            replay,
+        )
+    }
+
+    pub fn new_with_published_jwks<S>(
+        config: RuntimeConfig,
+        signer: S,
+        published_jwks: JwksDocument,
+        subject_jwks: JwksDocument,
+        actor_jwks: JwksDocument,
+        client_jwks: JwksDocument,
+        replay: ReplayPolicy,
+    ) -> Self
+    where
+        S: JoseSigner + 'static,
+    {
         Self {
             config,
             signer: Arc::new(signer),
+            published_jwks,
             subject_jwks,
             actor_jwks,
             client_jwks,
@@ -125,6 +157,303 @@ pub fn router(state: HttpState) -> Router {
     }
 
     app.with_state(state)
+}
+
+/// Stable startup/bootstrap failure.
+#[derive(Debug)]
+pub enum BootstrapError {
+    Config(ConfigError),
+    Jose(JoseError),
+    Verify(VerifyError),
+    Io { path: PathBuf, message: String },
+    InvalidJwks { label: String, message: String },
+    InvalidBind { message: String },
+}
+
+impl fmt::Display for BootstrapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Config(err) => write!(f, "config error: {err}"),
+            Self::Jose(err) => write!(f, "JOSE error: {err}"),
+            Self::Verify(err) => write!(f, "verification error: {err}"),
+            Self::Io { path, message } => write!(f, "IO error for {}: {message}", path.display()),
+            Self::InvalidJwks { label, message } => write!(f, "invalid {label}: {message}"),
+            Self::InvalidBind { message } => write!(f, "invalid bind address: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for BootstrapError {}
+
+impl From<ConfigError> for BootstrapError {
+    fn from(value: ConfigError) -> Self {
+        Self::Config(value)
+    }
+}
+
+impl From<JoseError> for BootstrapError {
+    fn from(value: JoseError) -> Self {
+        Self::Jose(value)
+    }
+}
+
+impl From<VerifyError> for BootstrapError {
+    fn from(value: VerifyError) -> Self {
+        Self::Verify(value)
+    }
+}
+
+const PRIVATE_JWK_MEMBERS: &[&str] = &["d", "p", "q", "dp", "dq", "qi", "oth", "k"];
+
+/// Build a complete HTTP state from the process environment without serving.
+pub async fn build_state_from_env() -> Result<HttpState, BootstrapError> {
+    build_state_from_source(&ConfigSource::from_env()).await
+}
+
+/// Build a complete HTTP state from an explicit config source without serving.
+pub async fn build_state_from_source(source: &ConfigSource) -> Result<HttpState, BootstrapError> {
+    let config = RuntimeConfig::from_source(source)?;
+    build_state_from_config(config).await
+}
+
+/// Build a complete HTTP state from an already-validated runtime config.
+pub async fn build_state_from_config(config: RuntimeConfig) -> Result<HttpState, BootstrapError> {
+    let signer = load_signer(&config)?;
+    let published_jwks = published_jwks(&config, &signer)?;
+    let subject_jwks = load_subject_jwks(&config).await?;
+    let actor_jwks = load_public_jwks_file(
+        &config.actor_jwks_file,
+        "actor JWKS",
+        config.allow_insecure_actor_jwks,
+    )?;
+    let client_jwks = load_public_jwks_file(
+        &config.client_jwks_file,
+        "client JWKS",
+        config.allow_insecure_client_jwks,
+    )?;
+    let replay = ReplayPolicy::new(InMemoryReplayStore::new(config.max_seen_jti, 256));
+    Ok(HttpState::new_with_published_jwks(
+        config,
+        signer,
+        published_jwks,
+        subject_jwks,
+        actor_jwks,
+        client_jwks,
+        replay,
+    ))
+}
+
+/// Start the production HTTP server from process environment.
+pub async fn serve_from_env() -> Result<(), BootstrapError> {
+    let source = ConfigSource::from_env();
+    let config = RuntimeConfig::from_source(&source)?;
+    let addr = parse_bind_addr(&config)?;
+    let state = build_state_from_config(config).await?;
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|err| {
+        BootstrapError::InvalidBind { message: format!("failed to bind {addr}: {err}") }
+    })?;
+    axum::serve(listener, router(state))
+        .await
+        .map_err(|err| BootstrapError::InvalidBind { message: format!("server failed: {err}") })
+}
+
+/// Validate startup inputs from process environment without binding a port.
+pub async fn bootstrap_check_from_env() -> Result<(), BootstrapError> {
+    let source = ConfigSource::from_env();
+    bootstrap_check_from_source(&source).await
+}
+
+/// Validate startup inputs from an explicit source without binding a port.
+pub async fn bootstrap_check_from_source(source: &ConfigSource) -> Result<(), BootstrapError> {
+    let config = RuntimeConfig::from_source(source)?;
+    parse_bind_addr(&config)?;
+    build_state_from_config(config).await.map(|_| ())
+}
+
+fn parse_bind_addr(config: &RuntimeConfig) -> Result<SocketAddr, BootstrapError> {
+    let addr: SocketAddr = config.http_addr.parse().map_err(|err| BootstrapError::InvalidBind {
+        message: format!("STS_HTTP_ADDR must be host:port, got {:?}: {err}", config.http_addr),
+    })?;
+    if config.our_issuer.starts_with("http://")
+        && !is_loopback_ip(addr.ip())
+        && !config.allow_insecure_http_bind
+    {
+        return Err(BootstrapError::InvalidBind {
+            message: "refusing non-loopback plaintext bind for http issuer; use https issuer or set ALLOW_INSECURE_HTTP_BIND=true".to_string(),
+        });
+    }
+    Ok(addr)
+}
+
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => ip.is_loopback(),
+    }
+}
+
+fn load_signer(config: &RuntimeConfig) -> Result<RsaJoseSigner, BootstrapError> {
+    let raw = read_checked_file(
+        &config.obo_sts_key_file,
+        "STS signing key",
+        config.allow_insecure_key_file,
+    )?;
+    let selection = BackendSelection::parse(&config.sts_signing_alg);
+    let trimmed = raw.trim_start();
+    if trimmed.starts_with("-----BEGIN") {
+        RsaJoseSigner::from_pkcs1_pem_for_backend(&selection, raw, config.our_kid.clone())
+            .map_err(BootstrapError::from)
+    } else {
+        RsaJoseSigner::from_private_jwk_for_backend(&selection, raw, config.our_kid.clone())
+            .map_err(BootstrapError::from)
+    }
+}
+
+fn published_jwks(
+    config: &RuntimeConfig,
+    signer: &RsaJoseSigner,
+) -> Result<JwksDocument, BootstrapError> {
+    let mut published = signer.public_jwks();
+    if let Some(extra_file) = &config.obo_sts_extra_jwks_file {
+        let extra =
+            load_public_jwks_file(extra_file, "extra STS JWKS", config.allow_insecure_jwks)?;
+        for key in extra.keys {
+            if !published.keys.iter().any(|existing| existing.kid == key.kid) {
+                published.keys.push(key);
+            }
+        }
+    }
+    Ok(published)
+}
+
+async fn load_subject_jwks(config: &RuntimeConfig) -> Result<JwksDocument, BootstrapError> {
+    if let Some(file) = &config.idp_jwks_file {
+        return load_public_jwks_file(file, "IdP JWKS", config.allow_insecure_jwks);
+    }
+    resolve_idp_jwks(&config.idp_issuer, config.idp_jwks_uri.as_deref())
+        .await
+        .map_err(BootstrapError::from)
+}
+
+fn load_public_jwks_file(
+    path: &Path,
+    label: &str,
+    allow_insecure_writable: bool,
+) -> Result<JwksDocument, BootstrapError> {
+    let raw = read_checked_file(path, label, allow_insecure_writable)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|err| BootstrapError::InvalidJwks {
+            label: label.to_string(),
+            message: format!("file is not valid JSON: {err}"),
+        })?;
+    normalize_public_jwks_value(value, label)
+}
+
+fn normalize_public_jwks_value(
+    value: serde_json::Value,
+    label: &str,
+) -> Result<JwksDocument, BootstrapError> {
+    let keys = match value {
+        serde_json::Value::Object(mut object) => match object.remove("keys") {
+            Some(serde_json::Value::Array(keys)) => keys,
+            Some(_) => {
+                return Err(BootstrapError::InvalidJwks {
+                    label: label.to_string(),
+                    message: "keys must be an array".to_string(),
+                });
+            }
+            None => vec![serde_json::Value::Object(object)],
+        },
+        _ => {
+            return Err(BootstrapError::InvalidJwks {
+                label: label.to_string(),
+                message: "JWKS must be an object".to_string(),
+            });
+        }
+    };
+    if keys.is_empty() {
+        return Err(BootstrapError::InvalidJwks {
+            label: label.to_string(),
+            message: "no public keys found".to_string(),
+        });
+    }
+
+    let mut public_keys = Vec::with_capacity(keys.len());
+    for key in keys {
+        let Some(object) = key.as_object() else {
+            return Err(BootstrapError::InvalidJwks {
+                label: label.to_string(),
+                message: "key entries must be objects".to_string(),
+            });
+        };
+        let private_found: Vec<&str> = PRIVATE_JWK_MEMBERS
+            .iter()
+            .copied()
+            .filter(|member| object.contains_key(*member))
+            .collect();
+        if !private_found.is_empty() {
+            return Err(BootstrapError::InvalidJwks {
+                label: label.to_string(),
+                message: format!(
+                    "key contains private JWK member(s) {}; public JWKS files must not contain private material",
+                    private_found.join(",")
+                ),
+            });
+        }
+        let jwk: PublicJwk =
+            serde_json::from_value(key).map_err(|err| BootstrapError::InvalidJwks {
+                label: label.to_string(),
+                message: format!("invalid public JWK: {err}"),
+            })?;
+        let bits = rsa_public_key_bits_from_jwk(&jwk).map_err(BootstrapError::from)?;
+        if bits < 2048 {
+            return Err(BootstrapError::InvalidJwks {
+                label: label.to_string(),
+                message: "RSA public keys must be at least 2048 bits".to_string(),
+            });
+        }
+        public_keys.push(jwk);
+    }
+    Ok(JwksDocument::new(public_keys))
+}
+
+fn read_checked_file(
+    path: &Path,
+    label: &str,
+    allow_insecure_writable: bool,
+) -> Result<String, BootstrapError> {
+    check_file_mode(path, label, allow_insecure_writable)?;
+    fs::read_to_string(path)
+        .map_err(|err| BootstrapError::Io { path: path.to_path_buf(), message: err.to_string() })
+}
+
+fn check_file_mode(
+    path: &Path,
+    label: &str,
+    allow_insecure_writable: bool,
+) -> Result<(), BootstrapError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Ok(metadata) = fs::metadata(path) else {
+            return Ok(());
+        };
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o022 != 0 && !allow_insecure_writable {
+            return Err(BootstrapError::Io {
+                path: path.to_path_buf(),
+                message: format!(
+                    "{label} is group/world-writable (mode {mode:o}); chmod 600 or set the explicit insecure override"
+                ),
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, label, allow_insecure_writable);
+    }
+    Ok(())
 }
 
 /// RFC 8414 authorization-server metadata.
@@ -303,7 +632,7 @@ impl IntoResponse for HttpError {
 }
 
 async fn jwks(State(state): State<HttpState>) -> impl IntoResponse {
-    (public_cache_headers(state.config.jwks_cache_max_age), Json(state.signer.public_jwks()))
+    (public_cache_headers(state.config.jwks_cache_max_age), Json(state.published_jwks))
 }
 
 async fn metadata(State(state): State<HttpState>) -> impl IntoResponse {
@@ -1093,11 +1422,18 @@ fn unix_now() -> i64 {
 mod tests {
     use super::*;
     use axum::body::Body;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use http::{Method, Request};
     use http_body_util::BodyExt;
     use rand::{SeedableRng, rngs::StdRng};
-    use rsa::RsaPrivateKey;
+    use rsa::{
+        RsaPrivateKey,
+        traits::{PrivateKeyParts, PublicKeyParts},
+    };
     use serde_json::Value;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
     use sts_config::{
         ConfigSource, ImpersonationPolicyEntry, ImpersonationSelector, TokenExchangeMode,
     };
@@ -1128,6 +1464,159 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(seed);
         let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa");
         RsaJoseSigner::from_generated(&private_key, kid).expect("signer")
+    }
+
+    fn private_key(seed: u64) -> RsaPrivateKey {
+        let mut rng = StdRng::seed_from_u64(seed);
+        RsaPrivateKey::new(&mut rng, 2048).expect("rsa")
+    }
+
+    fn private_jwk_json(key: &RsaPrivateKey, kid: &str) -> String {
+        let primes = key.primes();
+        serde_json::json!({
+            "kty": "RSA",
+            "kid": kid,
+            "n": URL_SAFE_NO_PAD.encode(key.n().to_bytes_be()),
+            "e": URL_SAFE_NO_PAD.encode(key.e().to_bytes_be()),
+            "d": URL_SAFE_NO_PAD.encode(key.d().to_bytes_be()),
+            "p": URL_SAFE_NO_PAD.encode(primes[0].to_bytes_be()),
+            "q": URL_SAFE_NO_PAD.encode(primes[1].to_bytes_be()),
+        })
+        .to_string()
+    }
+
+    fn temp_bootstrap_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).expect("time").as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("sts-rs-{name}-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&path).expect("temp dir");
+        path
+    }
+
+    fn write_file(path: &Path, contents: &str) {
+        fs::write(path, contents).expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        }
+    }
+
+    fn bootstrap_source(dir: &Path) -> ConfigSource {
+        let sts_key = private_key(10);
+        let sts_key_file = dir.join("sts-private.json");
+        write_file(&sts_key_file, &private_jwk_json(&sts_key, "sts-key-1"));
+
+        let subject_signer = signer(11, "subject-key-1");
+        let actor_signer = signer(12, "chat-mcp-key-1");
+        let idp_jwks_file = dir.join("idp-jwks.json");
+        let actor_jwks_file = dir.join("actor-jwks.json");
+        write_file(
+            &idp_jwks_file,
+            &serde_json::to_string(&subject_signer.public_jwks()).expect("idp jwks"),
+        );
+        write_file(
+            &actor_jwks_file,
+            &serde_json::to_string(&actor_signer.public_jwks()).expect("actor jwks"),
+        );
+
+        ConfigSource::from_pairs([
+            ("IDP_ISSUER", "https://issuer.example/oauth2/default".to_string()),
+            ("EXPECTED_SUBJECT_AUD", "api://obo".to_string()),
+            ("ACTOR_IDS", "chat-mcp".to_string()),
+            ("OBO_STS_ISSUER", "http://localhost:8888".to_string()),
+            ("OBO_STS_KEY_FILE", sts_key_file.display().to_string()),
+            ("IDP_JWKS_FILE", idp_jwks_file.display().to_string()),
+            ("ACTOR_JWKS_FILE", actor_jwks_file.display().to_string()),
+            ("CLIENT_JWKS_FILE", actor_jwks_file.display().to_string()),
+            (
+                "TARGET_POLICY_JSON",
+                r#"{"api://chat-mcp":{"allowed_scopes":["chat.read"],"default_scopes":["chat.read"]}}"#.to_string(),
+            ),
+        ])
+    }
+
+    #[tokio::test]
+    async fn bootstrap_builds_complete_state_from_safe_files() {
+        let dir = temp_bootstrap_dir("accepted");
+        let source = bootstrap_source(&dir);
+        let state = build_state_from_source(&source).await.expect("bootstrap");
+        assert_eq!(state.published_jwks.keys.len(), 1);
+        assert_eq!(state.subject_jwks.keys.len(), 1);
+        assert_eq!(state.actor_jwks.keys.len(), 1);
+        assert_eq!(state.client_jwks.keys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_missing_signing_key_before_serving() {
+        let dir = temp_bootstrap_dir("missing-key");
+        let source = bootstrap_source(&dir);
+        fs::remove_file(dir.join("sts-private.json")).expect("remove key");
+        let err = match build_state_from_source(&source).await {
+            Ok(_) => panic!("missing key should fail bootstrap"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, BootstrapError::Io { .. }));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_private_material_in_public_jwks() {
+        let dir = temp_bootstrap_dir("private-jwks");
+        let source = bootstrap_source(&dir);
+        let private_actor = private_key(13);
+        write_file(
+            &dir.join("actor-jwks.json"),
+            &format!(r#"{{"keys":[{}]}}"#, private_jwk_json(&private_actor, "chat-mcp-key-1")),
+        );
+        let err = match build_state_from_source(&source).await {
+            Ok(_) => panic!("private public JWKS should fail bootstrap"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, BootstrapError::InvalidJwks { .. }));
+        assert!(err.to_string().contains("private JWK member"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bootstrap_rejects_group_writable_signing_key_without_opt_in() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_bootstrap_dir("writable-key");
+        let source = bootstrap_source(&dir);
+        fs::set_permissions(dir.join("sts-private.json"), fs::Permissions::from_mode(0o620))
+            .expect("chmod");
+        let err = match build_state_from_source(&source).await {
+            Ok(_) => panic!("writable key should fail bootstrap"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, BootstrapError::Io { .. }));
+        assert!(err.to_string().contains("group/world-writable"));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_non_loopback_plaintext_bind_without_opt_in() {
+        let dir = temp_bootstrap_dir("plain-bind");
+        let mut pairs = vec![
+            ("STS_HTTP_ADDR".to_string(), "0.0.0.0:8888".to_string()),
+            ("ALLOW_INSECURE_HTTP_BIND".to_string(), "false".to_string()),
+        ];
+        let source = bootstrap_source(&dir);
+        for key in [
+            "IDP_ISSUER",
+            "EXPECTED_SUBJECT_AUD",
+            "ACTOR_IDS",
+            "OBO_STS_ISSUER",
+            "OBO_STS_KEY_FILE",
+            "IDP_JWKS_FILE",
+            "ACTOR_JWKS_FILE",
+            "CLIENT_JWKS_FILE",
+            "TARGET_POLICY_JSON",
+        ] {
+            pairs.push((key.to_string(), source.get(key).expect("source key").to_string()));
+        }
+        let source = ConfigSource::from_pairs(pairs);
+        let err = bootstrap_check_from_source(&source).await.expect_err("plaintext bind");
+        assert!(matches!(err, BootstrapError::InvalidBind { .. }));
     }
 
     fn test_state() -> (HttpState, RsaJoseSigner, RsaJoseSigner, RsaJoseSigner) {

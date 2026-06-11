@@ -20,7 +20,7 @@ WORKSPACE_CRATES = {
 }
 
 ALLOWED_NORMAL_WORKSPACE_DEPS = {
-    "sts-cli": set(),
+    "sts-cli": {"sts-http"},
     "sts-config": set(),
     "sts-core": set(),
     "sts-dpop": set(),
@@ -125,7 +125,7 @@ def main() -> int:
             verify_deps = direct_deps & VERIFY_ONLY_NORMAL_DEPS
             if verify_deps:
                 errors.append(f"{crate_name} depends on verify-only network crates: {sorted(verify_deps)}")
-        if crate_name != "sts-verify":
+        if crate_name not in {"sts-cli", "sts-http", "sts-verify"}:
             async_deps = direct_deps & ASYNC_RUNTIME_NORMAL_DEPS
             if async_deps:
                 errors.append(f"{crate_name} depends directly on async runtime crates: {sorted(async_deps)}")
