@@ -582,7 +582,13 @@ async fn contract_discovery_and_jwks_match_python_oracle_shape() {
     assert_eq!(metadata["response_types_supported"], json!([]));
     assert_eq!(metadata["grant_types_supported"], json!([TOKEN_EXCHANGE_GRANT_TYPE]));
     assert_eq!(metadata["token_endpoint_auth_methods_supported"], json!(["private_key_jwt"]));
+    #[cfg(not(feature = "pqc-aws-lc-unstable"))]
     assert_eq!(metadata["token_endpoint_auth_signing_alg_values_supported"], json!(["RS256"]));
+    #[cfg(feature = "pqc-aws-lc-unstable")]
+    assert_eq!(
+        metadata["token_endpoint_auth_signing_alg_values_supported"],
+        json!(["RS256", "ML-DSA-44", "ML-DSA-65", "ML-DSA-87"])
+    );
     assert!(
         metadata["dpop_signing_alg_values_supported"]
             .as_array()

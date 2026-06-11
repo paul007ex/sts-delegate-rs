@@ -106,10 +106,10 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-076 | Delegation minted token `exp` must not outlive the actor token. | must | implemented | http/core | Python `tests/test_integration.py:693`; Python `domain/payload.py:28` | `contract_delegation_lifetime_is_capped_by_subject_and_actor_exp` | Actor cap is delegation-specific. |
 | R-077 | `expires_in` must reflect actual minted lifetime after any cap. | must | implemented | http | RFC 6749 Section 5.1; Python `tests/test_integration.py:709` | `contract_delegation_lifetime_is_capped_by_subject_and_actor_exp` | Avoids over-stating token validity. |
 | R-078 | Minted token `jti` must be a non-empty generated string. | must | implemented | http/core | RFC 7519 Section 4.1.7; `crates/sts-http/src/lib.rs` | HTTP contract tests | Resource server can do replay checks. |
-| R-079 | The STS signing JWKS must not include private members. | must-not | implemented | jose/http | `crates/sts-jose/src/lib.rs:88`; Python `tests/test_integration.py:620` | JWKS contract test | Extra-JWKS file loading not yet in Rust. |
+| R-079 | The STS signing JWKS must not include private members. | must-not | implemented | jose/http | `crates/sts-jose/src/lib.rs`; Python `tests/test_integration.py:620` | JWKS and ML-DSA feature tests | RSA private members and RFC 9964 `priv` are rejected from public JWKS files. |
 | R-080 | Classical signing backend selection accepts blank, `classical`, and `RS256`. | policy | implemented | jose | `crates/sts-jose/src/lib.rs:31` | JOSE tests | Case-insensitive parsing. |
-| R-081 | PQC or unknown signing backend selection must fail closed and never instantiate RS256. | must-not | implemented | jose/security | issue #5; `crates/sts-jose/src/lib.rs:426` | JOSE tests | Native PQC remains missing. |
-| R-082 | Real PQC support must be first-class when implemented, not marker-only or fallback-only. | must | missing | jose/security | issue #2; repo instructions | no implementation | Future issue needed. |
+| R-081 | PQC or unknown signing backend selection must fail closed and never instantiate RS256. | must-not | implemented | jose/security | issue #5; `crates/sts-jose/src/lib.rs` | JOSE tests | Concrete ML-DSA selectors require the explicit feature; vague `pqc` and unknown algorithms do not fall back. |
+| R-082 | Real PQC support must be first-class when implemented, not marker-only or fallback-only. | must | implemented-experimental | jose/security | issue #19; RFC 9964 | `cargo test -p sts-jose --features pqc-aws-lc-unstable --lib`; `cargo test -p sts-http --features pqc-aws-lc-unstable` | Uses AWS-LC unstable ML-DSA API behind `pqc-aws-lc-unstable`; RS256 remains default. |
 | R-083 | Client assertion auth uses `private_key_jwt` assertion type. | must | implemented | http/verify | RFC 7523; `crates/sts-http/src/lib.rs:42` | HTTP tests | Wrong/missing assertion type rejected. |
 | R-084 | Client assertion `iss` and `sub` must match. | must | implemented | verify | RFC 7523; `crates/sts-verify/src/lib.rs:328` | verify/http tests | Prevent confused identities. |
 | R-085 | `client_id` form value must match authenticated client assertion subject. | must | implemented | http | issue #7; `crates/sts-http/tests/http_contract.rs:1337` | client mismatch test | Error is invalid_client. |
@@ -157,7 +157,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-127 | The requirements ledger must not close #2 until 100+ requirements and 20+ use cases are canonical. | must | implemented | PM | issue #2 | this ledger | Close only after issue update and validation. |
 | R-128 | Full Authorization Server features such as authorization endpoint, revocation, introspection, and registration are non-goals for current STS alpha. | non-goal | implemented | PM/http | Python docs; `README.md:3` | no routes | Future AS expansion requires new milestone. |
 | R-129 | CLI parser, runtime bootstrap, offline smoke, canary config check, public key/JWKS inspection, and file-backed RSA private JWK rotation are shipped. | policy | implemented | cli/ops | `README.md`; `crates/sts-cli/src/main.rs`; issues #20/#28 | `cargo test -p sts-cli` | Rotation stages old public keys for overlap, uses atomic writes, and keeps KMS/HSM/PQC rotation out of scope. |
-| R-130 | Native PQC signing/JWKS/downstream verification is a v2 requirement, but alpha currently only provides fail-closed selection. | must | missing | jose/security | repo instructions; `crates/sts-jose/src/lib.rs:5` | JOSE fail-closed tests | Needs dedicated implementation issue before claim. |
+| R-130 | Native PQC signing/JWKS/downstream verification is a v2 requirement. | must | implemented-experimental | jose/security | repo instructions; RFC 9964; issue #19 | JOSE and HTTP feature tests | RFC 9964 AKP/ML-DSA is opt-in behind `pqc-aws-lc-unstable`; do not claim stable or FIPS-validated PQC. |
 | R-131 | Live tenant validation must use the configured real Okta trial issuer; `example.com`, `issuer.example`, `sts.example`, and `*.example.*` are fixture-only and must not close readiness issues. | must | partial | tests/security/cli | issue #21; `scripts/real_tenant_endpoint_loop.py`; `crates/sts-cli/src/main.rs`; `/Users/Shared/claude/obo-lab/okta.env` | redaction self-test; FastMCP loops; CLI canary config tests | Rust STS live base remains gated by `CANARY_STS_BASE_URL`. |
 | R-132 | Runtime STS issuer values must reject query components, fragment components, and non-loopback HTTP while preserving Python's loopback HTTP dev exception. | must | implemented | config/security | issue #13; Python `tests/test_stress.py:920`; Python `infrastructure/config_env.py:47` | Rust config/verify issuer tests | Canonicalizes trailing slash to keep issuer/audience/metadata stable. |
 
@@ -270,8 +270,8 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | Minted claim assembly | `domain/payload.py` | `sts-core` plus HTTP composition | keep wire claims | exp/auth-context/cnf drift | claim-shape contract tests | Disable Rust endpoint; keep Python |
 | Subject verification | `verify.py`, trust modules | `sts-verify` | keep issuer/audience/time gates | JWT library differences | verify tests and oracle tokens | Swap verification call back to Python oracle in tests only |
 | Actor/client assertion verification | `verification/*`, `client_auth.py` | `sts-verify`, `sts-http` | keep private_key_jwt policy | kid binding, subject binding, replay order | #7/#10 tests plus oracle smoke | Revert assertion auth slice |
-| JOSE signing and JWKS | `signer.py`, `keys.py` | `sts-jose` | keep RS256 default; add PQC later | Key custody/JWKS private leak | JOSE tests, JWKS black-box tests | Revert signer backend change |
-| PQC backend | preview/planned Python work | future `sts-jose` backend | add, no fallback | Claiming unsupported PQC | native sign/verify/JWKS/downstream verification tests | Disable PQC feature; classical default |
+| JOSE signing and JWKS | `signer.py`, `keys.py` | `sts-jose` | keep RS256 default; opt-in ML-DSA feature | Key custody/JWKS private leak | JOSE tests, JWKS black-box tests | Revert signer backend change |
+| PQC backend | preview/planned Python work | `sts-jose` feature gate | opt-in, no fallback | Claiming stable/FIPS PQC from unstable API | native sign/verify/JWKS/downstream verification tests | Disable PQC feature; classical default |
 | DPoP stateless proof validation | `dpop.py` | `sts-dpop` | keep local canonicalization | htu normalization and alg drift | DPoP unit and HTTP contract tests | Feature flag disable DPoP endpoint branch |
 | Replay storage | `replay.py`, `application/replay_records.py` | `sts-replay` | keep semantics; store backend can change | late jti preburn, multi-worker | replay tests plus oracle late-failure tests | In-memory store only |
 | HTTP routes and errors | `transport.py`, response modules | `sts-http` | keep endpoints; no `/exchange` | status/error/header drift | HTTP contract suite | Route traffic to Python service |
@@ -301,7 +301,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | #16 | core/http | Subject auth-context claims needed Python parity | Minted claims | closed | Keep auth-context carry contract test. |
 | #17 | http/parity | Residual Python parity gaps for token form and route errors | Request/error surface | closed | Keep route/error contract tests. |
 | #18 | runtime/security | Production bootstrap now composes config, keys, trust anchors, replay, and startup validation before serving | Runtime startup | closed | Keep bootstrap smoke and fail-closed startup tests in release gates. |
-| #19 | jose/pqc/security | Native PQC signing, JWKS publication, and downstream verification are missing | JOSE/PQC | open | Implement RFC 9964-compatible ML-DSA/AKP support before any PQC capability claim. |
+| #19 | jose/pqc/security | Native PQC signing, JWKS publication, and downstream verification are implemented behind `pqc-aws-lc-unstable` | JOSE/PQC | open | Close after feature-gated tests, docs, and issue evidence land; keep stable-backend/FIPS claims out. |
 | #20 | cli/ops | CLI now has explicit parser, bootstrap, offline smoke, canary config check, and public key/JWKS inspection; rotation split to #28 | CLI/ops | closed | Keep shipped CLI command tests in release gates. |
 | #21 | tests/security | Real Okta proof must not be substituted with synthetic issuer evidence | Live canary | open | Configure Rust STS live base and keep redacted real-tenant evidence green. |
 | #22 | http/ops | Metrics/OpenAPI parity is implemented with curated OpenAPI and opt-in metrics | Metrics/OpenAPI | closed | Keep OpenAPI/docs/metrics contract tests green. |
@@ -319,7 +319,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 
 ## Current Freeze Gaps
 
-- Native PQC signing/JWKS/downstream verification is missing; only fail-closed selection is shipped (#19).
+- Native PQC signing/JWKS/downstream verification is implemented only behind the explicit `pqc-aws-lc-unstable` feature; classical RS256 remains the default (#19).
 - Rust STS live-base canary remains not configured in this environment because `CANARY_STS_BASE_URL` is absent (#21).
 - Full Authorization Server features remain non-goals for this STS alpha.
 
@@ -330,10 +330,10 @@ line already has meaningful implementation for the core STS path, HTTP surface, 
 verification, DPoP, replay, config, and architecture guards.
 
 v2 must become a Rust-native, contract-tested STS with native crypto backend seams,
-explicit PQC support when real backend support lands, and a release process that keeps
+explicit PQC support when the feature-gated backend is intentionally enabled, and a release process that keeps
 source-only alpha claims separate from future package publishing and enterprise-ready
 claims.
 
 The biggest risks are not basic routing anymore. They are parity drift in subtle
-security paths, over-claiming PQC before real sign/verify/JWKS support exists, and
+security paths, over-claiming PQC beyond the current unstable feature-gated sign/verify/JWKS support, and
 letting alpha source releases sound like a stable full OAuth authorization server.

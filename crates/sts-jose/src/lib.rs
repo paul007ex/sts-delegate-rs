@@ -2,10 +2,9 @@
 
 //! JOSE/JWK/JWKS, signing, and backend-selection crate for `sts-delegate-rs`.
 //!
-//! This crate owns the classical signing surface and the fail-closed selector
-//! for PQC requests. The first shipped backend is RS256; PQC selectors are
-//! recognized explicitly but refuse to silently downgrade until a real PQC
-//! backend is added.
+//! This crate owns the signing surface and fail-closed backend selection. The
+//! default backend is RS256; RFC 9964 ML-DSA support is available only behind
+//! the explicit `pqc-aws-lc-unstable` feature and never falls back to RS256.
 
 use std::fmt;
 
@@ -14,9 +13,17 @@ use aws_lc_rs::{
     encoding::{AsDer, Pkcs8V1Der},
     signature::{KeyPair as AwsKeyPair, RsaKeyPair, RsaPublicKeyComponents},
 };
+#[cfg(feature = "pqc-aws-lc-unstable")]
+use aws_lc_rs::{
+    signature::UnparsedPublicKey,
+    unstable::signature::{
+        ML_DSA_44, ML_DSA_44_SIGNING, ML_DSA_65, ML_DSA_65_SIGNING, ML_DSA_87, ML_DSA_87_SIGNING,
+        PqdsaKeyPair, PqdsaSigningAlgorithm, PqdsaVerificationAlgorithm,
+    },
+};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{
-    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
+    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode,
     errors::{Error as JwtError, ErrorKind as JwtErrorKind},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -97,8 +104,12 @@ pub struct PublicJwk {
     pub use_: String,
     #[serde(default = "default_jwk_alg")]
     pub alg: String,
-    pub n: String,
-    pub e: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e: Option<String>,
+    #[serde(default, rename = "pub", skip_serializing_if = "Option::is_none")]
+    pub pub_: Option<String>,
 }
 
 /// The JWKS document published by the STS.
@@ -135,6 +146,24 @@ struct PrivateRsaJwk {
     qi: Option<String>,
 }
 
+#[cfg(feature = "pqc-aws-lc-unstable")]
+#[derive(Debug, Deserialize)]
+struct PrivateAkpJwk {
+    kty: String,
+    kid: Option<String>,
+    alg: String,
+    #[serde(rename = "pub")]
+    pub_: String,
+    #[serde(rename = "priv")]
+    priv_: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompactJwsHeader {
+    alg: String,
+    kid: Option<String>,
+}
+
 /// Deserialized claims plus the protected-header key id selected for verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedJws<T> {
@@ -147,6 +176,101 @@ pub struct VerifiedJws<T> {
 pub struct DecodedRsaPublicKey {
     pub n: Vec<u8>,
     pub e: Vec<u8>,
+}
+
+/// Decoded public AKP JWK components for RFC 9964 ML-DSA keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedAkpPublicKey {
+    pub algorithm: MlDsaAlgorithm,
+    pub public_key: Vec<u8>,
+}
+
+/// RFC 9964 ML-DSA algorithms this crate can model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MlDsaAlgorithm {
+    MlDsa44,
+    MlDsa65,
+    MlDsa87,
+}
+
+impl MlDsaAlgorithm {
+    pub fn jose_alg(self) -> &'static str {
+        match self {
+            Self::MlDsa44 => "ML-DSA-44",
+            Self::MlDsa65 => "ML-DSA-65",
+            Self::MlDsa87 => "ML-DSA-87",
+        }
+    }
+
+    pub fn from_jose_alg(value: &str) -> Option<Self> {
+        match value {
+            "ML-DSA-44" => Some(Self::MlDsa44),
+            "ML-DSA-65" => Some(Self::MlDsa65),
+            "ML-DSA-87" => Some(Self::MlDsa87),
+            _ => None,
+        }
+    }
+
+    fn from_selector(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ml-dsa-44" | "mldsa44" => Some(Self::MlDsa44),
+            "ml-dsa-65" | "mldsa65" => Some(Self::MlDsa65),
+            "ml-dsa-87" | "mldsa87" => Some(Self::MlDsa87),
+            _ => None,
+        }
+    }
+
+    pub fn public_key_len(self) -> usize {
+        match self {
+            Self::MlDsa44 => 1312,
+            Self::MlDsa65 => 1952,
+            Self::MlDsa87 => 2592,
+        }
+    }
+
+    pub fn signature_len(self) -> usize {
+        match self {
+            Self::MlDsa44 => 2420,
+            Self::MlDsa65 => 3309,
+            Self::MlDsa87 => 4627,
+        }
+    }
+
+    #[cfg(feature = "pqc-aws-lc-unstable")]
+    fn signing_algorithm(self) -> &'static PqdsaSigningAlgorithm {
+        match self {
+            Self::MlDsa44 => &ML_DSA_44_SIGNING,
+            Self::MlDsa65 => &ML_DSA_65_SIGNING,
+            Self::MlDsa87 => &ML_DSA_87_SIGNING,
+        }
+    }
+
+    #[cfg(feature = "pqc-aws-lc-unstable")]
+    fn verification_algorithm(self) -> &'static PqdsaVerificationAlgorithm {
+        match self {
+            Self::MlDsa44 => &ML_DSA_44,
+            Self::MlDsa65 => &ML_DSA_65,
+            Self::MlDsa87 => &ML_DSA_87,
+        }
+    }
+}
+
+/// Algorithms accepted by compact-JWS verification in this build.
+pub fn supported_jws_signing_algs() -> Vec<String> {
+    #[cfg(feature = "pqc-aws-lc-unstable")]
+    {
+        let mut algs = vec!["RS256".to_string()];
+        algs.extend(
+            [MlDsaAlgorithm::MlDsa44, MlDsaAlgorithm::MlDsa65, MlDsaAlgorithm::MlDsa87]
+                .into_iter()
+                .map(|algorithm| algorithm.jose_alg().to_string()),
+        );
+        algs
+    }
+    #[cfg(not(feature = "pqc-aws-lc-unstable"))]
+    {
+        vec!["RS256".to_string()]
+    }
 }
 
 /// The crypto/signing surface the STS needs from the JOSE backend.
@@ -168,8 +292,24 @@ pub fn rsa_public_key_from_jwk(jwk: &PublicJwk) -> Result<DecodedRsaPublicKey, J
             format!("unsupported JWK key type {}", jwk.kty),
         ));
     }
-    let n = decode_jwk_component("n", &jwk.n)?;
-    let e = decode_jwk_component("e", &jwk.e)?;
+    if jwk.alg != "RS256" {
+        return Err(JoseError::new(
+            JoseErrorKind::InvalidKey,
+            format!("RSA JWK alg must be RS256, got {}", jwk.alg),
+        ));
+    }
+    let n = decode_jwk_component(
+        "n",
+        jwk.n
+            .as_deref()
+            .ok_or_else(|| JoseError::new(JoseErrorKind::InvalidKey, "RSA public JWK missing n"))?,
+    )?;
+    let e = decode_jwk_component(
+        "e",
+        jwk.e
+            .as_deref()
+            .ok_or_else(|| JoseError::new(JoseErrorKind::InvalidKey, "RSA public JWK missing e"))?,
+    )?;
     validate_public_components(&n, &e)?;
     Ok(DecodedRsaPublicKey { n, e })
 }
@@ -178,6 +318,54 @@ pub fn rsa_public_key_from_jwk(jwk: &PublicJwk) -> Result<DecodedRsaPublicKey, J
 pub fn rsa_public_key_bits_from_jwk(jwk: &PublicJwk) -> Result<usize, JoseError> {
     let public_key = rsa_public_key_from_jwk(jwk)?;
     Ok(rsa_modulus_bits(&public_key.n))
+}
+
+/// Parse a public AKP key from an RFC 9964 JWK.
+pub fn akp_public_key_from_jwk(jwk: &PublicJwk) -> Result<DecodedAkpPublicKey, JoseError> {
+    if jwk.kty != "AKP" {
+        return Err(JoseError::new(
+            JoseErrorKind::InvalidKey,
+            format!("unsupported JWK key type {}", jwk.kty),
+        ));
+    }
+    let algorithm = MlDsaAlgorithm::from_jose_alg(&jwk.alg).ok_or_else(|| {
+        JoseError::new(JoseErrorKind::InvalidKey, format!("unsupported AKP alg {}", jwk.alg))
+    })?;
+    if jwk.n.is_some() || jwk.e.is_some() {
+        return Err(JoseError::new(
+            JoseErrorKind::InvalidKey,
+            "AKP public JWK must not contain RSA n/e members",
+        ));
+    }
+    let public_key = decode_jwk_octets(
+        "AKP public JWK pub",
+        jwk.pub_.as_deref().ok_or_else(|| {
+            JoseError::new(JoseErrorKind::InvalidKey, "AKP public JWK missing pub")
+        })?,
+    )?;
+    if public_key.len() != algorithm.public_key_len() {
+        return Err(JoseError::new(
+            JoseErrorKind::InvalidKey,
+            format!(
+                "AKP public JWK pub length must be {} bytes for {}",
+                algorithm.public_key_len(),
+                algorithm.jose_alg()
+            ),
+        ));
+    }
+    Ok(DecodedAkpPublicKey { algorithm, public_key })
+}
+
+/// Validate a public JWK without exposing or decoding private material.
+pub fn validate_public_jwk(jwk: &PublicJwk) -> Result<(), JoseError> {
+    match jwk.kty.as_str() {
+        "RSA" => rsa_public_key_from_jwk(jwk).map(|_| ()),
+        "AKP" => akp_public_key_from_jwk(jwk).map(|_| ()),
+        other => Err(JoseError::new(
+            JoseErrorKind::InvalidKey,
+            format!("unsupported JWK key type {other}"),
+        )),
+    }
 }
 
 /// Verify a compact JWS against a JWKS and deserialize the payload.
@@ -197,30 +385,102 @@ pub fn verify_claims_against_jwks_with_header<T: DeserializeOwned>(
     token: &str,
     jwks: &JwksDocument,
 ) -> Result<VerifiedJws<T>, JoseError> {
-    RsaJoseSigner::parse_compact_jws(token)?;
-    let header = decode_header(token).map_err(map_jwt_header_error)?;
+    let header = decode_compact_jws_header(token)?;
     let kid = header.kid.as_deref().ok_or_else(|| {
         JoseError::new(JoseErrorKind::InvalidCompactJws, "compact JWS header missing kid")
     })?;
-    if header.alg != Algorithm::RS256 {
-        return Err(JoseError::new(JoseErrorKind::VerificationFailed, "unexpected JWS algorithm"));
-    }
-
     let jwk = jwks.keys.iter().find(|key| key.kid == kid).ok_or_else(|| {
         JoseError::new(JoseErrorKind::VerificationFailed, format!("no JWK found for kid {kid}"))
     })?;
-    let _ = rsa_public_key_from_jwk(jwk)?;
-    let decoding_key = DecodingKey::from_rsa_components(&jwk.n, &jwk.e).map_err(|e| {
-        JoseError::new(JoseErrorKind::InvalidKey, format!("invalid RSA public JWK: {e}"))
-    })?;
-    let claims = decode::<T>(token, &decoding_key, &signature_only_rs256_validation())
-        .map_err(map_jwt_decode_error)?
-        .claims;
+    let claims = match header.alg.as_str() {
+        "RS256" => verify_rs256_claims_against_jwk(token, jwk)?,
+        alg if MlDsaAlgorithm::from_jose_alg(alg).is_some() => {
+            verify_mldsa_claims_against_jwk(token, jwk, alg)?
+        }
+        _ => {
+            return Err(JoseError::new(
+                JoseErrorKind::UnsupportedAlgorithm,
+                format!("unsupported JWS algorithm {}", header.alg),
+            ));
+        }
+    };
 
     Ok(VerifiedJws { claims, kid: kid.to_string() })
 }
 
-/// Classical RS256 backend; PQC is reserved for a future explicit backend.
+fn verify_rs256_claims_against_jwk<T: DeserializeOwned>(
+    token: &str,
+    jwk: &PublicJwk,
+) -> Result<T, JoseError> {
+    let _ = rsa_public_key_from_jwk(jwk)?;
+    let n = jwk
+        .n
+        .as_deref()
+        .ok_or_else(|| JoseError::new(JoseErrorKind::InvalidKey, "RSA public JWK missing n"))?;
+    let e = jwk
+        .e
+        .as_deref()
+        .ok_or_else(|| JoseError::new(JoseErrorKind::InvalidKey, "RSA public JWK missing e"))?;
+    let decoding_key = DecodingKey::from_rsa_components(n, e).map_err(|e| {
+        JoseError::new(JoseErrorKind::InvalidKey, format!("invalid RSA public JWK: {e}"))
+    })?;
+    decode::<T>(token, &decoding_key, &signature_only_rs256_validation())
+        .map(|decoded| decoded.claims)
+        .map_err(map_jwt_decode_error)
+}
+
+#[cfg(feature = "pqc-aws-lc-unstable")]
+fn verify_mldsa_claims_against_jwk<T: DeserializeOwned>(
+    token: &str,
+    jwk: &PublicJwk,
+    header_alg: &str,
+) -> Result<T, JoseError> {
+    let header_algorithm = MlDsaAlgorithm::from_jose_alg(header_alg).ok_or_else(|| {
+        JoseError::new(JoseErrorKind::UnsupportedAlgorithm, "unsupported ML-DSA algorithm")
+    })?;
+    let decoded_public = akp_public_key_from_jwk(jwk)?;
+    if decoded_public.algorithm != header_algorithm {
+        return Err(JoseError::new(
+            JoseErrorKind::VerificationFailed,
+            "JWS alg does not match AKP public key alg",
+        ));
+    }
+    let (header_segment, payload_segment, signature_segment) = parse_compact_jws(token)?;
+    let signature = decode_compact_segment("JWS signature", signature_segment)?;
+    if signature.len() != header_algorithm.signature_len() {
+        return Err(JoseError::new(
+            JoseErrorKind::VerificationFailed,
+            format!(
+                "JWS signature length must be {} bytes for {}",
+                header_algorithm.signature_len(),
+                header_algorithm.jose_alg()
+            ),
+        ));
+    }
+    let signing_input = format!("{header_segment}.{payload_segment}");
+    let public_key = UnparsedPublicKey::new(
+        header_algorithm.verification_algorithm(),
+        decoded_public.public_key,
+    );
+    public_key.verify(signing_input.as_bytes(), &signature).map_err(|_| {
+        JoseError::new(JoseErrorKind::VerificationFailed, "JWS verification failed")
+    })?;
+    decode_payload_claims(payload_segment)
+}
+
+#[cfg(not(feature = "pqc-aws-lc-unstable"))]
+fn verify_mldsa_claims_against_jwk<T: DeserializeOwned>(
+    _token: &str,
+    _jwk: &PublicJwk,
+    header_alg: &str,
+) -> Result<T, JoseError> {
+    Err(JoseError::new(
+        JoseErrorKind::UnsupportedAlgorithm,
+        format!("JWS algorithm {header_alg} requires the pqc-aws-lc-unstable feature"),
+    ))
+}
+
+/// Classical RS256 backend.
 #[derive(Debug, Clone)]
 pub struct RsaJoseSigner {
     kid: String,
@@ -246,7 +506,7 @@ impl RsaJoseSigner {
         private_pem: impl AsRef<str>,
         kid: impl Into<String>,
     ) -> Result<Self, JoseError> {
-        resolve_backend(selection)?;
+        ensure_classical_backend(selection)?;
         Self::from_pkcs1_pem(private_pem, kid)
     }
 
@@ -257,7 +517,7 @@ impl RsaJoseSigner {
         private_jwk_json: impl AsRef<str>,
         fallback_kid: impl Into<String>,
     ) -> Result<Self, JoseError> {
-        resolve_backend(selection)?;
+        ensure_classical_backend(selection)?;
         Self::from_private_jwk(private_jwk_json, fallback_kid)
     }
 
@@ -305,7 +565,7 @@ impl RsaJoseSigner {
         private_der: impl AsRef<[u8]>,
         kid: impl Into<String>,
     ) -> Result<Self, JoseError> {
-        resolve_backend(selection)?;
+        ensure_classical_backend(selection)?;
         Self::from_private_key_der(private_der, kid)
     }
 
@@ -343,8 +603,9 @@ impl RsaJoseSigner {
             kid: kid.clone(),
             use_: "sig".to_string(),
             alg: "RS256".to_string(),
-            n: URL_SAFE_NO_PAD.encode(&components.n),
-            e: URL_SAFE_NO_PAD.encode(&components.e),
+            n: Some(URL_SAFE_NO_PAD.encode(&components.n)),
+            e: Some(URL_SAFE_NO_PAD.encode(&components.e)),
+            pub_: None,
         };
         Ok(Self { kid, encoding_key: EncodingKey::from_rsa_der(private_der), public_jwk })
     }
@@ -381,8 +642,9 @@ impl RsaJoseSigner {
             kid,
             use_: "sig".to_string(),
             alg: "RS256".to_string(),
-            n,
-            e,
+            n: Some(n),
+            e: Some(e),
+            pub_: None,
         };
         let private_jwk_json = private_jwk_json_from_pkcs8_der(private_der.as_ref(), &public_jwk)?;
 
@@ -414,24 +676,44 @@ impl RsaJoseSigner {
     }
 
     fn parse_compact_jws(token: &str) -> Result<(&str, &str, &str), JoseError> {
-        let mut parts = token.split('.');
-        let header = parts.next().ok_or_else(|| {
-            JoseError::new(JoseErrorKind::InvalidCompactJws, "compact JWS must have three parts")
-        })?;
-        let payload = parts.next().ok_or_else(|| {
-            JoseError::new(JoseErrorKind::InvalidCompactJws, "compact JWS must have three parts")
-        })?;
-        let signature = parts.next().ok_or_else(|| {
-            JoseError::new(JoseErrorKind::InvalidCompactJws, "compact JWS must have three parts")
-        })?;
-        if parts.next().is_some() {
-            return Err(JoseError::new(
-                JoseErrorKind::InvalidCompactJws,
-                "compact JWS must have exactly three parts",
-            ));
-        }
-        Ok((header, payload, signature))
+        parse_compact_jws(token)
     }
+}
+
+fn parse_compact_jws(token: &str) -> Result<(&str, &str, &str), JoseError> {
+    let mut parts = token.split('.');
+    let header = parts.next().ok_or_else(|| {
+        JoseError::new(JoseErrorKind::InvalidCompactJws, "compact JWS must have three parts")
+    })?;
+    let payload = parts.next().ok_or_else(|| {
+        JoseError::new(JoseErrorKind::InvalidCompactJws, "compact JWS must have three parts")
+    })?;
+    let signature = parts.next().ok_or_else(|| {
+        JoseError::new(JoseErrorKind::InvalidCompactJws, "compact JWS must have three parts")
+    })?;
+    if parts.next().is_some() {
+        return Err(JoseError::new(
+            JoseErrorKind::InvalidCompactJws,
+            "compact JWS must have exactly three parts",
+        ));
+    }
+    Ok((header, payload, signature))
+}
+
+fn decode_compact_jws_header(token: &str) -> Result<CompactJwsHeader, JoseError> {
+    let (header, _, _) = parse_compact_jws(token)?;
+    let bytes = decode_compact_segment("JWS header", header)?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        JoseError::new(JoseErrorKind::InvalidCompactJws, format!("invalid compact JWS header: {e}"))
+    })
+}
+
+#[cfg(feature = "pqc-aws-lc-unstable")]
+fn decode_payload_claims<T: DeserializeOwned>(payload_segment: &str) -> Result<T, JoseError> {
+    let bytes = decode_compact_segment("JWS payload", payload_segment)?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        JoseError::new(JoseErrorKind::InvalidClaims, format!("invalid token claims: {e}"))
+    })
 }
 
 fn signature_only_rs256_validation() -> Validation {
@@ -443,9 +725,7 @@ fn signature_only_rs256_validation() -> Validation {
 }
 
 fn decode_jwk_component(name: &str, value: &str) -> Result<Vec<u8>, JoseError> {
-    let bytes = URL_SAFE_NO_PAD.decode(value.as_bytes()).map_err(|e| {
-        JoseError::new(JoseErrorKind::InvalidKey, format!("invalid RSA JWK {name} encoding: {e}"))
-    })?;
+    let bytes = decode_jwk_octets(&format!("RSA JWK {name}"), value)?;
     if bytes.is_empty() {
         return Err(JoseError::new(
             JoseErrorKind::InvalidKey,
@@ -453,6 +733,21 @@ fn decode_jwk_component(name: &str, value: &str) -> Result<Vec<u8>, JoseError> {
         ));
     }
     Ok(bytes)
+}
+
+fn decode_jwk_octets(label: &str, value: &str) -> Result<Vec<u8>, JoseError> {
+    URL_SAFE_NO_PAD.decode(value.as_bytes()).map_err(|e| {
+        JoseError::new(JoseErrorKind::InvalidKey, format!("invalid {label} encoding: {e}"))
+    })
+}
+
+fn decode_compact_segment(label: &str, value: &str) -> Result<Vec<u8>, JoseError> {
+    URL_SAFE_NO_PAD.decode(value.as_bytes()).map_err(|e| {
+        JoseError::new(
+            JoseErrorKind::InvalidCompactJws,
+            format!("invalid compact {label} encoding: {e}"),
+        )
+    })
 }
 
 fn decode_required_private_component(
@@ -494,6 +789,12 @@ fn rsa_modulus_bits(n: &[u8]) -> usize {
 
 fn rsa_jwk_thumbprint(n: &str, e: &str) -> String {
     let canonical = format!(r#"{{"e":"{e}","kty":"RSA","n":"{n}"}}"#);
+    URL_SAFE_NO_PAD.encode(aws_digest(&SHA256, canonical.as_bytes()).as_ref())
+}
+
+#[cfg(feature = "pqc-aws-lc-unstable")]
+fn akp_jwk_thumbprint(alg: &str, public: &str) -> String {
+    let canonical = format!(r#"{{"alg":"{alg}","kty":"AKP","pub":"{public}"}}"#);
     URL_SAFE_NO_PAD.encode(aws_digest(&SHA256, canonical.as_bytes()).as_ref())
 }
 
@@ -660,10 +961,6 @@ fn map_jwt_encode_error(err: JwtError) -> JoseError {
     }
 }
 
-fn map_jwt_header_error(err: JwtError) -> JoseError {
-    JoseError::new(JoseErrorKind::InvalidCompactJws, format!("invalid compact JWS header: {err}"))
-}
-
 fn map_jwt_decode_error(err: JwtError) -> JoseError {
     match err.kind() {
         JwtErrorKind::InvalidToken | JwtErrorKind::Base64(_) | JwtErrorKind::Utf8(_) => {
@@ -694,6 +991,198 @@ fn map_jwt_decode_error(err: JwtError) -> JoseError {
     }
 }
 
+#[cfg(feature = "pqc-aws-lc-unstable")]
+pub struct MlDsaJoseSigner {
+    kid: String,
+    algorithm: MlDsaAlgorithm,
+    key_pair: PqdsaKeyPair,
+    public_jwk: PublicJwk,
+}
+
+#[cfg(feature = "pqc-aws-lc-unstable")]
+impl fmt::Debug for MlDsaJoseSigner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MlDsaJoseSigner")
+            .field("kid", &self.kid)
+            .field("algorithm", &self.algorithm.jose_alg())
+            .finish()
+    }
+}
+
+#[cfg(feature = "pqc-aws-lc-unstable")]
+impl MlDsaJoseSigner {
+    /// Build an ML-DSA signer from an RFC 9964 private AKP JWK.
+    ///
+    /// RFC 9964 uses a 32-byte seed in the `priv` member; expanded private key
+    /// encodings are intentionally not accepted here.
+    pub fn from_private_jwk_for_backend(
+        selection: &BackendSelection,
+        private_jwk_json: impl AsRef<str>,
+        fallback_kid: impl Into<String>,
+    ) -> Result<Self, JoseError> {
+        resolve_backend(selection)?;
+        let selected_algorithm = selected_pqc_algorithm(selection)?;
+        let jwk: PrivateAkpJwk = serde_json::from_str(private_jwk_json.as_ref()).map_err(|e| {
+            JoseError::new(JoseErrorKind::InvalidKey, format!("invalid AKP private JWK JSON: {e}"))
+        })?;
+        if jwk.kty != "AKP" {
+            return Err(JoseError::new(
+                JoseErrorKind::InvalidKey,
+                format!("unsupported private JWK key type {}", jwk.kty),
+            ));
+        }
+        let algorithm = MlDsaAlgorithm::from_jose_alg(&jwk.alg).ok_or_else(|| {
+            JoseError::new(
+                JoseErrorKind::UnsupportedAlgorithm,
+                format!("unsupported AKP private JWK alg {}", jwk.alg),
+            )
+        })?;
+        if algorithm != selected_algorithm {
+            return Err(JoseError::new(
+                JoseErrorKind::InvalidKey,
+                "selected signing algorithm does not match AKP private JWK alg",
+            ));
+        }
+        let seed = decode_jwk_octets("AKP private JWK priv", &jwk.priv_)?;
+        if seed.len() != 32 {
+            return Err(JoseError::new(
+                JoseErrorKind::InvalidKey,
+                "AKP private JWK priv must be a 32-byte seed",
+            ));
+        }
+        let supplied_public = decode_jwk_octets("AKP private JWK pub", &jwk.pub_)?;
+        if supplied_public.len() != algorithm.public_key_len() {
+            return Err(JoseError::new(
+                JoseErrorKind::InvalidKey,
+                format!(
+                    "AKP private JWK pub length must be {} bytes for {}",
+                    algorithm.public_key_len(),
+                    algorithm.jose_alg()
+                ),
+            ));
+        }
+        let key_pair =
+            PqdsaKeyPair::from_seed(algorithm.signing_algorithm(), &seed).map_err(|_| {
+                JoseError::new(JoseErrorKind::InvalidKey, "AKP private JWK seed was rejected")
+            })?;
+        let derived_public = key_pair.public_key().as_ref();
+        if derived_public != supplied_public.as_slice() {
+            return Err(JoseError::new(
+                JoseErrorKind::InvalidKey,
+                "AKP private JWK pub does not match priv-derived public key",
+            ));
+        }
+        let public = URL_SAFE_NO_PAD.encode(derived_public);
+        let fallback_kid = fallback_kid.into();
+        let kid = jwk.kid.unwrap_or_else(|| {
+            if fallback_kid.is_empty() {
+                akp_jwk_thumbprint(algorithm.jose_alg(), &public)
+            } else {
+                fallback_kid
+            }
+        });
+        let public_jwk = PublicJwk {
+            kty: "AKP".to_string(),
+            kid: kid.clone(),
+            use_: "sig".to_string(),
+            alg: algorithm.jose_alg().to_string(),
+            n: None,
+            e: None,
+            pub_: Some(public),
+        };
+        Ok(Self { kid, algorithm, key_pair, public_jwk })
+    }
+
+    /// Generate a deterministic test signer from a 32-byte seed.
+    pub fn from_seed_for_tests(
+        algorithm: MlDsaAlgorithm,
+        seed: [u8; 32],
+        kid: impl Into<String>,
+    ) -> Result<Self, JoseError> {
+        let key_pair = PqdsaKeyPair::from_seed(algorithm.signing_algorithm(), &seed)
+            .map_err(|_| JoseError::new(JoseErrorKind::InvalidKey, "AKP seed was rejected"))?;
+        let public = URL_SAFE_NO_PAD.encode(key_pair.public_key().as_ref());
+        let kid = kid.into();
+        let public_jwk = PublicJwk {
+            kty: "AKP".to_string(),
+            kid: kid.clone(),
+            use_: "sig".to_string(),
+            alg: algorithm.jose_alg().to_string(),
+            n: None,
+            e: None,
+            pub_: Some(public),
+        };
+        Ok(Self { kid, algorithm, key_pair, public_jwk })
+    }
+
+    pub fn sign_json_claims<T: Serialize>(&self, claims: &T) -> Result<String, JoseError> {
+        self.sign_json_claims_with_typ(claims, "JWT")
+    }
+
+    fn sign_json_claims_with_typ<T: Serialize>(
+        &self,
+        claims: &T,
+        typ: &str,
+    ) -> Result<String, JoseError> {
+        #[derive(Serialize)]
+        struct ProtectedHeader<'a> {
+            alg: &'a str,
+            kid: &'a str,
+            typ: &'a str,
+        }
+
+        let header = ProtectedHeader { alg: self.algorithm.jose_alg(), kid: &self.kid, typ };
+        let protected = serde_json::to_vec(&header).map_err(|e| {
+            JoseError::new(JoseErrorKind::InvalidClaims, format!("encode JWS header failed: {e}"))
+        })?;
+        let payload = serde_json::to_vec(claims).map_err(|e| {
+            JoseError::new(JoseErrorKind::InvalidClaims, format!("encode claims failed: {e}"))
+        })?;
+        let signing_input =
+            format!("{}.{}", URL_SAFE_NO_PAD.encode(protected), URL_SAFE_NO_PAD.encode(payload));
+        let mut signature = vec![0_u8; self.algorithm.signature_len()];
+        let signature_len = self
+            .key_pair
+            .sign(signing_input.as_bytes(), &mut signature)
+            .map_err(|_| JoseError::new(JoseErrorKind::InvalidKey, "ML-DSA signing failed"))?;
+        signature.truncate(signature_len);
+        Ok(format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature)))
+    }
+
+    fn public_jwk(&self) -> PublicJwk {
+        self.public_jwk.clone()
+    }
+}
+
+#[cfg(feature = "pqc-aws-lc-unstable")]
+impl JoseSigner for MlDsaJoseSigner {
+    fn alg(&self) -> &'static str {
+        self.algorithm.jose_alg()
+    }
+
+    fn sign_claims(&self, claims: &MintedClaims) -> Result<String, JoseError> {
+        self.sign_json_claims_with_typ(claims, "at+jwt")
+    }
+
+    fn public_jwks(&self) -> JwksDocument {
+        JwksDocument::new(vec![self.public_jwk()])
+    }
+
+    fn verify_claims(&self, token: &str) -> Result<MintedClaims, JoseError> {
+        let header = decode_compact_jws_header(token)?;
+        if header.alg != self.algorithm.jose_alg() {
+            return Err(JoseError::new(
+                JoseErrorKind::VerificationFailed,
+                "unexpected JWS algorithm",
+            ));
+        }
+        if header.kid.as_deref() != Some(self.kid.as_str()) {
+            return Err(JoseError::new(JoseErrorKind::VerificationFailed, "unexpected JWS kid"));
+        }
+        verify_claims_against_jwks(token, &self.public_jwks())
+    }
+}
+
 impl JoseSigner for RsaJoseSigner {
     fn alg(&self) -> &'static str {
         "RS256"
@@ -709,8 +1198,8 @@ impl JoseSigner for RsaJoseSigner {
 
     fn verify_claims(&self, token: &str) -> Result<MintedClaims, JoseError> {
         Self::parse_compact_jws(token)?;
-        let header = decode_header(token).map_err(map_jwt_header_error)?;
-        if header.alg != Algorithm::RS256 {
+        let header = decode_compact_jws_header(token)?;
+        if header.alg != "RS256" {
             return Err(JoseError::new(
                 JoseErrorKind::VerificationFailed,
                 "unexpected JWS algorithm",
@@ -727,12 +1216,58 @@ impl JoseSigner for RsaJoseSigner {
 pub fn resolve_backend(selection: &BackendSelection) -> Result<(), JoseError> {
     match selection {
         BackendSelection::Classical => Ok(()),
+        BackendSelection::RequestedPqc(requested) => {
+            let _algorithm = MlDsaAlgorithm::from_selector(requested).ok_or_else(|| {
+                JoseError::new(
+                    JoseErrorKind::UnsupportedAlgorithm,
+                    format!(
+                        "requested signing backend {requested:?} is not supported; refusing to fall back to RS256"
+                    ),
+                )
+            })?;
+            #[cfg(feature = "pqc-aws-lc-unstable")]
+            {
+                Ok(())
+            }
+            #[cfg(not(feature = "pqc-aws-lc-unstable"))]
+            {
+                Err(JoseError::new(
+                    JoseErrorKind::UnsupportedAlgorithm,
+                    format!(
+                        "requested PQC signing backend {requested:?} requires the pqc-aws-lc-unstable feature; refusing to fall back to RS256"
+                    ),
+                ))
+            }
+        }
+    }
+}
+
+fn ensure_classical_backend(selection: &BackendSelection) -> Result<(), JoseError> {
+    match selection {
+        BackendSelection::Classical => Ok(()),
         BackendSelection::RequestedPqc(requested) => Err(JoseError::new(
             JoseErrorKind::UnsupportedAlgorithm,
             format!(
-                "requested PQC signing backend {requested:?} is not available yet; refusing to fall back to RS256"
+                "requested PQC signing backend {requested:?} cannot instantiate the RS256 signer; refusing to fall back to RS256"
             ),
         )),
+    }
+}
+
+#[cfg(feature = "pqc-aws-lc-unstable")]
+fn selected_pqc_algorithm(selection: &BackendSelection) -> Result<MlDsaAlgorithm, JoseError> {
+    match selection {
+        BackendSelection::Classical => Err(JoseError::new(
+            JoseErrorKind::UnsupportedAlgorithm,
+            "classical signing selection does not identify an ML-DSA algorithm",
+        )),
+        BackendSelection::RequestedPqc(requested) => MlDsaAlgorithm::from_selector(requested)
+            .ok_or_else(|| {
+                JoseError::new(
+                    JoseErrorKind::UnsupportedAlgorithm,
+                    format!("requested PQC signing backend {requested:?} is not supported"),
+                )
+            }),
     }
 }
 
@@ -768,9 +1303,18 @@ mod tests {
         assert!(matches!(BackendSelection::parse("RS256"), BackendSelection::Classical));
     }
 
+    #[cfg(not(feature = "pqc-aws-lc-unstable"))]
     #[test]
     fn pqc_backend_selector_fails_closed() {
         let err = resolve_backend(&BackendSelection::parse("ML-DSA-65")).unwrap_err();
+        assert_eq!(err.kind, JoseErrorKind::UnsupportedAlgorithm);
+    }
+
+    #[cfg(feature = "pqc-aws-lc-unstable")]
+    #[test]
+    fn concrete_pqc_backend_selector_is_available_when_feature_enabled() {
+        resolve_backend(&BackendSelection::parse("ML-DSA-65")).expect("backend");
+        let err = resolve_backend(&BackendSelection::parse("pqc")).unwrap_err();
         assert_eq!(err.kind, JoseErrorKind::UnsupportedAlgorithm);
     }
 
@@ -912,5 +1456,126 @@ mod tests {
             verify_claims_against_jwks_with_header(&token, &signer.public_jwks()).expect("verify");
         assert_eq!(verified.kid, "kid-1");
         assert_eq!(verified.claims.sub, "user@example.com");
+    }
+
+    #[cfg(feature = "pqc-aws-lc-unstable")]
+    fn mldsa_private_jwk(seed: [u8; 32], kid: &str) -> String {
+        let signer =
+            MlDsaJoseSigner::from_seed_for_tests(MlDsaAlgorithm::MlDsa65, seed, kid).unwrap();
+        let public = signer.public_jwks().keys[0].pub_.clone().expect("public key");
+        serde_json::json!({
+            "kty": "AKP",
+            "kid": kid,
+            "use": "sig",
+            "alg": "ML-DSA-65",
+            "pub": public,
+            "priv": URL_SAFE_NO_PAD.encode(seed),
+        })
+        .to_string()
+    }
+
+    #[cfg(feature = "pqc-aws-lc-unstable")]
+    fn rewrite_header_alg(token: &str, alg: &str) -> String {
+        let (header, payload, signature) = parse_compact_jws(token).expect("compact");
+        let mut header_json: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header.as_bytes()).expect("header"))
+                .expect("header json");
+        header_json["alg"] = serde_json::Value::String(alg.to_string());
+        format!(
+            "{}.{payload}.{signature}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header_json).expect("header encode"))
+        )
+    }
+
+    #[cfg(feature = "pqc-aws-lc-unstable")]
+    #[test]
+    fn mldsa_signer_publishes_akp_and_round_trips_claims() {
+        let private_jwk = mldsa_private_jwk([9_u8; 32], "ml-kid");
+        let signer = MlDsaJoseSigner::from_private_jwk_for_backend(
+            &BackendSelection::parse("ML-DSA-65"),
+            &private_jwk,
+            "fallback",
+        )
+        .expect("mldsa signer");
+
+        let token = signer.sign_claims(&claims()).expect("sign");
+        let header_b64 = token.split('.').next().unwrap();
+        let header: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header_b64.as_bytes()).unwrap())
+                .unwrap();
+        assert_eq!(header["alg"], "ML-DSA-65");
+        assert_eq!(header["kid"], "ml-kid");
+        assert_eq!(header["typ"], "at+jwt");
+
+        let jwks = signer.public_jwks();
+        let public = &jwks.keys[0];
+        assert_eq!(public.kty, "AKP");
+        assert_eq!(public.alg, "ML-DSA-65");
+        assert_eq!(public.pub_.as_ref().map(|value| !value.is_empty()), Some(true));
+        assert!(public.n.is_none());
+        assert!(public.e.is_none());
+        let public_json = serde_json::to_value(&jwks).expect("jwks json");
+        assert!(public_json["keys"][0].get("priv").is_none());
+
+        let decoded: MintedClaims = verify_claims_against_jwks(&token, &jwks).expect("verify");
+        assert_eq!(decoded.sub, "user@example.com");
+        assert_eq!(decoded.aud, "api://chat-mcp");
+    }
+
+    #[cfg(feature = "pqc-aws-lc-unstable")]
+    #[test]
+    fn mldsa_verifier_rejects_tampered_algorithm_header() {
+        let private_jwk = mldsa_private_jwk([10_u8; 32], "ml-kid");
+        let signer = MlDsaJoseSigner::from_private_jwk_for_backend(
+            &BackendSelection::parse("ML-DSA-65"),
+            &private_jwk,
+            "fallback",
+        )
+        .expect("mldsa signer");
+        let token = signer.sign_claims(&claims()).expect("sign");
+        let tampered = rewrite_header_alg(&token, "ML-DSA-44");
+
+        let err = verify_claims_against_jwks::<MintedClaims>(&tampered, &signer.public_jwks())
+            .unwrap_err();
+        assert_eq!(err.kind, JoseErrorKind::VerificationFailed);
+    }
+
+    #[cfg(feature = "pqc-aws-lc-unstable")]
+    #[test]
+    fn mldsa_private_jwk_rejects_mismatched_public_key() {
+        let good_private = mldsa_private_jwk([11_u8; 32], "ml-kid");
+        let wrong_public =
+            MlDsaJoseSigner::from_seed_for_tests(MlDsaAlgorithm::MlDsa65, [12_u8; 32], "wrong")
+                .unwrap()
+                .public_jwks()
+                .keys[0]
+                .pub_
+                .clone()
+                .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&good_private).unwrap();
+        value["pub"] = serde_json::Value::String(wrong_public);
+
+        let err = MlDsaJoseSigner::from_private_jwk_for_backend(
+            &BackendSelection::parse("ML-DSA-65"),
+            value.to_string(),
+            "fallback",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, JoseErrorKind::InvalidKey);
+    }
+
+    #[test]
+    fn akp_public_jwk_rejects_wrong_public_key_size() {
+        let jwk = PublicJwk {
+            kty: "AKP".to_string(),
+            kid: "ml-kid".to_string(),
+            use_: "sig".to_string(),
+            alg: "ML-DSA-65".to_string(),
+            n: None,
+            e: None,
+            pub_: Some(URL_SAFE_NO_PAD.encode([0_u8; 32])),
+        };
+        let err = akp_public_key_from_jwk(&jwk).unwrap_err();
+        assert_eq!(err.kind, JoseErrorKind::InvalidKey);
     }
 }

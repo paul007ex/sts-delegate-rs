@@ -35,9 +35,11 @@ use sts_core::{
 use sts_dpop::{
     DPOP_SIGNING_ALGS_SUPPORTED, DpopBinding, DpopError, DpopProofRequest, validate_dpop_proof,
 };
+#[cfg(feature = "pqc-aws-lc-unstable")]
+use sts_jose::MlDsaJoseSigner;
 use sts_jose::{
     BackendSelection, JoseError, JoseSigner, JwksDocument, PublicJwk, RsaJoseSigner,
-    rsa_public_key_bits_from_jwk,
+    rsa_public_key_bits_from_jwk, supported_jws_signing_algs, validate_public_jwk,
 };
 use sts_replay::{InMemoryReplayStore, ReplayErrorKind, ReplayPolicy, dpop_replay_key};
 use sts_verify::{
@@ -116,9 +118,29 @@ impl HttpState {
     where
         S: JoseSigner + 'static,
     {
+        Self::new_with_signer_arc(
+            config,
+            Arc::new(signer),
+            published_jwks,
+            subject_jwks,
+            actor_jwks,
+            client_jwks,
+            replay,
+        )
+    }
+
+    pub fn new_with_signer_arc(
+        config: RuntimeConfig,
+        signer: Arc<dyn JoseSigner>,
+        published_jwks: JwksDocument,
+        subject_jwks: JwksDocument,
+        actor_jwks: JwksDocument,
+        client_jwks: JwksDocument,
+        replay: ReplayPolicy,
+    ) -> Self {
         Self {
             config,
-            signer: Arc::new(signer),
+            signer,
             published_jwks,
             subject_jwks,
             actor_jwks,
@@ -271,7 +293,7 @@ impl From<VerifyError> for BootstrapError {
     }
 }
 
-const PRIVATE_JWK_MEMBERS: &[&str] = &["d", "p", "q", "dp", "dq", "qi", "oth", "k"];
+const PRIVATE_JWK_MEMBERS: &[&str] = &["d", "p", "q", "dp", "dq", "qi", "oth", "k", "priv"];
 
 /// Build a complete HTTP state from the process environment without serving.
 pub async fn build_state_from_env() -> Result<HttpState, BootstrapError> {
@@ -287,7 +309,7 @@ pub async fn build_state_from_source(source: &ConfigSource) -> Result<HttpState,
 /// Build a complete HTTP state from an already-validated runtime config.
 pub async fn build_state_from_config(config: RuntimeConfig) -> Result<HttpState, BootstrapError> {
     let signer = load_signer(&config)?;
-    let published_jwks = published_jwks(&config, &signer)?;
+    let published_jwks = published_jwks(&config, signer.as_ref())?;
     let subject_jwks = load_subject_jwks(&config).await?;
     let actor_jwks = load_public_jwks_file(
         &config.actor_jwks_file,
@@ -300,7 +322,7 @@ pub async fn build_state_from_config(config: RuntimeConfig) -> Result<HttpState,
         config.allow_insecure_client_jwks,
     )?;
     let replay = ReplayPolicy::new(InMemoryReplayStore::new(config.max_seen_jti, 256));
-    Ok(HttpState::new_with_published_jwks(
+    Ok(HttpState::new_with_signer_arc(
         config,
         signer,
         published_jwks,
@@ -360,26 +382,60 @@ fn is_loopback_ip(ip: IpAddr) -> bool {
     }
 }
 
-fn load_signer(config: &RuntimeConfig) -> Result<RsaJoseSigner, BootstrapError> {
+fn load_signer(config: &RuntimeConfig) -> Result<Arc<dyn JoseSigner>, BootstrapError> {
     let raw = read_checked_file(
         &config.obo_sts_key_file,
         "STS signing key",
         config.allow_insecure_key_file,
     )?;
     let selection = BackendSelection::parse(&config.sts_signing_alg);
+    if matches!(selection, BackendSelection::RequestedPqc(_)) {
+        return load_pqc_signer(&selection, &raw, config.our_kid.clone());
+    }
     let trimmed = raw.trim_start();
-    if trimmed.starts_with("-----BEGIN") {
+    let signer = if trimmed.starts_with("-----BEGIN") {
         RsaJoseSigner::from_pkcs1_pem_for_backend(&selection, raw, config.our_kid.clone())
             .map_err(BootstrapError::from)
     } else {
         RsaJoseSigner::from_private_jwk_for_backend(&selection, raw, config.our_kid.clone())
             .map_err(BootstrapError::from)
+    }?;
+    Ok(Arc::new(signer))
+}
+
+#[cfg(feature = "pqc-aws-lc-unstable")]
+fn load_pqc_signer(
+    selection: &BackendSelection,
+    raw: &str,
+    fallback_kid: String,
+) -> Result<Arc<dyn JoseSigner>, BootstrapError> {
+    if raw.trim_start().starts_with("-----BEGIN") {
+        return Err(BootstrapError::Jose(JoseError::new(
+            sts_jose::JoseErrorKind::InvalidKey,
+            "ML-DSA signing requires an RFC 9964 AKP private JWK seed, not PEM",
+        )));
     }
+    let signer = MlDsaJoseSigner::from_private_jwk_for_backend(selection, raw, fallback_kid)
+        .map_err(BootstrapError::from)?;
+    Ok(Arc::new(signer))
+}
+
+#[cfg(not(feature = "pqc-aws-lc-unstable"))]
+fn load_pqc_signer(
+    selection: &BackendSelection,
+    _raw: &str,
+    _fallback_kid: String,
+) -> Result<Arc<dyn JoseSigner>, BootstrapError> {
+    sts_jose::resolve_backend(selection).map_err(BootstrapError::from)?;
+    Err(BootstrapError::Jose(JoseError::new(
+        sts_jose::JoseErrorKind::UnsupportedAlgorithm,
+        "PQC signing backend is not available in this build",
+    )))
 }
 
 fn published_jwks(
     config: &RuntimeConfig,
-    signer: &RsaJoseSigner,
+    signer: &dyn JoseSigner,
 ) -> Result<JwksDocument, BootstrapError> {
     let mut published = signer.public_jwks();
     if let Some(extra_file) = &config.obo_sts_extra_jwks_file {
@@ -473,12 +529,15 @@ fn normalize_public_jwks_value(
                 label: label.to_string(),
                 message: format!("invalid public JWK: {err}"),
             })?;
-        let bits = rsa_public_key_bits_from_jwk(&jwk).map_err(BootstrapError::from)?;
-        if bits < 2048 {
-            return Err(BootstrapError::InvalidJwks {
-                label: label.to_string(),
-                message: "RSA public keys must be at least 2048 bits".to_string(),
-            });
+        validate_public_jwk(&jwk).map_err(BootstrapError::from)?;
+        if jwk.kty == "RSA" {
+            let bits = rsa_public_key_bits_from_jwk(&jwk).map_err(BootstrapError::from)?;
+            if bits < 2048 {
+                return Err(BootstrapError::InvalidJwks {
+                    label: label.to_string(),
+                    message: "RSA public keys must be at least 2048 bits".to_string(),
+                });
+            }
         }
         public_keys.push(jwk);
     }
@@ -738,7 +797,7 @@ async fn metadata(State(state): State<HttpState>) -> impl IntoResponse {
         response_types_supported: Vec::new(),
         grant_types_supported: vec![TOKEN_EXCHANGE_GRANT_TYPE.to_string()],
         token_endpoint_auth_methods_supported: vec!["private_key_jwt".to_string()],
-        token_endpoint_auth_signing_alg_values_supported: vec!["RS256".to_string()],
+        token_endpoint_auth_signing_alg_values_supported: supported_jws_signing_algs(),
         dpop_signing_alg_values_supported: DPOP_SIGNING_ALGS_SUPPORTED
             .iter()
             .map(|alg| (*alg).to_string())
@@ -1596,6 +1655,26 @@ mod tests {
         .to_string()
     }
 
+    #[cfg(feature = "pqc-aws-lc-unstable")]
+    fn mldsa_private_jwk(seed: [u8; 32], kid: &str) -> String {
+        let signer = sts_jose::MlDsaJoseSigner::from_seed_for_tests(
+            sts_jose::MlDsaAlgorithm::MlDsa65,
+            seed,
+            kid,
+        )
+        .expect("mldsa signer");
+        let public = signer.public_jwks().keys[0].pub_.clone().expect("public key");
+        serde_json::json!({
+            "kty": "AKP",
+            "kid": kid,
+            "use": "sig",
+            "alg": "ML-DSA-65",
+            "pub": public,
+            "priv": URL_SAFE_NO_PAD.encode(seed),
+        })
+        .to_string()
+    }
+
     fn temp_bootstrap_dir(name: &str) -> PathBuf {
         let unique = SystemTime::now().duration_since(UNIX_EPOCH).expect("time").as_nanos();
         let path =
@@ -1683,6 +1762,56 @@ mod tests {
         };
         assert!(matches!(err, BootstrapError::InvalidJwks { .. }));
         assert!(err.to_string().contains("private JWK member"));
+    }
+
+    #[cfg(feature = "pqc-aws-lc-unstable")]
+    #[tokio::test]
+    async fn bootstrap_loads_feature_gated_mldsa_signer() {
+        let dir = temp_bootstrap_dir("mldsa-key");
+        let base = bootstrap_source(&dir);
+        let mldsa_key_file = dir.join("sts-mldsa-private.json");
+        write_file(&mldsa_key_file, &mldsa_private_jwk([44_u8; 32], "sts-mldsa-kid"));
+
+        let mut pairs = Vec::new();
+        for key in [
+            "IDP_ISSUER",
+            "EXPECTED_SUBJECT_AUD",
+            "ACTOR_IDS",
+            "OBO_STS_ISSUER",
+            "IDP_JWKS_FILE",
+            "ACTOR_JWKS_FILE",
+            "CLIENT_JWKS_FILE",
+            "TARGET_POLICY_JSON",
+        ] {
+            pairs.push((key.to_string(), base.get(key).expect("source key").to_string()));
+        }
+        pairs.push(("OBO_STS_KEY_FILE".to_string(), mldsa_key_file.display().to_string()));
+        pairs.push(("STS_SIGNING_ALG".to_string(), "ML-DSA-65".to_string()));
+        let source = ConfigSource::from_pairs(pairs);
+
+        let state = build_state_from_source(&source).await.expect("bootstrap");
+        assert_eq!(state.signer.alg(), "ML-DSA-65");
+        assert_eq!(state.published_jwks.keys[0].kty, "AKP");
+        assert_eq!(state.published_jwks.keys[0].alg, "ML-DSA-65");
+        let jwks_json = serde_json::to_value(&state.published_jwks).expect("jwks");
+        assert!(jwks_json["keys"][0].get("priv").is_none());
+
+        let claims = sts_core::MintedClaims::new(
+            "http://localhost:8888",
+            "user@example.com",
+            "api://chat-mcp",
+            "chat.read",
+            1,
+            2,
+            "jti-1",
+            "chat-mcp",
+        );
+        let token = state.signer.sign_claims(&claims).expect("sign");
+        let verified: sts_core::MintedClaims =
+            sts_jose::verify_claims_against_jwks(&token, &state.published_jwks)
+                .expect("verify mldsa token");
+        assert_eq!(verified.sub, "user@example.com");
+        assert_eq!(verified.aud, "api://chat-mcp");
     }
 
     #[cfg(unix)]

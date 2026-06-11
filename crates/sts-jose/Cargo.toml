@@ -8,6 +8,10 @@ readme.workspace = true
 repository.workspace = true
 version.workspace = true
 
+[features]
+default = []
+pqc-aws-lc-unstable = ["aws-lc-rs/unstable"]
+
 [dependencies]
 aws-lc-rs = "1.17.0"
 base64 = "0.22"

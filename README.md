@@ -1,6 +1,6 @@
 # sts-delegate-rs
 
-Rust-native successor to `sts-delegate`: an OAuth 2.1 / RFC 8693 security token service with explicit crate boundaries, contract-first migration from the Python oracle, classical signing support now, and explicit fail-closed PQC backend selection while native PQC work continues.
+Rust-native successor to `sts-delegate`: an OAuth 2.1 / RFC 8693 security token service with explicit crate boundaries, contract-first migration from the Python oracle, classical RS256 signing by default, and opt-in RFC 9964 ML-DSA support behind an explicit experimental feature gate.
 
 ## Workspace shape
 
@@ -35,6 +35,14 @@ Required environment includes `IDP_ISSUER` or `OKTA_ISSUER`,
 `OBO_STS_KEY_FILE`, `ACTOR_JWKS_FILE`, and either `IDP_JWKS_FILE` or
 `IDP_JWKS_URI`/OIDC discovery. `STS_HTTP_ADDR` defaults to
 `127.0.0.1:8888`.
+
+The default signing runtime is classical RS256. Experimental ML-DSA signing,
+AKP JWKS publication, and ML-DSA verification can be compiled with
+`pqc-aws-lc-unstable`; runtime selection then requires a concrete
+`STS_SIGNING_ALG` such as `ML-DSA-65` and an RFC 9964 AKP private JWK seed file
+with matching public material. The published JWKS contains only public `AKP`
+members (`kty`, `kid`, `use`, `alg`, `pub`) and never `priv`. This path uses
+AWS-LC's unstable ML-DSA API and is not a FIPS-validation claim.
 
 ## HTTP Ops
 
@@ -74,8 +82,8 @@ the current private JWK and existing public overlap JWKS, stages the old public
 key in `OBO_STS_EXTRA_JWKS_FILE` format, then atomically replaces the private key
 with a new RSA private JWK using restrictive file permissions on Unix. The
 command prints only public key ids, file paths, counts, and restart status; it
-does not print private key material. KMS/HSM and PQC rotation remain separate
-future work.
+does not print private key material. KMS/HSM and ML-DSA/PQC rotation remain
+separate future work.
 
 ## Release shape
 

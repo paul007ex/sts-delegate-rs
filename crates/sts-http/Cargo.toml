@@ -8,6 +8,10 @@ readme.workspace = true
 repository.workspace = true
 version.workspace = true
 
+[features]
+default = []
+pqc-aws-lc-unstable = ["sts-jose/pqc-aws-lc-unstable"]
+
 [dependencies]
 axum = "0.8.9"
 base64 = "0.22"
