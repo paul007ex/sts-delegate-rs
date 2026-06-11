@@ -220,6 +220,20 @@ pub struct RsaJoseSigner {
 }
 
 impl RsaJoseSigner {
+    /// Build the RS256 signer only when backend policy selected the classical path.
+    ///
+    /// This keeps fail-closed backend selection at the key-loading boundary: a
+    /// requested PQC backend must not accidentally instantiate the classical
+    /// signer and continue as RS256.
+    pub fn from_pkcs1_pem_for_backend(
+        selection: &BackendSelection,
+        private_pem: impl AsRef<str>,
+        kid: impl Into<String>,
+    ) -> Result<Self, JoseError> {
+        resolve_backend(selection)?;
+        Self::from_pkcs1_pem(private_pem, kid)
+    }
+
     pub fn from_pkcs1_pem(
         private_pem: impl AsRef<str>,
         kid: impl Into<String>,
@@ -230,6 +244,16 @@ impl RsaJoseSigner {
         })?;
         let public_key = RsaPublicKey::from(&private_key);
         Ok(Self { kid: kid.into(), private_key, public_key })
+    }
+
+    /// Build a test/generated RS256 signer only for the selected classical backend.
+    pub fn from_generated_for_backend(
+        selection: &BackendSelection,
+        private_key: &RsaPrivateKey,
+        kid: impl Into<String>,
+    ) -> Result<Self, JoseError> {
+        resolve_backend(selection)?;
+        Self::from_generated(private_key, kid)
     }
 
     pub fn from_generated(
@@ -422,6 +446,38 @@ mod tests {
     #[test]
     fn pqc_backend_selector_fails_closed() {
         let err = resolve_backend(&BackendSelection::parse("ML-DSA-65")).unwrap_err();
+        assert_eq!(err.kind, JoseErrorKind::UnsupportedAlgorithm);
+    }
+
+    #[test]
+    fn unknown_backend_selector_fails_closed() {
+        let err = resolve_backend(&BackendSelection::parse("ed25519")).unwrap_err();
+        assert_eq!(err.kind, JoseErrorKind::UnsupportedAlgorithm);
+    }
+
+    #[test]
+    fn selected_classical_backend_can_construct_rsa_signer() {
+        let mut rng = StdRng::seed_from_u64(17);
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa key");
+        let signer = RsaJoseSigner::from_generated_for_backend(
+            &BackendSelection::Classical,
+            &private_key,
+            "kid-1",
+        )
+        .expect("signer");
+        assert_eq!(signer.alg(), "RS256");
+    }
+
+    #[test]
+    fn selected_pqc_backend_cannot_construct_rsa_signer() {
+        let mut rng = StdRng::seed_from_u64(19);
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa key");
+        let err = RsaJoseSigner::from_generated_for_backend(
+            &BackendSelection::parse("ML-DSA-65"),
+            &private_key,
+            "kid-1",
+        )
+        .unwrap_err();
         assert_eq!(err.kind, JoseErrorKind::UnsupportedAlgorithm);
     }
 
