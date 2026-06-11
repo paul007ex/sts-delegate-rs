@@ -761,21 +761,21 @@ fn validate_request_params(
     if request.actor_token_type.is_some() && request.actor_token.is_none() {
         return Err(HttpError::invalid_request("actor_token_type present without actor_token"));
     }
-    if !is_supported_token_type(&request.subject_token_type) {
+    if !is_supported_input_token_type(&request.subject_token_type) {
         return Err(HttpError::invalid_request(format!(
             "unsupported subject_token_type {}",
             request.subject_token_type
         )));
     }
     if let Some(actor_type) = &request.actor_token_type
-        && !is_supported_token_type(actor_type)
+        && !is_supported_input_token_type(actor_type)
     {
         return Err(HttpError::invalid_request(format!(
             "unsupported actor_token_type {actor_type}"
         )));
     }
     if let Some(requested_type) = &request.requested_token_type
-        && !is_supported_token_type(requested_type)
+        && !is_supported_requested_token_type(requested_type)
     {
         return Err(HttpError::invalid_request(format!(
             "unsupported requested_token_type {requested_type}"
@@ -805,8 +805,12 @@ fn validate_client_assertion_type(request: &ExchangeRequest) -> Result<(), HttpE
     Ok(())
 }
 
-fn is_supported_token_type(value: &str) -> bool {
+fn is_supported_input_token_type(value: &str) -> bool {
     matches!(value, ACCESS_TOKEN_TYPE | JWT_TOKEN_TYPE)
+}
+
+fn is_supported_requested_token_type(value: &str) -> bool {
+    value == ACCESS_TOKEN_TYPE
 }
 
 fn verify_actor_token(

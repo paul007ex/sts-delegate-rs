@@ -20,6 +20,7 @@ fi
 
 python_tests=(
   "tests/test_integration.py::test_client_assertion_kid_must_belong_to_asserted_client"
+  "tests/test_integration.py::test_requested_token_type_validated"
   "tests/test_integration.py::test_http_exchange_rejects_duplicate_form_param"
   "tests/test_integration.py::test_authorization_header_rejected_on_token_endpoint"
   "tests/test_integration.py::test_authorization_header_cannot_be_mixed_with_private_key_jwt"

@@ -578,6 +578,74 @@ async fn contract_delegation_token_matches_python_oracle_wire_shape() {
 }
 
 #[tokio::test]
+async fn contract_requested_token_type_matches_python_oracle() {
+    let (state, subject_signer, actor_signer, _) = test_state();
+    let now = unix_now();
+    let subject_token = signed_subject_token(&subject_signer, now);
+
+    let access_token_actor = signed_assertion(&actor_signer, now, "actor-rtt-access-token");
+    let access_token_body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", access_token_actor.as_str()),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+        ("requested_token_type", ACCESS_TOKEN_TYPE),
+    ])
+    .expect("form");
+    let response = post_token_form(state.clone(), access_token_body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["issued_token_type"], ACCESS_TOKEN_TYPE);
+
+    let saml_actor = signed_assertion(&actor_signer, now, "actor-rtt-saml");
+    let saml_body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", saml_actor.as_str()),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("requested_token_type", "urn:ietf:params:oauth:token-type:saml2"),
+    ])
+    .expect("form");
+    let response = post_token_form(state.clone(), saml_body).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_request");
+    assert!(
+        body["error_description"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unsupported requested_token_type")
+    );
+
+    let jwt_actor = signed_assertion(&actor_signer, now, "actor-rtt-jwt");
+    let jwt_body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", jwt_actor.as_str()),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("requested_token_type", JWT_TOKEN_TYPE),
+    ])
+    .expect("form");
+    let response = post_token_form(state, jwt_body).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_request");
+    assert!(
+        body["error_description"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unsupported requested_token_type")
+    );
+}
+
+#[tokio::test]
 async fn contract_impersonation_omits_act_claim() {
     let (mut state, subject_signer, _, client_signer) = test_state();
     state.config.token_exchange_mode = TokenExchangeMode::Impersonation;
