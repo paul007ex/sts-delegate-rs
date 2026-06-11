@@ -20,7 +20,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
   `sts_delegate/domain/payload.py`, `sts_delegate/transport.py`,
   `sts_delegate/dpop.py`, `sts_delegate/client_auth.py`,
   `sts_delegate/application/replay_records.py`
-- Rust issues: #1 through #25, with #2 as the active freeze tracker
+- Rust issues: #1 through #31, with #2 as the contract-freeze tracker
 - Primary specs: RFC 6749, RFC 7523, RFC 7519, RFC 8414, RFC 8693, RFC 9068,
   RFC 9449
 
@@ -30,7 +30,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | R-001 | GitHub issues are canonical for product work; `/tmp` logs are monitoring only. | policy | implemented | PM | `AGENTS.md`; issue #2 | issue comments on #2 | Do not close issues from stale log-only evidence. |
 | R-002 | The Python repo remains the behavior oracle until Rust parity is proven. | policy | implemented | PM/tests | `README.md:16`; issue #2 | `scripts/oracle_contract_smoke.sh` | Keep alpha allowed, beta/stable blocked until parity matrix. |
-| R-003 | Rust v2 must preserve observable endpoints, claims, errors, replay behavior, DPoP, and client auth where intended. | must | partial | PM/all crates | issue #2/#30; `README.md:18` | workspace tests; oracle smoke | Final parity inventory remains tracked in #30; divergences must be explicit issues. |
+| R-003 | Rust v2 must preserve observable endpoints, claims, errors, replay behavior, DPoP, and client auth where intended. | must | implemented | PM/all crates | issue #2/#30; `README.md:18`; R-003 parity inventory below | workspace tests; oracle smoke; issue-specific contract tests | Every known divergence is represented by a narrower row/issue; future parity drift must open a focused issue rather than reopening a broad bucket. |
 | R-004 | Requirements must classify source-backed items as must, must-not, policy, non-goal, or open question. | policy | implemented | PM | issue #2; `/tmp/sts-requirements-log.md` | this ledger | Scratch log had duplicate IDs; this file resets numbering. |
 | R-005 | Every protocol/security requirement must cite code, test, issue, or RFC evidence. | policy | implemented | PM/security | `AGENTS.md`; RFC source set | this ledger | Vague claims are not freeze-ready. |
 | R-006 | Rust code targets Rust 2024. | must | implemented | architecture | `Cargo.toml:14`; `AGENTS.md` | `cargo metadata`; build | Crate manifests inherit workspace package data. |
@@ -109,7 +109,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-079 | The STS signing JWKS must not include private members. | must-not | implemented | jose/http | `crates/sts-jose/src/lib.rs`; Python `tests/test_integration.py:620` | JWKS and ML-DSA feature tests | RSA private members and RFC 9964 `priv` are rejected from public JWKS files. |
 | R-080 | Classical signing backend selection accepts blank, `classical`, and `RS256`. | policy | implemented | jose | `crates/sts-jose/src/lib.rs:31` | JOSE tests | Case-insensitive parsing. |
 | R-081 | PQC or unknown signing backend selection must fail closed and never instantiate RS256. | must-not | implemented | jose/security | issue #5; `crates/sts-jose/src/lib.rs` | JOSE tests | Concrete ML-DSA selectors require the explicit feature; vague `pqc` and unknown algorithms do not fall back. |
-| R-082 | Real PQC support must be first-class when implemented, not marker-only or fallback-only. | must | implemented-experimental | jose/security | issue #19/#29; RFC 9964; OpenSSL 3.5 EVP_PKEY-ML-DSA | `cargo test -p sts-jose --features pqc-openssl-unstable --lib`; `cargo test -p sts-http --features pqc-openssl-unstable` | Uses OpenSSL 3.5+ ML-DSA through `openssl-rs` behind `pqc-openssl-unstable`; RS256 remains default. |
+| R-082 | Real PQC support must be first-class when implemented, not marker-only or fallback-only. | must | implemented | jose/security | issue #19/#29; RFC 9964; OpenSSL 3.5 EVP_PKEY-ML-DSA | `cargo test -p sts-jose --features pqc-openssl-unstable --lib`; `cargo test -p sts-http --features pqc-openssl-unstable` | Uses OpenSSL 3.5+ ML-DSA through `openssl-rs` behind `pqc-openssl-unstable`; RS256 remains default; no FIPS-validated or stable-backend claim. |
 | R-083 | Client assertion auth uses `private_key_jwt` assertion type. | must | implemented | http/verify | RFC 7523; `crates/sts-http/src/lib.rs:42` | HTTP tests | Wrong/missing assertion type rejected. |
 | R-084 | Client assertion `iss` and `sub` must match. | must | implemented | verify | RFC 7523; `crates/sts-verify/src/lib.rs:328` | verify/http tests | Prevent confused identities. |
 | R-085 | `client_id` form value must match authenticated client assertion subject. | must | implemented | http | issue #7; `crates/sts-http/tests/http_contract.rs:1337` | client mismatch test | Error is invalid_client. |
@@ -157,9 +157,28 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-127 | The requirements ledger must not close #2 until 100+ requirements and 20+ use cases are canonical. | must | implemented | PM | issue #2 | this ledger | Close only after issue update and validation. |
 | R-128 | Full Authorization Server features such as authorization endpoint, revocation, introspection, and registration are non-goals for current STS alpha. | non-goal | implemented | PM/http | Python docs; `README.md:3` | no routes | Future AS expansion requires new milestone. |
 | R-129 | CLI parser, runtime bootstrap, offline smoke, canary config check, public key/JWKS inspection, and file-backed RSA private JWK rotation are shipped. | policy | implemented | cli/ops | `README.md`; `crates/sts-cli/src/main.rs`; issues #20/#28 | `cargo test -p sts-cli` | Rotation stages old public keys for overlap, uses atomic writes, and keeps KMS/HSM/PQC rotation out of scope. |
-| R-130 | Native PQC signing/JWKS/downstream verification is a v2 requirement. | must | implemented-experimental | jose/security | repo instructions; RFC 9964; issue #19/#29 | JOSE and HTTP feature tests | RFC 9964 AKP/ML-DSA is opt-in behind OpenSSL-backed `pqc-openssl-unstable`; do not claim FIPS-validated PQC. |
+| R-130 | Native PQC signing/JWKS/downstream verification is a v2 requirement. | must | implemented | jose/security | repo instructions; RFC 9964; issue #19/#29 | JOSE and HTTP feature tests | RFC 9964 AKP/ML-DSA is opt-in behind OpenSSL-backed `pqc-openssl-unstable`; do not claim FIPS-validated PQC. |
 | R-131 | Live tenant validation must use the configured real Okta trial issuer; `example.com`, `issuer.example`, `sts.example`, and `*.example.*` are fixture-only and must not close readiness issues. | must | implemented | tests/security/cli | issue #21; `scripts/real_tenant_endpoint_loop.py`; `crates/sts-cli/src/main.rs`; `/Users/Shared/claude/obo-lab/okta.env` | redaction self-test; FastMCP loops; CLI canary config tests; local Rust STS live-base canary | Rust STS metadata, JWKS, and token endpoint passed against configured real-tenant MCP flows with redacted evidence. |
 | R-132 | Runtime STS issuer values must reject query components, fragment components, and non-loopback HTTP while preserving Python's loopback HTTP dev exception. | must | implemented | config/security | issue #13; Python `tests/test_stress.py:920`; Python `infrastructure/config_env.py:47` | Rust config/verify issuer tests | Canonicalizes trailing slash to keep issuer/audience/metadata stable. |
+
+## R-003 Python Oracle Parity Inventory
+
+This inventory closes the broad R-003 marker by mapping each observable Python-oracle
+surface to narrower Rust requirements and tests. Future parity drift must open a
+focused issue against the affected lane rather than using R-003 as a catch-all.
+
+| Lane | Python oracle evidence | Rust proof | Requirement rows | Current status |
+| --- | --- | --- | --- | --- |
+| Public endpoints, discovery, JWKS, cache headers, and absent legacy routes | `transport.py`; `transport_metadata.py`; `tests/test_integration.py` | HTTP contract tests for discovery/JWKS, path-bearing issuers, metadata method policy, cache headers, `/exchange`, OpenAPI, and metrics | R-023 through R-044 | covered |
+| Token form parsing, requested token type, target, resource, scope, and OAuth error mapping | `application/exchange.py`; `domain/*`; `tests/test_integration.py`; `tests/test_stress.py` | core tests plus HTTP contracts for form content type, duplicate params, extension params, target/resource, requested token type, and clean OAuth errors | R-034 through R-059 | covered |
+| Subject validation and minted claim shape | `verification/*`; `domain/payload.py`; `tests/test_integration.py` | verify/core/http tests for issuer, audience, lifetime, `sub`, auth context, `typ=at+jwt`, required claims, `expires_in`, and lifetime caps | R-060 through R-078 | covered |
+| Delegation, impersonation, `may_act`, and nested `act` chains | `domain/actor.py`; `application/exchange.py`; `tests/test_impersonation.py`; `tests/test_stress.py` | delegation/impersonation HTTP contracts, may_act contracts, and prior-act preserve/sanitize/reject/no-preburn contracts | R-068 through R-072, R-092 through R-101 | covered |
+| JOSE signing, public JWKS, backend selection, and PQC | `signer.py`; `keys.py`; Python PQC intent docs | JOSE tests, JWKS tests, OpenSSL ML-DSA feature tests, fail-closed selector tests, and docs/README no-FIPS claim | R-079 through R-082, R-130 | covered; PQC is opt-in and experimental by design |
+| Client and actor authentication | `client_auth.py`; `verification/client_auth.py`; `verification/common.py`; `tests/test_integration.py` | verify/http tests for private_key_jwt, issuer/subject/audience, TTL, kid binding, subject binding, and RS256 inbound algorithm allowlist | R-083 through R-091 | covered |
+| Replay behavior and side-effect order | `application/replay_records.py`; `application/exchange.py`; replay tests | replay tests, client assertion no-preburn contract, DPoP replay contracts, and prior-act no-preburn contract | R-102 through R-106, R-070, R-116 | covered |
+| DPoP sender-constraining | `dpop.py`; `tests/test_dpop.py`; DPoP integration tests | DPoP unit tests and HTTP contracts for alg, typ, JWK privacy, signature, htm/htu/iat, replay, and `cnf.jkt` token binding | R-107 through R-120 | covered |
+| Runtime config, startup, CLI, and live tenant proof | `config*`; transport runtime; live Okta/MCP scripts | config tests, bootstrap tests, CLI tests, canary/redaction scripts, and real-tenant issue evidence | R-121 through R-124, R-129, R-131, R-132 | covered |
+| Explicit non-goals and release claims | Python docs; README; release notes | README/ledger release-shape checks and route absence tests | R-125 through R-128 | covered; not a full OAuth authorization server |
 
 ## Use Cases
 
@@ -312,7 +331,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | #26 | validation/security | Configured gateway MCP paths returned 401 after edge Okta auth | Gateway MCP proof | closed | Keep configured FastMCP proof and obo-lab gateway passthrough config aligned. |
 | #27 | jose/security | RustCrypto `rsa` backend was replaced with the AWS-LC-backed JOSE path | JOSE signing/verification dependency | closed | Keep cargo-audit/cargo-deny advisory gates green. |
 | #29 | jose/pqc/security | PQC backend drift from Python intent is resolved by replacing direct AWS-LC ML-DSA with OpenSSL 3.5+ `openssl-rs` ML-DSA | JOSE/PQC | closed | Keep OpenSSL ML-DSA feature tests, supply-chain exemptions, and no-FIPS docs green. |
-| #30 | tests/architecture | Residual broad Python-oracle parity marker R-003 needs final inventory or narrower issue links | Parity inventory | open | Close only when R-003 is no longer partial in the regenerated table. |
+| #30 | tests/architecture | Residual broad Python-oracle parity marker R-003 is closed by the lane-by-lane parity inventory | Parity inventory | closed | Future parity drift must open a focused issue against the affected lane. |
 | #31 | core/tests | Nested incoming `act` chain verification coverage caveat for R-070 is closed with Python-oracle-backed HTTP contract tests and replay-order fix | Delegation act chain | closed | Keep prior-act preserve/sanitize/reject/no-preburn contract tests in release gates. |
 | Python #210 | bug/parity | Scoped token cannot outlive subject | Token lifetime | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
 | Python #280 | bug/parity | Scoped token cannot outlive actor | Token lifetime | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
