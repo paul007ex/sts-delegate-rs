@@ -668,7 +668,7 @@ fn authenticate_client_if_present(
         .as_deref()
         .ok_or_else(|| HttpError::invalid_client("client_assertion required"))?;
     let audiences = vec![state.config.our_issuer.clone(), state.token_endpoint()];
-    let key_binding_registry = client_key_binding_registry(state);
+    let key_binding_registry = key_binding_registry(state);
     let claims = verify_assertion(
         assertion,
         &state.client_jwks,
@@ -701,7 +701,7 @@ fn authenticate_client_if_present(
     Ok(Some(claims))
 }
 
-fn client_key_binding_registry(state: &HttpState) -> BTreeSet<String> {
+fn key_binding_registry(state: &HttpState) -> BTreeSet<String> {
     let mut identities = state.config.actor_ids.clone();
     identities.extend(state.config.client_ids.iter().cloned());
     identities
@@ -815,6 +815,7 @@ fn verify_actor_token(
     subject_token: &str,
 ) -> Result<AssertionClaims, HttpError> {
     let audiences = vec![state.config.our_issuer.clone(), state.token_endpoint()];
+    let key_binding_registry = key_binding_registry(state);
     verify_assertion(
         actor_token,
         &state.actor_jwks,
@@ -825,7 +826,7 @@ fn verify_actor_token(
             max_ttl: state.config.assertion_max_ttl,
             binding_subject_token: Some(subject_token),
             require_subject_binding: state.config.require_subject_binding,
-            key_binding_registry: None,
+            key_binding_registry: Some(&key_binding_registry),
         },
     )
     .map_err(|err| HttpError::invalid_client(err.message))
@@ -1090,7 +1091,7 @@ mod tests {
     fn test_state() -> (HttpState, RsaJoseSigner, RsaJoseSigner, RsaJoseSigner) {
         let sts_signer = signer(1, "sts-kid");
         let subject_signer = signer(2, "subject-kid");
-        let actor_signer = signer(3, "actor-kid");
+        let actor_signer = signer(3, "chat-mcp-actor-key-1");
         let client_signer = signer(4, "chat-mcp-key-1");
         let mut config = RuntimeConfig::from_source(&ConfigSource::from_pairs([
             ("IDP_ISSUER", "https://issuer.example/oauth2/default"),
@@ -1360,6 +1361,43 @@ mod tests {
             ("client_assertion_type", CLIENT_ASSERTION_TYPE),
             ("client_assertion", client_assertion.as_str()),
             ("client_id", "chat-mcp"),
+        ])
+        .expect("form");
+
+        let response = post_token_form(state, body).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = read_json(response).await;
+        assert_eq!(body["error"], "invalid_client");
+        assert!(
+            body["error_description"]
+                .as_str()
+                .unwrap_or("")
+                .contains("signing key does not belong")
+        );
+    }
+
+    #[tokio::test]
+    async fn token_route_rejects_actor_token_signed_by_cross_domain_client_key() {
+        let (mut state, subject_signer, actor_signer, _) = test_state();
+        let client_domain_signer = signer(6, "chat-mcp-svc-key-1");
+        state.config.client_ids.insert("chat-mcp-svc".to_string());
+        state.actor_jwks = JwksDocument::new(vec![
+            actor_signer.public_jwks().keys[0].clone(),
+            client_domain_signer.public_jwks().keys[0].clone(),
+        ]);
+        let now = unix_now();
+        let subject_token = signed_subject_token(&subject_signer, now);
+        let actor_token =
+            signed_assertion(&client_domain_signer, now, "actor-jti-cross-domain-client-key");
+
+        let body = serde_urlencoded::to_string([
+            ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+            ("subject_token", subject_token.as_str()),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("actor_token", actor_token.as_str()),
+            ("actor_token_type", JWT_TOKEN_TYPE),
+            ("audience", "api://chat-mcp"),
+            ("scope", "chat.read"),
         ])
         .expect("form");
 
