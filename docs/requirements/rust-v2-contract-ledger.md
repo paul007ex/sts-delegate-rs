@@ -69,9 +69,9 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-039 | OAuth error responses must be JSON and include stable `error` and `error_description` when OAuth-shaped. | must | implemented | http | RFC 6749 Section 5.2; `crates/sts-http/src/lib.rs:282` | HTTP contract tests | Service-unavailable may omit OAuth `error`. |
 | R-040 | Unexpected internal failures must map to clean `server_error` without leaking internal detail. | must | implemented | http | Python `tests/test_integration.py:732` | `contract_unexpected_signing_failure_is_clean_server_error` | Signing backend failures return sanitized 500 JSON. |
 | R-041 | Old `/exchange` route must remain absent. | must-not | implemented | http | Python `tests/test_integration.py:751`; issue #17 | `contract_exchange_route_remains_absent` | `/token` is the only token-exchange route. |
-| R-042 | Interactive docs must be off by default if/when served. | policy | open | http/ops | Python `transport.py:78` | missing Rust scope | Rust has no docs UI yet. |
-| R-043 | OpenAPI, if shipped, must be curated and drift-checked. | policy | missing | http/docs | Python `transport.py:78` | no Rust OpenAPI | Future issue needed before full HTTP release. |
-| R-044 | Metrics, if shipped, must be opt-in and not alter protocol behavior. | policy | missing | http/ops | Python `transport.py:85` | no Rust metrics | Future issue. |
+| R-042 | Interactive docs must be off by default if/when served. | policy | implemented | http/ops | Python `transport.py:78`; `crates/sts-http/tests/http_contract.rs` | `contract_openapi_json_is_curated_and_docs_are_absent_by_default` | Rust serves no `/docs` or `/redoc` routes by default. |
+| R-043 | OpenAPI, if shipped, must be curated and drift-checked. | policy | implemented | http/docs | Python `transport.py:78`; `crates/sts-http/openapi.json`; issue #22 | OpenAPI contract test | Served `/openapi.json` is compiled from the curated artifact and version-stamped. |
+| R-044 | Metrics, if shipped, must be opt-in and not alter protocol behavior. | policy | implemented | http/ops | Python `transport.py:85`; issue #22 | metrics contract tests | `STS_ENABLE_METRICS=true` installs `/metrics`; default is 404. |
 | R-045 | Token exchange grant type must be exactly `urn:ietf:params:oauth:grant-type:token-exchange`. | must | implemented | core/http | RFC 8693 Section 2.1; `crates/sts-core/src/lib.rs:12` | HTTP contract tests | Bad grant returns unsupported_grant_type. |
 | R-046 | `subject_token` is required and must not exceed configured max token length. | must | implemented | http/verify | RFC 8693 Section 2.1; `crates/sts-http/src/lib.rs:388` | HTTP unit tests | Oversized input fails before crypto. |
 | R-047 | `subject_token_type` is required and only access_token or jwt are accepted for inbound subject tokens. | policy | implemented | http/verify | `crates/sts-http/src/lib.rs:28`; issue #11 | HTTP contract tests | Unsupported type is invalid_request. |
@@ -302,14 +302,15 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | #17 | http/parity | Residual Python parity gaps for token form and route errors | Request/error surface | closed | Keep route/error contract tests. |
 | #18 | runtime/security | Production bootstrap now composes config, keys, trust anchors, replay, and startup validation before serving | Runtime startup | closed | Keep bootstrap smoke and fail-closed startup tests in release gates. |
 | #19 | jose/pqc/security | Native PQC signing, JWKS publication, and downstream verification are missing | JOSE/PQC | open | Implement RFC 9964-compatible ML-DSA/AKP support before any PQC capability claim. |
-| #20 | cli/ops | CLI now has explicit parser, bootstrap, offline smoke, canary config check, and public key/JWKS inspection; rotation remains incomplete | CLI/ops | open | Add or explicitly defer mutation/rotation workflow. |
+| #20 | cli/ops | CLI now has explicit parser, bootstrap, offline smoke, canary config check, and public key/JWKS inspection; rotation split to #28 | CLI/ops | closed | Keep shipped CLI command tests in release gates. |
 | #21 | tests/security | Real Okta proof must not be substituted with synthetic issuer evidence | Live canary | open | Configure Rust STS live base and keep redacted real-tenant evidence green. |
-| #22 | http/ops | Metrics/OpenAPI parity is undecided and unimplemented | Metrics/OpenAPI | open | Port Python behavior and gates or mark explicit non-goal/deferred. |
+| #22 | http/ops | Metrics/OpenAPI parity is implemented with curated OpenAPI and opt-in metrics | Metrics/OpenAPI | closed | Keep OpenAPI/docs/metrics contract tests green. |
 | #23 | security/tests | Secure Rust audit loop has normal monitoring plus pinned strict supply-chain tooling/policy; strict mode is green after #27 | Security loop | closed | Keep strict supply-chain gate in release evidence. |
 | #24 | replay/security | Poisoned replay mutex locks could panic instead of failing closed | Replay availability | closed | Keep poisoned-lock fail-closed tests in release gate. |
 | #25 | http/security | `may_act` delegation/impersonation behavior lacked Rust contract coverage | Delegation authorization | closed | Keep may_act Rust contracts and Python oracle smoke entries. |
+| #28 | cli/security | Signing-key mutation/rotation workflow remains incomplete | CLI rotation | open | Implement dry-run, atomic writes, overlap JWKS, and key-custody tests. |
 | #26 | validation/security | Configured gateway MCP paths returned 401 after edge Okta auth | Gateway MCP proof | closed | Keep configured FastMCP proof and obo-lab gateway passthrough config aligned. |
-| #27 | jose/security | `rsa 0.9.10` is flagged by RustSec RUSTSEC-2023-0071 and has no fixed upgrade | JOSE signing/verification dependency | open | Replace or explicitly mitigate the RSA backend before release readiness. |
+| #27 | jose/security | RustCrypto `rsa` backend was replaced with the AWS-LC-backed JOSE path | JOSE signing/verification dependency | closed | Keep cargo-audit/cargo-deny advisory gates green. |
 | Python #210 | bug/parity | Scoped token cannot outlive subject | Token lifetime | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
 | Python #280 | bug/parity | Scoped token cannot outlive actor | Token lifetime | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
 | Python #279 | bug/parity | `expires_in` must reflect capped lifetime | Token response | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
@@ -319,9 +320,8 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 ## Current Freeze Gaps
 
 - Native PQC signing/JWKS/downstream verification is missing; only fail-closed selection is shipped (#19).
-- CLI mutation/rotation workflow remains incomplete (#20).
+- CLI mutation/rotation workflow remains incomplete (#28).
 - Rust STS live-base canary remains not configured in this environment because `CANARY_STS_BASE_URL` is absent (#21).
-- Metrics/OpenAPI parity is unresolved; Rust must either port Python behavior and gates or mark the scope explicit non-goal/deferred (#22).
 - Full Authorization Server features remain non-goals for this STS alpha.
 
 ## Executive Conclusion

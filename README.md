@@ -36,6 +36,15 @@ Required environment includes `IDP_ISSUER` or `OKTA_ISSUER`,
 `IDP_JWKS_URI`/OIDC discovery. `STS_HTTP_ADDR` defaults to
 `127.0.0.1:8888`.
 
+## HTTP Ops
+
+The Rust HTTP runtime serves a curated OpenAPI artifact at `/openapi.json`.
+Interactive docs routes such as `/docs` and `/redoc` are not served by default.
+
+Prometheus-style metrics are opt-in with `STS_ENABLE_METRICS=true`; when enabled,
+`/metrics` reports exchange outcomes, denial counts by OAuth error code, and the
+current in-process replay-cache size. When disabled, `/metrics` is absent.
+
 ## Operator CLI
 
 `sts-cli` also includes offline-safe operator checks:

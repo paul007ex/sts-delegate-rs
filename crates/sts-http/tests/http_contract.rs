@@ -212,6 +212,13 @@ async fn post_token_form(state: HttpState, body: String) -> Response<Body> {
     post_token_form_with_dpop_values(state, body, &[]).await
 }
 
+async fn get_path(state: HttpState, uri: &str) -> Response<Body> {
+    router(state)
+        .oneshot(Request::builder().method(Method::GET).uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
 async fn post_form_to_uri(state: HttpState, uri: &str, body: String) -> Response<Body> {
     router(state)
         .oneshot(
@@ -282,6 +289,80 @@ fn impersonation_form(subject_token: &str, client_assertion: &str) -> String {
         ("client_id", "chat-mcp"),
     ])
     .expect("form")
+}
+
+#[tokio::test]
+async fn contract_openapi_json_is_curated_and_docs_are_absent_by_default() {
+    let (state, _, _, _) = test_state();
+
+    let response = get_path(state.clone(), "/openapi.json").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body = read_json(response).await;
+    assert_eq!(body["openapi"], "3.1.0");
+    assert_eq!(body["info"]["version"], env!("CARGO_PKG_VERSION"));
+    let paths = body["paths"].as_object().expect("paths");
+    assert!(paths.contains_key("/token"));
+    assert!(paths.contains_key("/jwks"));
+    assert!(paths.contains_key("/.well-known/oauth-authorization-server"));
+    assert!(!paths.contains_key("/exchange"));
+    assert!(!paths.contains_key("/metrics"));
+
+    assert_eq!(get_path(state.clone(), "/docs").await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(get_path(state, "/redoc").await.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn contract_metrics_are_opt_in_and_expose_expected_names() {
+    let (mut state, _, _, _) = test_state();
+
+    assert_eq!(get_path(state.clone(), "/metrics").await.status(), StatusCode::NOT_FOUND);
+
+    state.config.enable_metrics = true;
+    let response = get_path(state, "/metrics").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .starts_with("text/plain")
+    );
+    let body = response.into_body().collect().await.expect("body").to_bytes();
+    let body = std::str::from_utf8(&body).expect("utf8 metrics");
+    assert!(body.contains("sts_exchanges_total"));
+    assert!(body.contains("sts_denials_total"));
+    assert!(body.contains("sts_replay_cache_size"));
+}
+
+#[tokio::test]
+async fn contract_metrics_record_token_success_and_denial_without_changing_errors() {
+    let (mut state, subject_signer, actor_signer, _) = test_state();
+    state.config.enable_metrics = true;
+    let now = unix_now();
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let actor_token = signed_assertion(&actor_signer, now, "metrics-actor-jti");
+
+    let response =
+        post_token_form(state.clone(), delegation_form(&subject_token, &actor_token)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = post_token_raw(state.clone(), "{}", Some("application/json"), &[]).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_request");
+
+    let response = get_path(state, "/metrics").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.expect("body").to_bytes();
+    let body = std::str::from_utf8(&body).expect("utf8 metrics");
+    assert!(body.contains("sts_exchanges_total{result=\"minted\"} 1"));
+    assert!(body.contains("sts_exchanges_total{result=\"denied\"} 1"));
+    assert!(body.contains("sts_denials_total{error=\"invalid_request\"} 1"));
 }
 
 #[tokio::test]

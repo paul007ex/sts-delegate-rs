@@ -210,6 +210,7 @@ pub struct RuntimeConfig {
     pub actor_jwks_sha256: Option<String>,
     pub client_jwks_sha256: Option<String>,
     pub http_addr: String,
+    pub enable_metrics: bool,
     pub log_format_json: bool,
     pub log_level: String,
     pub audit_hash_chain: bool,
@@ -388,6 +389,7 @@ impl RuntimeConfig {
                         .map(ToString::to_string)
                 }),
             http_addr: source.get("STS_HTTP_ADDR").unwrap_or(DEFAULT_HTTP_ADDR).trim().to_string(),
+            enable_metrics: parse_bool(source, "STS_ENABLE_METRICS", false),
             log_format_json: parse_bool(source, "LOG_FORMAT_JSON", false)
                 || source.get("LOG_FORMAT").is_some_and(|v| v.trim().eq_ignore_ascii_case("json")),
             log_level: parse_log_level(source),

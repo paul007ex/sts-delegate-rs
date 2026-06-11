@@ -11,7 +11,8 @@ use std::fmt;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
@@ -48,6 +49,8 @@ use url::Url;
 const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
 const DPOP_HEADER: HeaderName = HeaderName::from_static("dpop");
+const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+const CURATED_OPENAPI_JSON: &str = include_str!("../openapi.json");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EffectiveExchangeMode {
@@ -74,6 +77,7 @@ pub struct HttpState {
     pub actor_jwks: JwksDocument,
     pub client_jwks: JwksDocument,
     pub replay: Arc<ReplayPolicy>,
+    metrics: Arc<MetricsState>,
 }
 
 impl HttpState {
@@ -120,6 +124,7 @@ impl HttpState {
             actor_jwks,
             client_jwks,
             replay: Arc::new(replay),
+            metrics: Arc::new(MetricsState::default()),
         }
     }
 
@@ -138,6 +143,64 @@ impl HttpState {
     }
 }
 
+#[derive(Default)]
+struct MetricsState {
+    exchanges_minted: AtomicU64,
+    exchanges_denied: AtomicU64,
+    denials: Mutex<std::collections::BTreeMap<&'static str, u64>>,
+}
+
+impl MetricsState {
+    fn record_exchange<T>(&self, result: &Result<T, HttpError>) {
+        match result {
+            Ok(_) => {
+                self.exchanges_minted.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(err) => {
+                self.exchanges_denied.fetch_add(1, Ordering::Relaxed);
+                if let Some(error) = err.error
+                    && let Ok(mut denials) = self.denials.lock()
+                {
+                    *denials.entry(error).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    fn render(&self, replay_cache_size: usize) -> String {
+        let minted = self.exchanges_minted.load(Ordering::Relaxed);
+        let denied = self.exchanges_denied.load(Ordering::Relaxed);
+        let denials = self.denials.lock().map(|denials| denials.clone()).unwrap_or_default();
+        let mut output = String::new();
+        output.push_str(
+            "# HELP sts_exchanges_total Total token exchange outcomes (minted = success, denied = any OAuth error)\n",
+        );
+        output.push_str("# TYPE sts_exchanges_total counter\n");
+        output.push_str(&format!("sts_exchanges_total{{result=\"minted\"}} {minted}\n"));
+        output.push_str(&format!("sts_exchanges_total{{result=\"denied\"}} {denied}\n"));
+        output.push_str(
+            "# HELP sts_denials_total Token exchange denials labelled by OAuth error code\n",
+        );
+        output.push_str("# TYPE sts_denials_total counter\n");
+        for (error, count) in denials {
+            output.push_str(&format!(
+                "sts_denials_total{{error=\"{}\"}} {count}\n",
+                escape_prometheus_label(error)
+            ));
+        }
+        output.push_str(
+            "# HELP sts_replay_cache_size Unexpired jtis currently held in the in-process replay cache\n",
+        );
+        output.push_str("# TYPE sts_replay_cache_size gauge\n");
+        output.push_str(&format!("sts_replay_cache_size {replay_cache_size}\n"));
+        output
+    }
+}
+
+fn escape_prometheus_label(value: &str) -> String {
+    value.replace('\\', r"\\").replace('"', r#"\""#).replace('\n', r"\n")
+}
+
 /// Build the Axum router for the public STS endpoints.
 ///
 /// RFC 8414 metadata, RFC 8693 token exchange, and JWKS publication are exposed
@@ -147,7 +210,12 @@ pub fn router(state: HttpState) -> Router {
     let mut app = Router::new()
         .route("/token", post(token))
         .route("/jwks", get(jwks))
+        .route("/openapi.json", get(openapi))
         .route("/.well-known/oauth-authorization-server", get(metadata));
+
+    if state.config.enable_metrics {
+        app = app.route("/metrics", get(metrics));
+    }
 
     if let Some(path) = state.issuer_path() {
         app = app
@@ -635,6 +703,33 @@ async fn jwks(State(state): State<HttpState>) -> impl IntoResponse {
     (public_cache_headers(state.config.jwks_cache_max_age), Json(state.published_jwks))
 }
 
+async fn openapi() -> impl IntoResponse {
+    let mut document: serde_json::Value = serde_json::from_str(CURATED_OPENAPI_JSON)
+        .unwrap_or_else(|_| {
+            serde_json::json!({
+                "openapi": "3.1.0",
+                "info": {
+                    "title": "sts-delegate-rs",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "paths": {}
+            })
+        });
+    if let Some(info) = document.get_mut("info").and_then(serde_json::Value::as_object_mut) {
+        info.insert("version".to_string(), env!("CARGO_PKG_VERSION").into());
+    }
+    (public_cache_headers(300), Json(document))
+}
+
+async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(METRICS_CONTENT_TYPE));
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
+    (headers, state.metrics.render(state.replay.cache_size()))
+}
+
 async fn metadata(State(state): State<HttpState>) -> impl IntoResponse {
     let document = AuthorizationServerMetadata {
         issuer: state.config.our_issuer.clone(),
@@ -720,6 +815,17 @@ fn assign_token_form_value(form: &mut TokenForm, key: &str, value: String) {
 async fn token(
     headers: HeaderMap,
     State(state): State<HttpState>,
+    body: Bytes,
+) -> Result<(HeaderMap, Json<TokenResponse>), HttpError> {
+    let metrics = state.metrics.clone();
+    let result = token_inner(headers, state, body).await;
+    metrics.record_exchange(&result);
+    result
+}
+
+async fn token_inner(
+    headers: HeaderMap,
+    state: HttpState,
     body: Bytes,
 ) -> Result<(HeaderMap, Json<TokenResponse>), HttpError> {
     let form = parse_token_form(&headers, &body)?;
