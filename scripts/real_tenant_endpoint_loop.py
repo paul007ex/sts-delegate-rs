@@ -8,6 +8,7 @@ import base64
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -26,6 +27,11 @@ DEFAULT_FASTMCP_PYTHON = Path("/Users/Shared/claude/obo-lab/.venv/bin/python3")
 EXAMPLE_HOST_FRAGMENTS = ("example.com", "example.test", "example.org", "issuer.example", "sts.example")
 PRIVATE_JWK_MEMBERS = {"d", "p", "q", "dp", "dq", "qi", "oth"}
 TOKEN_FIELD_NAMES = {"authorization", "access_token", "subject_token", "actor_token", "client_assertion"}
+SECRET_QUERY_RE = re.compile(
+    r"(?i)([?&](?:access_token|subject_token|actor_token|client_assertion|client_secret|authorization)=)[^&\s]+"
+)
+BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+JWT_RE = re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\b")
 MCP_TOOL_PROBES = {
     "chat-mcp": ("say", {"message": "hello from sts-delegate-rs canary"}),
     "databricks-mcp": ("run_sql_query", {"sql": "SELECT 1"}),
@@ -94,6 +100,12 @@ def log(event: str, **fields: Any) -> None:
     print(json.dumps({"event": event, **redact(fields)}, sort_keys=True), flush=True)
 
 
+def redact_string(value: str) -> str:
+    redacted = SECRET_QUERY_RE.sub(lambda match: f"{match.group(1)}<redacted>", value)
+    redacted = BEARER_RE.sub("Bearer <redacted>", redacted)
+    return JWT_RE.sub("<jwt-redacted>", redacted)
+
+
 def redact(value: Any) -> Any:
     if isinstance(value, dict):
         safe: dict[str, Any] = {}
@@ -108,9 +120,21 @@ def redact(value: Any) -> Any:
         return safe
     if isinstance(value, list):
         return [redact(item) for item in value]
-    if isinstance(value, str) and value.startswith("Bearer "):
-        return "Bearer <redacted>"
+    if isinstance(value, str):
+        return redact_string(value)
     return value
+
+
+def self_test_redaction() -> None:
+    synthetic_jwt = "headerheaderheaderheader.payloadpayloadpayloadpayload.signaturesignature"
+    sample = {
+        "message": f"Authorization: Bearer {synthetic_jwt} failed",
+        "url": f"https://tenant.invalid/cb?access_token={synthetic_jwt}&ok=1",
+        "nested": [{"client_assertion": synthetic_jwt}],
+    }
+    rendered = json.dumps(redact(sample), sort_keys=True)
+    if synthetic_jwt in rendered or "access_token=header" in rendered:
+        raise CanaryError("redaction self-test failed")
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -484,12 +508,17 @@ def parse_args() -> argparse.Namespace:
         help="MCP endpoint proof mode; auto uses FastMCP when available",
     )
     parser.add_argument("--fastmcp-python", type=Path, default=DEFAULT_FASTMCP_PYTHON)
+    parser.add_argument("--self-test-redaction", action="store_true", help="run the local log-redaction self-test")
     return parser.parse_args()
 
 
 def main() -> int:
     sys.stdout.reconfigure(line_buffering=True)
     args = parse_args()
+    if args.self_test_redaction:
+        self_test_redaction()
+        log("redaction_self_test", result="pass")
+        return 0
     if args.loop:
         interval = max(args.loop, 30)
         while True:
