@@ -171,6 +171,20 @@ fn signed_subject_token_with_auth_context(signer: &RsaJoseSigner, now: i64) -> S
         .expect("subject token")
 }
 
+fn signed_subject_token_with_may_act(signer: &RsaJoseSigner, now: i64, may_act: Value) -> String {
+    signer
+        .sign_json_claims(&json!({
+            "iss": "https://issuer.example/oauth2/default",
+            "sub": "alice@example.com",
+            "aud": "api://obo",
+            "scope": "chat.read chat.write",
+            "exp": now + 600,
+            "iat": now,
+            "may_act": may_act,
+        }))
+        .expect("subject token")
+}
+
 fn signed_assertion(signer: &RsaJoseSigner, now: i64, jti: &str) -> String {
     signed_assertion_with_exp_delta(signer, now, jti, 300)
 }
@@ -245,6 +259,33 @@ async fn post_token_form_with_dpop_values(
         builder = builder.header("DPoP", *value);
     }
     router(state).oneshot(builder.body(Body::from(body)).unwrap()).await.unwrap()
+}
+
+fn delegation_form(subject_token: &str, actor_token: &str) -> String {
+    serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", actor_token),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+    ])
+    .expect("form")
+}
+
+fn impersonation_form(subject_token: &str, client_assertion: &str) -> String {
+    serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+        ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+        ("client_assertion", client_assertion),
+        ("client_id", "chat-mcp"),
+    ])
+    .expect("form")
 }
 
 #[tokio::test]
@@ -724,6 +765,73 @@ async fn contract_delegation_token_matches_python_oracle_wire_shape() {
 }
 
 #[tokio::test]
+async fn contract_may_act_allows_matching_actor_and_does_not_burn_replay_on_failure() {
+    let (state, subject_signer, actor_signer, _) = test_state();
+    let now = unix_now();
+    let actor_token = signed_assertion(&actor_signer, now, "actor-may-act-retry");
+
+    let rejected_subject =
+        signed_subject_token_with_may_act(&subject_signer, now, json!({"sub": "other-actor"}));
+    let rejected =
+        post_token_form(state.clone(), delegation_form(&rejected_subject, &actor_token)).await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let body = read_json(rejected).await;
+    assert_eq!(body["error"], "invalid_request");
+    assert!(
+        body["error_description"]
+            .as_str()
+            .unwrap_or("")
+            .contains("may_act does not authorize this actor")
+    );
+
+    let accepted_subject =
+        signed_subject_token_with_may_act(&subject_signer, now, json!({"sub": "chat-mcp"}));
+    let accepted =
+        post_token_form(state.clone(), delegation_form(&accepted_subject, &actor_token)).await;
+    assert_eq!(
+        accepted.status(),
+        StatusCode::OK,
+        "failed may_act gate must not record actor replay state"
+    );
+    let response_body = read_json(accepted).await;
+    let token = response_body["access_token"].as_str().expect("access token");
+    let payload = jwt_segment(token, 1);
+    assert_eq!(payload["act"], json!({"sub": "chat-mcp"}));
+}
+
+#[tokio::test]
+async fn contract_may_act_rejects_malformed_empty_and_issuer_mismatch() {
+    let (state, subject_signer, actor_signer, _) = test_state();
+    let now = unix_now();
+    let cases = [
+        ("actor-may-act-empty", json!({}), "may_act present but empty"),
+        ("actor-may-act-string", json!("chat-mcp"), "may_act must be a JSON object"),
+        ("actor-may-act-array", json!([{"sub": "chat-mcp"}]), "may_act must be a JSON object"),
+        ("actor-may-act-null-sub", json!({"sub": null}), "may_act does not authorize this actor"),
+        (
+            "actor-may-act-issuer",
+            json!({"sub": "chat-mcp", "iss": "other-issuer"}),
+            "may_act issuer does not match this actor",
+        ),
+    ];
+
+    for (actor_jti, may_act, expected_description) in cases {
+        let subject_token = signed_subject_token_with_may_act(&subject_signer, now, may_act);
+        let actor_token = signed_assertion(&actor_signer, now, actor_jti);
+        let response =
+            post_token_form(state.clone(), delegation_form(&subject_token, &actor_token)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{actor_jti}");
+        let body = read_json(response).await;
+        assert_eq!(body["error"], "invalid_request", "{actor_jti}");
+        assert!(
+            body["error_description"].as_str().unwrap_or("").contains(expected_description),
+            "{actor_jti}: {body}"
+        );
+        assert!(body.get("access_token").is_none(), "{actor_jti}");
+    }
+}
+
+#[tokio::test]
 async fn contract_auth_context_claims_carry_from_subject_token_when_present() {
     let (state, subject_signer, actor_signer, _) = test_state();
     let now = unix_now();
@@ -964,6 +1072,27 @@ async fn contract_impersonation_omits_act_claim() {
     .expect("form");
 
     let response = post_token_form(state, body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = read_json(response).await;
+    let token = response_body["access_token"].as_str().expect("access token");
+    let payload = jwt_segment(token, 1);
+    assert_eq!(payload["sub"], "alice@example.com");
+    assert_eq!(payload["client_id"], "chat-mcp");
+    assert!(payload.get("act").is_none(), "impersonation must omit act");
+}
+
+#[tokio::test]
+async fn contract_impersonation_ignores_subject_may_act_claim() {
+    let (mut state, subject_signer, _, client_signer) = test_state();
+    state.config.token_exchange_mode = TokenExchangeMode::Impersonation;
+    allow_impersonation_anywhere(&mut state, "chat-mcp");
+    let now = unix_now();
+    let subject_token =
+        signed_subject_token_with_may_act(&subject_signer, now, json!({"sub": "other-actor"}));
+    let client_assertion = signed_assertion(&client_signer, now, "client-may-act-ignored");
+
+    let response =
+        post_token_form(state, impersonation_form(&subject_token, &client_assertion)).await;
     assert_eq!(response.status(), StatusCode::OK);
     let response_body = read_json(response).await;
     let token = response_body["access_token"].as_str().expect("access token");
