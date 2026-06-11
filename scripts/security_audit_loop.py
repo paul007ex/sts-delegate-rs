@@ -49,6 +49,24 @@ def run_command(label: str, command: list[str]) -> bool:
     return False
 
 
+def check_duplicate_dependencies() -> bool:
+    command = ["cargo", "tree", "-d"]
+    print(f"check=duplicate-dependencies command={' '.join(command)}")
+    completed = subprocess.run(command, cwd=REPO, text=True, check=False, capture_output=True)
+    if completed.stdout:
+        print(completed.stdout, end="")
+    if completed.stderr:
+        print(completed.stderr, end="", file=sys.stderr)
+    if completed.returncode != 0:
+        print(f"check=duplicate-dependencies result=fail code={completed.returncode}")
+        return False
+    if completed.stdout.strip():
+        print("check=duplicate-dependencies result=fail reason=duplicates-present")
+        return False
+    print("check=duplicate-dependencies result=pass")
+    return True
+
+
 def rust_source_files() -> list[Path]:
     return sorted((REPO / "crates").glob("*/src/**/*.rs"))
 
@@ -126,12 +144,12 @@ def run_once(args: argparse.Namespace) -> bool:
         ("fmt", ["cargo", "fmt", "--check"]),
         ("clippy", ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]),
         ("architecture-boundaries", ["scripts/check_architecture_boundaries.py"]),
-        ("duplicate-dependencies", ["cargo", "tree", "-d"]),
     ]
 
     for label, command in required_commands:
         ok = run_command(label, command) and ok
 
+    ok = check_duplicate_dependencies() and ok
     ok = scan_production_rust() and ok
     ok = run_supply_chain_tools(args.strict_supply_chain) and ok
 
