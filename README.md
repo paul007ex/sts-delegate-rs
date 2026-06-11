@@ -55,6 +55,12 @@ cargo run -p sts-cli -- smoke --allow-network
 cargo run -p sts-cli -- canary check-config
 cargo run -p sts-cli -- jwks inspect --file public_jwks.json
 cargo run -p sts-cli -- key inspect --file public_jwk.json
+cargo run -p sts-cli -- key rotate --dry-run \
+  --key-file secrets/obo_sts_private_key.json \
+  --extra-jwks-file secrets/obo_sts_retiring_jwks.json
+cargo run -p sts-cli -- key rotate \
+  --key-file secrets/obo_sts_private_key.json \
+  --extra-jwks-file secrets/obo_sts_retiring_jwks.json
 ```
 
 `smoke` runs the same startup bootstrap path as the server, but defaults to
@@ -62,6 +68,14 @@ offline mode and requires `IDP_JWKS_FILE`; pass `--allow-network` only when live
 IdP JWKS retrieval is intentional. `canary check-config` reports only missing
 `CANARY_*` names. Key and JWKS inspection print public metadata only and refuse
 private or symmetric JWK input.
+
+`key rotate` is the file-backed RSA private JWK rotation workflow. It validates
+the current private JWK and existing public overlap JWKS, stages the old public
+key in `OBO_STS_EXTRA_JWKS_FILE` format, then atomically replaces the private key
+with a new RSA private JWK using restrictive file permissions on Unix. The
+command prints only public key ids, file paths, counts, and restart status; it
+does not print private key material. KMS/HSM and PQC rotation remain separate
+future work.
 
 ## Release shape
 

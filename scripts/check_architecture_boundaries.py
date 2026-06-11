@@ -20,7 +20,10 @@ WORKSPACE_CRATES = {
 }
 
 ALLOWED_NORMAL_WORKSPACE_DEPS = {
-    "sts-cli": {"sts-http"},
+    # `sts-cli` can bootstrap the HTTP runtime and run operator key workflows.
+    # Key rotation uses JOSE-owned RSA/JWK generation instead of duplicating
+    # private-key handling in the CLI crate.
+    "sts-cli": {"sts-http", "sts-jose"},
     "sts-config": set(),
     "sts-core": set(),
     "sts-dpop": set(),

@@ -156,7 +156,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-126 | Release validation requires fmt, workspace tests, clippy, architecture guard, oracle smoke, and diff check. | policy | implemented | release | issue #2 comments; `README.md:24` | alpha.4 validation | Supply-chain helper CLIs remain optional until installed. |
 | R-127 | The requirements ledger must not close #2 until 100+ requirements and 20+ use cases are canonical. | must | implemented | PM | issue #2 | this ledger | Close only after issue update and validation. |
 | R-128 | Full Authorization Server features such as authorization endpoint, revocation, introspection, and registration are non-goals for current STS alpha. | non-goal | implemented | PM/http | Python docs; `README.md:3` | no routes | Future AS expansion requires new milestone. |
-| R-129 | CLI parser, runtime bootstrap, offline smoke, canary config check, and public key/JWKS inspection are shipped; mutation/rotation workflows remain planned. | policy | partial | cli/ops | `README.md:22`; `crates/sts-cli/src/main.rs:12`; issue #20 | `cargo test -p sts-cli` | Rotation must preserve key custody and overlap semantics before closing full CLI scope. |
+| R-129 | CLI parser, runtime bootstrap, offline smoke, canary config check, public key/JWKS inspection, and file-backed RSA private JWK rotation are shipped. | policy | implemented | cli/ops | `README.md`; `crates/sts-cli/src/main.rs`; issues #20/#28 | `cargo test -p sts-cli` | Rotation stages old public keys for overlap, uses atomic writes, and keeps KMS/HSM/PQC rotation out of scope. |
 | R-130 | Native PQC signing/JWKS/downstream verification is a v2 requirement, but alpha currently only provides fail-closed selection. | must | missing | jose/security | repo instructions; `crates/sts-jose/src/lib.rs:5` | JOSE fail-closed tests | Needs dedicated implementation issue before claim. |
 | R-131 | Live tenant validation must use the configured real Okta trial issuer; `example.com`, `issuer.example`, `sts.example`, and `*.example.*` are fixture-only and must not close readiness issues. | must | partial | tests/security/cli | issue #21; `scripts/real_tenant_endpoint_loop.py`; `crates/sts-cli/src/main.rs`; `/Users/Shared/claude/obo-lab/okta.env` | redaction self-test; FastMCP loops; CLI canary config tests | Rust STS live base remains gated by `CANARY_STS_BASE_URL`. |
 | R-132 | Runtime STS issuer values must reject query components, fragment components, and non-loopback HTTP while preserving Python's loopback HTTP dev exception. | must | implemented | config/security | issue #13; Python `tests/test_stress.py:920`; Python `infrastructure/config_env.py:47` | Rust config/verify issuer tests | Canonicalizes trailing slash to keep issuer/audience/metadata stable. |
@@ -308,7 +308,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | #23 | security/tests | Secure Rust audit loop has normal monitoring plus pinned strict supply-chain tooling/policy; strict mode is green after #27 | Security loop | closed | Keep strict supply-chain gate in release evidence. |
 | #24 | replay/security | Poisoned replay mutex locks could panic instead of failing closed | Replay availability | closed | Keep poisoned-lock fail-closed tests in release gate. |
 | #25 | http/security | `may_act` delegation/impersonation behavior lacked Rust contract coverage | Delegation authorization | closed | Keep may_act Rust contracts and Python oracle smoke entries. |
-| #28 | cli/security | Signing-key mutation/rotation workflow remains incomplete | CLI rotation | open | Implement dry-run, atomic writes, overlap JWKS, and key-custody tests. |
+| #28 | cli/security | File-backed RSA private JWK rotation is implemented with dry-run, atomic writes, overlap JWKS staging, and key-custody tests | CLI rotation | closed | Keep rotation tests in release gates; KMS/HSM and PQC rotation require separate issues. |
 | #26 | validation/security | Configured gateway MCP paths returned 401 after edge Okta auth | Gateway MCP proof | closed | Keep configured FastMCP proof and obo-lab gateway passthrough config aligned. |
 | #27 | jose/security | RustCrypto `rsa` backend was replaced with the AWS-LC-backed JOSE path | JOSE signing/verification dependency | closed | Keep cargo-audit/cargo-deny advisory gates green. |
 | Python #210 | bug/parity | Scoped token cannot outlive subject | Token lifetime | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
@@ -320,7 +320,6 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 ## Current Freeze Gaps
 
 - Native PQC signing/JWKS/downstream verification is missing; only fail-closed selection is shipped (#19).
-- CLI mutation/rotation workflow remains incomplete (#28).
 - Rust STS live-base canary remains not configured in this environment because `CANARY_STS_BASE_URL` is absent (#21).
 - Full Authorization Server features remain non-goals for this STS alpha.
 

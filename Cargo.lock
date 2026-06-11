@@ -1507,6 +1507,7 @@ dependencies = [
  "clap",
  "serde_json",
  "sts-http",
+ "sts-jose",
  "tokio",
 ]
 

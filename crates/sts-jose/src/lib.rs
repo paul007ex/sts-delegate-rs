@@ -10,6 +10,7 @@
 use std::fmt;
 
 use aws_lc_rs::{
+    digest::{SHA256, digest as aws_digest},
     encoding::{AsDer, Pkcs8V1Der},
     signature::{KeyPair as AwsKeyPair, RsaKeyPair, RsaPublicKeyComponents},
 };
@@ -227,6 +228,13 @@ pub struct RsaJoseSigner {
     public_jwk: PublicJwk,
 }
 
+/// A freshly generated classical RSA signing key for file-backed operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedRsaKey {
+    pub private_jwk_json: String,
+    pub public_jwk: PublicJwk,
+}
+
 impl RsaJoseSigner {
     /// Build the RS256 signer only when backend policy selected the classical path.
     ///
@@ -352,6 +360,35 @@ impl RsaJoseSigner {
         Self::from_private_key_der(private_der.as_ref(), kid)
     }
 
+    /// Generate a 2048-bit RSA private JWK plus its public JWK.
+    ///
+    /// The public `kid` is the RFC 7638-style SHA-256 thumbprint of the RSA public
+    /// JWK members so rotations get a deterministic key id for the generated key.
+    pub fn generate_private_jwk() -> Result<GeneratedRsaKey, JoseError> {
+        let key_pair = RsaKeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).map_err(|e| {
+            JoseError::new(JoseErrorKind::InvalidKey, format!("generate RSA key failed: {e}"))
+        })?;
+        let private_der = AsDer::<Pkcs8V1Der>::as_der(&key_pair).map_err(|e| {
+            JoseError::new(JoseErrorKind::InvalidKey, format!("encode RSA key failed: {e}"))
+        })?;
+        let public = key_pair.public_key();
+        let components = RsaPublicKeyComponents::<Vec<u8>>::from(public);
+        let n = URL_SAFE_NO_PAD.encode(&components.n);
+        let e = URL_SAFE_NO_PAD.encode(&components.e);
+        let kid = rsa_jwk_thumbprint(&n, &e);
+        let public_jwk = PublicJwk {
+            kty: "RSA".to_string(),
+            kid,
+            use_: "sig".to_string(),
+            alg: "RS256".to_string(),
+            n,
+            e,
+        };
+        let private_jwk_json = private_jwk_json_from_pkcs8_der(private_der.as_ref(), &public_jwk)?;
+
+        Ok(GeneratedRsaKey { private_jwk_json, public_jwk })
+    }
+
     fn public_jwk(&self) -> PublicJwk {
         self.public_jwk.clone()
     }
@@ -455,6 +492,11 @@ fn rsa_modulus_bits(n: &[u8]) -> usize {
     (bytes.len() - 1) * 8 + (8 - bytes[0].leading_zeros() as usize)
 }
 
+fn rsa_jwk_thumbprint(n: &str, e: &str) -> String {
+    let canonical = format!(r#"{{"e":"{e}","kty":"RSA","n":"{n}"}}"#);
+    URL_SAFE_NO_PAD.encode(aws_digest(&SHA256, canonical.as_bytes()).as_ref())
+}
+
 fn rsa_private_jwk_to_pkcs1_der(jwk: &PrivateRsaJwk) -> Result<Vec<u8>, JoseError> {
     let n = decode_jwk_component("n", &jwk.n)?;
     let e = decode_jwk_component("e", &jwk.e)?;
@@ -482,6 +524,70 @@ fn rsa_private_jwk_to_pkcs1_der(jwk: &PrivateRsaJwk) -> Result<Vec<u8>, JoseErro
             format!("failed to encode RSA private JWK as PKCS#1 DER: {e}"),
         )
     })
+}
+
+fn private_jwk_json_from_pkcs8_der(
+    private_der: &[u8],
+    public_jwk: &PublicJwk,
+) -> Result<String, JoseError> {
+    let pkcs1_der = normalize_rsa_private_key_der(private_der)?;
+    let blocks = simple_asn1::from_der(&pkcs1_der).map_err(|e| {
+        JoseError::new(JoseErrorKind::InvalidKey, format!("invalid generated RSA key DER: {e}"))
+    })?;
+    let sequence = match blocks.as_slice() {
+        [ASN1Block::Sequence(_, sequence)] => sequence,
+        _ => {
+            return Err(JoseError::new(
+                JoseErrorKind::InvalidKey,
+                "invalid generated RSA key DER: expected PKCS#1 sequence",
+            ));
+        }
+    };
+    if sequence.len() < 9 {
+        return Err(JoseError::new(
+            JoseErrorKind::InvalidKey,
+            "invalid generated RSA key DER: missing RSA private key components",
+        ));
+    }
+
+    let jwk = serde_json::json!({
+        "kty": "RSA",
+        "kid": public_jwk.kid.clone(),
+        "use": "sig",
+        "alg": "RS256",
+        "n": rsa_integer_component(sequence, 1, "n")?,
+        "e": rsa_integer_component(sequence, 2, "e")?,
+        "d": rsa_integer_component(sequence, 3, "d")?,
+        "p": rsa_integer_component(sequence, 4, "p")?,
+        "q": rsa_integer_component(sequence, 5, "q")?,
+        "dp": rsa_integer_component(sequence, 6, "dp")?,
+        "dq": rsa_integer_component(sequence, 7, "dq")?,
+        "qi": rsa_integer_component(sequence, 8, "qi")?,
+    });
+    serde_json::to_string_pretty(&jwk).map(|json| format!("{json}\n")).map_err(|e| {
+        JoseError::new(JoseErrorKind::InvalidKey, format!("encode generated RSA JWK failed: {e}"))
+    })
+}
+
+fn rsa_integer_component(
+    sequence: &[ASN1Block],
+    index: usize,
+    name: &str,
+) -> Result<String, JoseError> {
+    let Some(ASN1Block::Integer(_, value)) = sequence.get(index) else {
+        return Err(JoseError::new(
+            JoseErrorKind::InvalidKey,
+            format!("invalid generated RSA key DER: missing integer {name}"),
+        ));
+    };
+    if value <= &BigInt::from(0) {
+        return Err(JoseError::new(
+            JoseErrorKind::InvalidKey,
+            format!("invalid generated RSA key DER: non-positive integer {name}"),
+        ));
+    }
+    let (_, bytes) = value.to_bytes_be();
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
 fn positive_integer_block(name: &str, bytes: &[u8]) -> Result<ASN1Block, JoseError> {
@@ -721,6 +827,29 @@ mod tests {
         assert_eq!(jwks.keys[0].alg, "RS256");
         assert_eq!(jwks.keys[0].use_, "sig");
         assert_eq!(jwks.keys[0].kid, "kid-1");
+    }
+
+    #[test]
+    fn generated_private_jwk_round_trips_to_public_jwks() {
+        let generated = RsaJoseSigner::generate_private_jwk().expect("generated key");
+        assert!(generated.private_jwk_json.contains(r#""d""#));
+        assert_eq!(generated.public_jwk.kty, "RSA");
+        assert_eq!(generated.public_jwk.alg, "RS256");
+        assert_eq!(generated.public_jwk.use_, "sig");
+
+        let signer = RsaJoseSigner::from_pkcs1_pem(
+            &generated.private_jwk_json,
+            generated.public_jwk.kid.clone(),
+        )
+        .expect_err("private JWK must not be parsed as PEM");
+        assert_eq!(signer.kind, JoseErrorKind::InvalidKey);
+
+        let signer = RsaJoseSigner::from_private_jwk(
+            &generated.private_jwk_json,
+            generated.public_jwk.kid.clone(),
+        )
+        .expect("parse generated key");
+        assert_eq!(signer.public_jwks().keys, vec![generated.public_jwk]);
     }
 
     #[test]
