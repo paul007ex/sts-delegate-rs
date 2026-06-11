@@ -287,10 +287,18 @@ impl RsaJoseSigner {
     /// verifier tests and adjacent JWT-shaped payloads to reuse the same RSA
     /// signing boundary.
     pub fn sign_json_claims<T: Serialize>(&self, claims: &T) -> Result<String, JoseError> {
+        self.sign_json_claims_with_typ(claims, "JWT")
+    }
+
+    fn sign_json_claims_with_typ<T: Serialize>(
+        &self,
+        claims: &T,
+        typ: &str,
+    ) -> Result<String, JoseError> {
         let header = serde_json::json!({
             "alg": self.alg(),
             "kid": self.kid,
-            "typ": "JWT",
+            "typ": typ,
         });
         let header_json = serde_json::to_vec(&header).map_err(|e| {
             JoseError::new(JoseErrorKind::InvalidClaims, format!("encode header failed: {e}"))
@@ -331,7 +339,7 @@ impl JoseSigner for RsaJoseSigner {
     }
 
     fn sign_claims(&self, claims: &MintedClaims) -> Result<String, JoseError> {
-        self.sign_json_claims(claims)
+        self.sign_json_claims_with_typ(claims, "at+jwt")
     }
 
     fn public_jwks(&self) -> JwksDocument {
@@ -520,6 +528,18 @@ mod tests {
                 .unwrap();
         assert_eq!(header["alg"], "RS256");
         assert_eq!(header["kid"], "kid-1");
+        assert_eq!(header["typ"], "at+jwt");
+    }
+
+    #[test]
+    fn generic_json_signer_keeps_jwt_typ_for_assertions() {
+        let signer = test_signer();
+        let token = signer.sign_json_claims(&claims()).expect("sign");
+        let header_b64 = token.split('.').next().unwrap();
+        let header: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header_b64.as_bytes()).unwrap())
+                .unwrap();
+        assert_eq!(header["typ"], "JWT");
     }
 
     #[test]

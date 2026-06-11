@@ -39,8 +39,15 @@ pub struct ExchangeRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActClaim {
     pub sub: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub iss: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub act: Option<Box<ActClaim>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ConfirmationClaim {
+    jkt: String,
 }
 
 /// The minted claim contract the STS must preserve.
@@ -54,10 +61,21 @@ pub struct MintedClaims {
     pub exp: i64,
     pub jti: String,
     pub client_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub act: Option<ActClaim>,
+    #[serde(
+        default,
+        rename = "cnf",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_cnf_jkt",
+        deserialize_with = "deserialize_cnf_jkt"
+    )]
     pub cnf_jkt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_time: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub acr: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub amr: Vec<String>,
 }
 
@@ -240,6 +258,20 @@ pub fn build_scoped_payload(
     }
 }
 
+fn serialize_cnf_jkt<S>(value: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    value.as_ref().map(|jkt| ConfirmationClaim { jkt: jkt.clone() }).serialize(serializer)
+}
+
+fn deserialize_cnf_jkt<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<ConfirmationClaim>::deserialize(deserializer).map(|cnf| cnf.map(|value| value.jkt))
+}
+
 fn validate_target_value(value: &str) -> Result<String, CoreError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -349,34 +381,51 @@ mod tests {
             Some(build_act("chat-mcp", None)),
             Some("thumbprint".to_string()),
         );
-        let value = serde_json::to_value(payload_to_json(&payload)).unwrap();
+        let value = serde_json::to_value(&payload).unwrap();
         assert_eq!(value["sub"], "user@example.com");
         assert_eq!(value["act"]["sub"], "chat-mcp");
+        assert!(value["act"].get("iss").is_none());
+        assert!(value["act"].get("act").is_none());
         assert_eq!(value["client_id"], "chat-mcp");
         assert_eq!(value["cnf"]["jkt"], "thumbprint");
     }
 
-    fn payload_to_json(payload: &MintedClaims) -> serde_json::Value {
-        let act = payload.act.as_ref().map(act_to_json);
-        serde_json::json!({
-            "iss": payload.iss,
-            "sub": payload.sub,
-            "aud": payload.aud,
-            "scope": payload.scope,
-            "iat": payload.iat,
-            "exp": payload.exp,
-            "jti": payload.jti,
-            "client_id": payload.client_id,
-            "act": act,
-            "cnf": payload.cnf_jkt.as_ref().map(|jkt| serde_json::json!({ "jkt": jkt })),
-        })
+    #[test]
+    fn payload_omits_absent_optional_claims() {
+        let payload = build_scoped_payload(
+            "https://sts.example/",
+            "user@example.com",
+            "api://chat-mcp",
+            "chat.read",
+            1,
+            2,
+            "jti-1",
+            "chat-mcp",
+            None,
+            None,
+        );
+        let value = serde_json::to_value(&payload).unwrap();
+        assert!(value.get("act").is_none());
+        assert!(value.get("cnf").is_none());
+        assert!(value.get("auth_time").is_none());
+        assert!(value.get("acr").is_none());
+        assert!(value.get("amr").is_none());
     }
 
-    fn act_to_json(act: &ActClaim) -> serde_json::Value {
-        serde_json::json!({
-            "sub": act.sub,
-            "iss": act.iss,
-            "act": act.act.as_deref().map(act_to_json),
-        })
+    #[test]
+    fn payload_deserializes_cnf_jkt_wire_shape() {
+        let value = serde_json::json!({
+            "iss": "https://sts.example/",
+            "sub": "user@example.com",
+            "aud": "api://chat-mcp",
+            "scope": "chat.read",
+            "iat": 1,
+            "exp": 2,
+            "jti": "jti-1",
+            "client_id": "chat-mcp",
+            "cnf": { "jkt": "thumbprint" }
+        });
+        let claims: MintedClaims = serde_json::from_value(value).unwrap();
+        assert_eq!(claims.cnf_jkt.as_deref(), Some("thumbprint"));
     }
 }

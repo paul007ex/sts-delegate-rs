@@ -227,6 +227,8 @@ impl IntoResponse for HttpError {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
         if let Some(retry_after) = self.retry_after {
             headers.insert("retry-after", HeaderValue::from_static(retry_after));
         }
@@ -1198,6 +1200,10 @@ mod tests {
         .expect("form");
         let response = post_token_form(state, body).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
         let body = read_json(response).await;
         assert_eq!(body["error"], "invalid_client");
     }
