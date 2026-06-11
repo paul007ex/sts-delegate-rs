@@ -729,7 +729,7 @@ fn record_client_assertion_replay(
     state
         .replay
         .check_and_record(&format!("ca:{}:{jti}", claims.sub), claims.exp, now)
-        .map_err(map_replay_error)
+        .map_err(map_client_assertion_replay_error)
 }
 
 fn client_assertion_jti(claims: &AssertionClaims) -> Result<&str, HttpError> {
@@ -1011,6 +1011,16 @@ fn map_replay_error(err: sts_replay::ReplayError) -> HttpError {
     match err.kind {
         ReplayErrorKind::InvalidRequest | ReplayErrorKind::ReplayDetected => {
             HttpError::invalid_request(err.message)
+        }
+        ReplayErrorKind::StoreFull => HttpError::service_unavailable(err.message),
+    }
+}
+
+fn map_client_assertion_replay_error(err: sts_replay::ReplayError) -> HttpError {
+    match err.kind {
+        ReplayErrorKind::InvalidRequest => HttpError::invalid_client(err.message),
+        ReplayErrorKind::ReplayDetected => {
+            HttpError::invalid_client("client_assertion replay detected")
         }
         ReplayErrorKind::StoreFull => HttpError::service_unavailable(err.message),
     }

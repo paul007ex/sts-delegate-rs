@@ -1042,6 +1042,47 @@ async fn contract_impersonation_policy_rejects_wrong_target_and_subject() {
 }
 
 #[tokio::test]
+async fn contract_client_assertion_jti_is_not_burned_by_late_target_failure() {
+    let (state, subject_signer, actor_signer, client_signer) = test_state();
+    let now = unix_now();
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let client_assertion = signed_assertion(&client_signer, now, "client-late-target-retry");
+
+    let form = |actor_jti: &str, audience: &str| {
+        let actor_token = signed_assertion(&actor_signer, now, actor_jti);
+        serde_urlencoded::to_string([
+            ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+            ("subject_token", subject_token.as_str()),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("actor_token", actor_token.as_str()),
+            ("actor_token_type", JWT_TOKEN_TYPE),
+            ("audience", audience),
+            ("scope", "chat.read"),
+            ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+            ("client_assertion", client_assertion.as_str()),
+            ("client_id", "chat-mcp"),
+        ])
+        .expect("form")
+    };
+
+    let rejected =
+        post_token_form(state.clone(), form("actor-late-target-reject", "api://evil")).await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let body = read_json(rejected).await;
+    assert_eq!(body["error"], "invalid_target");
+
+    let accepted =
+        post_token_form(state.clone(), form("actor-late-target-success", "api://chat-mcp")).await;
+    assert_eq!(accepted.status(), StatusCode::OK);
+
+    let replay = post_token_form(state, form("actor-late-target-replay", "api://chat-mcp")).await;
+    assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+    let body = read_json(replay).await;
+    assert_eq!(body["error"], "invalid_client");
+    assert!(body["error_description"].as_str().unwrap_or("").contains("replay"));
+}
+
+#[tokio::test]
 async fn contract_token_errors_are_oauth_json_and_no_store() {
     let (state, _, _, _) = test_state();
     let body = serde_urlencoded::to_string([("grant_type", "bad")]).expect("form");
