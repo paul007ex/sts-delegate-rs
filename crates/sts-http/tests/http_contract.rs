@@ -874,6 +874,83 @@ async fn contract_impersonation_omits_act_claim() {
 }
 
 #[tokio::test]
+async fn contract_both_mode_dispatches_by_actor_token_presence() {
+    let (mut state, subject_signer, actor_signer, client_signer) = test_state();
+    state.config.token_exchange_mode = TokenExchangeMode::Both;
+    let now = unix_now();
+
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let actor_token = signed_assertion(&actor_signer, now, "actor-both-dispatch-delegation");
+    let delegation_body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", actor_token.as_str()),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+    ])
+    .expect("form");
+
+    let response = post_token_form(state.clone(), delegation_body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = read_json(response).await;
+    let token = response_body["access_token"].as_str().expect("access token");
+    let payload = jwt_segment(token, 1);
+    assert_eq!(payload["act"], json!({"sub": "chat-mcp"}));
+
+    let mut impersonation_state = state.clone();
+    allow_impersonation_anywhere(&mut impersonation_state, "chat-mcp");
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let client_assertion =
+        signed_assertion(&client_signer, now, "client-both-dispatch-impersonation");
+    let impersonation_body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+        ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+        ("client_assertion", client_assertion.as_str()),
+        ("client_id", "chat-mcp"),
+    ])
+    .expect("form");
+
+    let response = post_token_form(impersonation_state.clone(), impersonation_body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = read_json(response).await;
+    let token = response_body["access_token"].as_str().expect("access token");
+    let payload = jwt_segment(token, 1);
+    assert_eq!(payload["client_id"], "chat-mcp");
+    assert!(payload.get("act").is_none(), "impersonation must omit act");
+
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let client_assertion = signed_assertion(&client_signer, now, "client-both-empty-actor-token");
+    let malformed_body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+        ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+        ("client_assertion", client_assertion.as_str()),
+        ("client_id", "chat-mcp"),
+        ("actor_token", ""),
+    ])
+    .expect("form");
+
+    let response = post_token_form(impersonation_state, malformed_body).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_request");
+    assert_eq!(body["error_description"], "actor_token must be a non-empty string");
+    assert!(
+        body.get("access_token").is_none(),
+        "malformed delegation-shaped request must not mint an impersonation token"
+    );
+}
+
+#[tokio::test]
 async fn contract_dpop_impersonation_binds_token_without_act_claim() {
     let (mut state, subject_signer, _, client_signer) = test_state();
     state.config.token_exchange_mode = TokenExchangeMode::Impersonation;

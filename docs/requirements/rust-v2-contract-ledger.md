@@ -124,7 +124,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-094 | Impersonation mode requires private_key_jwt client auth. | must | implemented | http | Python `tests/test_impersonation.py:395`; issue #12 | impersonation tests | Actor-token-only cannot impersonate. |
 | R-095 | `both` mode dispatches to delegation when actor_token is present. | policy | implemented | http/config | Python `tests/test_impersonation.py:434`; `crates/sts-config/src/lib.rs:75` | HTTP tests | Empty actor_token is present malformed. |
 | R-096 | `both` mode dispatches to impersonation when actor_token is absent and client assertion exists. | policy | implemented | http/config | Python `tests/test_impersonation.py:444` | HTTP tests | Missing policy still denies. |
-| R-097 | Empty present actor_token must not be treated as absent impersonation. | must-not | open | http | Python `tests/test_impersonation.py:458` | missing Rust test | Add parity negative test. |
+| R-097 | Empty present actor_token must not be treated as absent impersonation. | must-not | implemented | http | Python `tests/test_impersonation.py:458` | `contract_both_mode_dispatches_by_actor_token_presence` | Present-empty remains malformed and mints no token. |
 | R-098 | Impersonation policy is deny-by-default when no client entry exists. | must | implemented | config/http | issue #12; Python `tests/test_impersonation.py:316` | impersonation tests | Wrong client is invalid_request. |
 | R-099 | Impersonation policy supports per-client target allowlists. | must | implemented | config/http | issue #12; `crates/sts-config/src/lib.rs:114` | impersonation policy tests | Wrong target maps invalid_target. |
 | R-100 | Impersonation policy supports per-client subject allowlists. | must | implemented | config/http | issue #12; `crates/sts-config/src/lib.rs:120` | impersonation policy tests | Wrong subject maps invalid_request. |
@@ -240,7 +240,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | E-10 | Actor/client registry has overlapping prefixes | longest identity prefix wins | Rust verify test | R-088, R-089 |
 | E-11 | Missing impersonation policy selector field | empty set, deny | Rust config | R-098 |
 | E-12 | Impersonation selector `"*"` | any for that selector | Rust/Python config tests | R-101 |
-| E-13 | Empty present actor_token in both mode | malformed, not impersonation | Python impersonation | R-097 |
+| E-13 | Empty present actor_token in both mode | malformed, not impersonation | Python impersonation; Rust HTTP contract | R-097 |
 | E-14 | Auth-context absent | omit `auth_time`, `acr`, `amr` | Python integration; Rust core | R-073 |
 | E-15 | Subject expires before default TTL | cap minted exp and expires_in | Python integration | R-075, R-077 |
 | E-16 | Actor expires before default TTL | cap minted exp | Python integration | R-076 |
@@ -299,13 +299,12 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | Python #210 | bug/parity | Scoped token cannot outlive subject | Token lifetime | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
 | Python #280 | bug/parity | Scoped token cannot outlive actor | Token lifetime | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
 | Python #279 | bug/parity | `expires_in` must reflect capped lifetime | Token response | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
-| Python #580 | bug/parity | Empty actor_token is present malformed | Mode dispatch | open in Rust ledger | Add Rust contract test. |
+| Python #580 | bug/parity | Empty actor_token is present malformed | Mode dispatch | implemented in Rust contract | Keep #15 both-mode dispatch test in release gate. |
 | Python #602 | bug/parity | DPoP jti/proof anti-DoS and replay key bounds | DPoP/replay | implemented in Rust | Keep DPoP tests. |
 
 ## Current Freeze Gaps
 
 - Rust still needs an explicit catch-all clean 500 test for unexpected HTTP failures.
-- Rust still needs explicit both-mode empty actor_token parity coverage.
 - Rust still needs #13 config issuer validation for query, fragment, and non-loopback HTTP values.
 - Native PQC signing/JWKS/downstream verification is missing; only fail-closed selection is shipped.
 - CLI/ops helpers are only a crate boundary, not a complete product surface.
