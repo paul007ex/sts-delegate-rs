@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "crates/sts-core",
+    "crates/sts-jose",
+    "crates/sts-verify",
+    "crates/sts-replay",
+    "crates/sts-config",
+    "crates/sts-http",
+    "crates/sts-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
