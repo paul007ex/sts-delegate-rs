@@ -8,13 +8,14 @@ use p256::ecdsa::SigningKey;
 use p256::pkcs8::EncodePrivateKey;
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::sync::Arc;
 use sts_config::{
     ConfigSource, ImpersonationPolicyEntry, ImpersonationSelector, RuntimeConfig, TokenExchangeMode,
 };
 use sts_core::{ACCESS_TOKEN_TYPE, JWT_TOKEN_TYPE, MintedClaims, TOKEN_EXCHANGE_GRANT_TYPE};
 use sts_http::{HttpState, router};
 use sts_jose::{JoseError, JoseErrorKind, JoseSigner, JwksDocument, RsaJoseSigner};
-use sts_replay::ReplayPolicy;
+use sts_replay::{FileReplayStore, ReplayPolicy};
 use tower::ServiceExt;
 
 #[derive(Debug, Clone, Serialize)]
@@ -1023,6 +1024,78 @@ async fn contract_dpop_replay_reuses_holder_key_and_jti_fail_closed() {
 }
 
 #[tokio::test]
+async fn contract_actor_replay_is_shared_across_file_backed_replicas() {
+    let (mut replica1, subject_signer, actor_signer, _) = test_state();
+    let mut replica2 = replica1.clone();
+    let dir = unique_test_dir("actor-shared-replay");
+    replica1.replay =
+        Arc::new(ReplayPolicy::new(FileReplayStore::new(&dir, 64, 1).expect("replica1 replay")));
+    replica2.replay =
+        Arc::new(ReplayPolicy::new(FileReplayStore::new(&dir, 64, 1).expect("replica2 replay")));
+    let now = unix_now();
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let actor_token = signed_assertion(&actor_signer, now, "actor-shared-replay");
+    let body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", actor_token.as_str()),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+    ])
+    .expect("form");
+
+    let first = post_token_form(replica1, body.clone()).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let replay = post_token_form(replica2, body).await;
+    assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+    let body = read_json(replay).await;
+    assert_eq!(body["error"], "invalid_request");
+    assert!(body["error_description"].as_str().unwrap_or("").contains("replay"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn contract_dpop_replay_is_shared_across_file_backed_replicas() {
+    let (mut replica1, subject_signer, actor_signer, _) = test_state();
+    let mut replica2 = replica1.clone();
+    let dir = unique_test_dir("dpop-shared-replay");
+    replica1.replay =
+        Arc::new(ReplayPolicy::new(FileReplayStore::new(&dir, 64, 1).expect("replica1 replay")));
+    replica2.replay =
+        Arc::new(ReplayPolicy::new(FileReplayStore::new(&dir, 64, 1).expect("replica2 replay")));
+    let now = unix_now();
+    let proof = dpop_proof(now, "dpop-shared-replay", "POST", "https://sts.example/token");
+
+    for (state, actor_jti, expected) in [
+        (replica1, "actor-dpop-shared-1", StatusCode::OK),
+        (replica2, "actor-dpop-shared-2", StatusCode::BAD_REQUEST),
+    ] {
+        let subject_token = signed_subject_token(&subject_signer, now);
+        let actor_token = signed_assertion(&actor_signer, now, actor_jti);
+        let body = serde_urlencoded::to_string([
+            ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+            ("subject_token", subject_token.as_str()),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("actor_token", actor_token.as_str()),
+            ("actor_token_type", JWT_TOKEN_TYPE),
+            ("audience", "api://chat-mcp"),
+            ("scope", "chat.read"),
+        ])
+        .expect("form");
+        let response = post_token_form_with_dpop_values(state, body, &[&proof]).await;
+        assert_eq!(response.status(), expected);
+        if expected == StatusCode::BAD_REQUEST {
+            let body = read_json(response).await;
+            assert_eq!(body["error"], "invalid_dpop_proof");
+            assert!(body["error_description"].as_str().unwrap_or("").contains("replay"));
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn contract_dpop_duplicate_or_malformed_header_is_invalid_dpop_proof() {
     let (state, _, _, _) = test_state();
     let body = serde_urlencoded::to_string([
@@ -1045,6 +1118,10 @@ async fn contract_dpop_duplicate_or_malformed_header_is_invalid_dpop_proof() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body_json = read_json(response).await;
     assert_eq!(body_json["error"], "invalid_dpop_proof");
+}
+
+fn unique_test_dir(label: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("sts-http-{label}-{}", std::process::id()))
 }
 
 #[tokio::test]

@@ -7,6 +7,9 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
@@ -131,6 +134,120 @@ impl ReplayStore for InMemoryReplayStore {
     }
 }
 
+/// File-backed replay store for multi-replica deployments sharing a POSIX directory.
+///
+/// The caller-controlled replay key is hashed before it becomes a filename. Recording
+/// uses `create_new` so two processes racing on the same key get exactly one winner.
+#[derive(Debug)]
+pub struct FileReplayStore {
+    dir: PathBuf,
+    max_seen: usize,
+    sweep_every: usize,
+    calls_since_sweep: Mutex<usize>,
+}
+
+impl FileReplayStore {
+    pub fn new(
+        dir: impl Into<PathBuf>,
+        max_seen: usize,
+        sweep_every: usize,
+    ) -> Result<Self, ReplayError> {
+        let dir = dir.into();
+        fs::create_dir_all(&dir).map_err(|_| replay_store_unavailable())?;
+        if !dir.is_dir() {
+            return Err(replay_store_unavailable());
+        }
+        Ok(Self {
+            dir,
+            max_seen,
+            sweep_every: sweep_every.max(1),
+            calls_since_sweep: Mutex::new(0),
+        })
+    }
+
+    fn path_for_jti(&self, jti: &str) -> PathBuf {
+        self.dir.join(replay_filename(jti))
+    }
+
+    fn sweep_expired(&self, now: i64) -> Result<(), ReplayError> {
+        let entries = fs::read_dir(&self.dir).map_err(|_| replay_store_unavailable())?;
+        for entry in entries {
+            let entry = entry.map_err(|_| replay_store_unavailable())?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if read_exp(&path).is_some_and(|exp| exp < now) {
+                remove_replay_file(&path)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn maybe_sweep(&self, now: i64) -> Result<(), ReplayError> {
+        let mut calls_since_sweep =
+            self.calls_since_sweep.lock().map_err(|_| replay_store_unavailable())?;
+        *calls_since_sweep += 1;
+        if *calls_since_sweep >= self.sweep_every {
+            self.sweep_expired(now)?;
+            *calls_since_sweep = 0;
+        }
+        Ok(())
+    }
+
+    fn active_entry_count(&self) -> Result<usize, ReplayError> {
+        let entries = fs::read_dir(&self.dir).map_err(|_| replay_store_unavailable())?;
+        let mut count = 0;
+        for entry in entries {
+            let entry = entry.map_err(|_| replay_store_unavailable())?;
+            if entry.path().is_file() {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+}
+
+impl ReplayStore for FileReplayStore {
+    fn check_and_record(&self, jti: &str, exp: i64, now: i64) -> Result<(), ReplayError> {
+        if jti.trim().is_empty() {
+            return Err(ReplayError::new(ReplayErrorKind::InvalidRequest, "jti must not be empty"));
+        }
+
+        self.maybe_sweep(now)?;
+        if self.active_entry_count()? >= self.max_seen {
+            self.sweep_expired(now)?;
+        }
+        if self.active_entry_count()? >= self.max_seen {
+            return Err(ReplayError::new(
+                ReplayErrorKind::StoreFull,
+                "replay store full, retry shortly",
+            ));
+        }
+
+        let path = self.path_for_jti(jti);
+        if read_exp(&path).is_some_and(|stored_exp| stored_exp < now) {
+            remove_replay_file(&path)?;
+        }
+
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                writeln!(file, "{exp}").map_err(|_| replay_store_unavailable())?;
+                Ok(())
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => Err(ReplayError::new(
+                ReplayErrorKind::ReplayDetected,
+                "actor_token replay detected",
+            )),
+            Err(_) => Err(replay_store_unavailable()),
+        }
+    }
+
+    fn cache_size(&self) -> usize {
+        self.active_entry_count().unwrap_or(0)
+    }
+}
+
 fn replay_store_unavailable() -> ReplayError {
     ReplayError::new(ReplayErrorKind::StoreFull, "replay store unavailable, retry shortly")
 }
@@ -179,6 +296,29 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+fn replay_filename(jti: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sts-replay-file-v1");
+    hasher.update([0]);
+    hasher.update(jti.as_bytes());
+    format!("{}.jti", hex_lower(&hasher.finalize()))
+}
+
+fn read_exp(path: &Path) -> Option<i64> {
+    let mut content = String::new();
+    let mut file = OpenOptions::new().read(true).open(path).ok()?;
+    file.read_to_string(&mut content).ok()?;
+    content.trim().parse::<i64>().ok()
+}
+
+fn remove_replay_file(path: &Path) -> Result<(), ReplayError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(replay_store_unavailable()),
+    }
 }
 
 #[cfg(test)]
@@ -248,5 +388,54 @@ mod tests {
         assert!(key.starts_with("dpop:"));
         assert_eq!(key.len(), "dpop:".len() + 64);
         assert_ne!(key, dpop_replay_key("holder-thumbprintx", ""));
+    }
+
+    #[test]
+    fn file_store_records_once_across_instances_without_raw_jti_filename() {
+        let dir = unique_test_dir("file-store-records");
+        let store1 = FileReplayStore::new(&dir, 8, 4).expect("store1");
+        let store2 = FileReplayStore::new(&dir, 8, 4).expect("store2");
+
+        assert!(store1.check_and_record("act:chat-mcp:raw/jti-value", 10, 1).is_ok());
+        let err = store2.check_and_record("act:chat-mcp:raw/jti-value", 10, 1).unwrap_err();
+        assert_eq!(err.kind, ReplayErrorKind::ReplayDetected);
+
+        let names = fs::read_dir(&dir)
+            .expect("dir")
+            .map(|entry| entry.expect("entry").file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 1);
+        assert!(!names[0].contains("raw"));
+        assert!(!names[0].contains("chat-mcp"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn file_store_reuses_expired_entry_and_enforces_capacity() {
+        let dir = unique_test_dir("file-store-expiry");
+        let store = FileReplayStore::new(&dir, 1, 1).expect("store");
+
+        assert!(store.check_and_record("jti-1", 2, 1).is_ok());
+        assert!(store.check_and_record("jti-1", 10, 3).is_ok());
+        let err = store.check_and_record("jti-2", 10, 3).unwrap_err();
+        assert_eq!(err.kind, ReplayErrorKind::StoreFull);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn file_store_fails_closed_when_directory_is_unavailable() {
+        let dir = unique_test_dir("file-store-unavailable");
+        let store = FileReplayStore::new(&dir, 8, 4).expect("store");
+        fs::remove_dir_all(&dir).expect("remove dir");
+
+        let err = store.check_and_record("jti-1", 10, 1).unwrap_err();
+        assert_eq!(err.kind, ReplayErrorKind::StoreFull);
+        assert_eq!(err.message, "replay store unavailable, retry shortly");
+    }
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let unique =
+            format!("sts-replay-{label}-{}-{:?}", std::process::id(), std::thread::current().id());
+        std::env::temp_dir().join(unique)
     }
 }

@@ -164,7 +164,27 @@ Interactive docs routes such as `/docs` and `/redoc` are not served by default.
 
 Prometheus-style metrics are opt-in with `STS_ENABLE_METRICS=true`; when enabled,
 `/metrics` reports exchange outcomes, denial counts by OAuth error code, and the
-current in-process replay-cache size. When disabled, `/metrics` is absent.
+current replay-cache size. When disabled, `/metrics` is absent.
+
+Replay storage defaults to in-process memory, which is suitable only for local and
+single-replica deployments:
+
+```bash
+STS_REPLAY_BACKEND=memory
+```
+
+For multi-replica deployments, configure a shared file-backed replay directory on a
+POSIX shared volume. The replay crate hashes caller-controlled replay keys before
+using them as filenames and records with atomic create-new semantics:
+
+```bash
+STS_REPLAY_BACKEND=file
+STS_REPLAY_DIR=/var/lib/sts-delegate/replay
+```
+
+If the shared replay directory is unavailable at startup or while serving, replay
+enforcement fails closed with service-unavailable semantics. Do not run more than
+one STS replica on the default in-memory backend.
 
 ## Operator CLI
 

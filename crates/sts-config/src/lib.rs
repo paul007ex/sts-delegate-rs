@@ -90,6 +90,13 @@ pub enum ClientAuthPolicy {
     ActorTokenAllowed,
 }
 
+/// Replay storage backend selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplayBackend {
+    Memory,
+    File { dir: PathBuf },
+}
+
 /// Policy rows for a single target audience.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetPolicyEntry {
@@ -199,6 +206,7 @@ pub struct RuntimeConfig {
     pub jwks_cache_max_age: i64,
     pub assertion_max_ttl: i64,
     pub max_seen_jti: usize,
+    pub replay_backend: ReplayBackend,
     pub max_token_len: usize,
     pub require_subject_binding: bool,
     pub subject_scope_bound_required: bool,
@@ -352,6 +360,7 @@ impl RuntimeConfig {
                 Some(1),
                 None,
             )?,
+            replay_backend: parse_replay_backend(source)?,
             max_token_len: parse_env_usize(
                 source,
                 "MAX_TOKEN_LEN",
@@ -538,6 +547,32 @@ fn parse_client_auth_policy(source: &ConfigSource) -> Result<ClientAuthPolicy, C
             format!(
                 "must be auto, actor_token_allowed, or private_key_jwt_required; got {other:?}"
             ),
+        )),
+    }
+}
+
+fn parse_replay_backend(source: &ConfigSource) -> Result<ReplayBackend, ConfigError> {
+    let raw = source.get("STS_REPLAY_BACKEND").unwrap_or("memory");
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "memory" | "in_memory" => Ok(ReplayBackend::Memory),
+        "file" => {
+            let raw_dir = source
+                .get("STS_REPLAY_DIR")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ConfigError::new(
+                        ConfigErrorKind::MissingEnv,
+                        Some("STS_REPLAY_DIR".to_string()),
+                        "set STS_REPLAY_DIR when STS_REPLAY_BACKEND=file",
+                    )
+                })?;
+            Ok(ReplayBackend::File { dir: PathBuf::from(raw_dir) })
+        }
+        other => Err(ConfigError::new(
+            ConfigErrorKind::InvalidValue,
+            Some("STS_REPLAY_BACKEND".to_string()),
+            format!("must be memory or file; got {other:?}"),
         )),
     }
 }
@@ -875,6 +910,28 @@ mod tests {
         assert_eq!(cfg.actor_id, "chat-mcp");
         assert_eq!(cfg.target_policy.targets.len(), 1);
         assert_eq!(cfg.client_ids.len(), 1);
+        assert_eq!(cfg.replay_backend, ReplayBackend::Memory);
+    }
+
+    #[test]
+    fn replay_backend_file_requires_directory() {
+        let source = ConfigSource::from_pairs([("STS_REPLAY_BACKEND", "file")]);
+        let err = parse_replay_backend(&source).unwrap_err();
+        assert_eq!(err.kind, ConfigErrorKind::MissingEnv);
+        assert_eq!(err.key.as_deref(), Some("STS_REPLAY_DIR"));
+    }
+
+    #[test]
+    fn replay_backend_file_parses_directory() {
+        let source = ConfigSource::from_pairs([
+            ("STS_REPLAY_BACKEND", "file"),
+            ("STS_REPLAY_DIR", "/var/lib/sts-delegate/replay"),
+        ]);
+        let backend = parse_replay_backend(&source).expect("backend");
+        assert_eq!(
+            backend,
+            ReplayBackend::File { dir: PathBuf::from("/var/lib/sts-delegate/replay") }
+        );
     }
 
     fn minimal_source_with_sts_issuer(issuer: &str) -> ConfigSource {

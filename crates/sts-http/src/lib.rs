@@ -27,7 +27,9 @@ use http::header::{
 use http::{HeaderMap, StatusCode};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sts_config::{ClientAuthPolicy, ConfigError, ConfigSource, RuntimeConfig, TokenExchangeMode};
+use sts_config::{
+    ClientAuthPolicy, ConfigError, ConfigSource, ReplayBackend, RuntimeConfig, TokenExchangeMode,
+};
 use sts_core::{
     ACCESS_TOKEN_TYPE, ActClaim, ExchangeRequest, JWT_TOKEN_TYPE, TOKEN_EXCHANGE_GRANT_TYPE,
     build_act, build_scoped_payload, downscope, resolve_target,
@@ -41,7 +43,10 @@ use sts_jose::{
     BackendSelection, JoseError, JoseSigner, JwksDocument, PublicJwk, RsaJoseSigner,
     rsa_public_key_bits_from_jwk, validate_public_jwk,
 };
-use sts_replay::{InMemoryReplayStore, ReplayErrorKind, ReplayPolicy, dpop_replay_key};
+use sts_replay::{
+    FileReplayStore, InMemoryReplayStore, ReplayError, ReplayErrorKind, ReplayPolicy,
+    dpop_replay_key,
+};
 use sts_verify::{
     AssertionClaims, AssertionVerificationOptions, SubjectTokenClaims, VerifyError,
     VerifyErrorKind, inbound_jwt_signing_algs, resolve_idp_jwks, verify_assertion,
@@ -212,7 +217,7 @@ impl MetricsState {
             ));
         }
         output.push_str(
-            "# HELP sts_replay_cache_size Unexpired jtis currently held in the in-process replay cache\n",
+            "# HELP sts_replay_cache_size Unexpired jtis currently held in the active replay cache\n",
         );
         output.push_str("# TYPE sts_replay_cache_size gauge\n");
         output.push_str(&format!("sts_replay_cache_size {replay_cache_size}\n"));
@@ -256,6 +261,7 @@ pub enum BootstrapError {
     Config(ConfigError),
     Jose(JoseError),
     Verify(VerifyError),
+    Replay(ReplayError),
     Io { path: PathBuf, message: String },
     InvalidJwks { label: String, message: String },
     InvalidBind { message: String },
@@ -267,6 +273,7 @@ impl fmt::Display for BootstrapError {
             Self::Config(err) => write!(f, "config error: {err}"),
             Self::Jose(err) => write!(f, "JOSE error: {err}"),
             Self::Verify(err) => write!(f, "verification error: {err}"),
+            Self::Replay(err) => write!(f, "replay error: {err}"),
             Self::Io { path, message } => write!(f, "IO error for {}: {message}", path.display()),
             Self::InvalidJwks { label, message } => write!(f, "invalid {label}: {message}"),
             Self::InvalidBind { message } => write!(f, "invalid bind address: {message}"),
@@ -291,6 +298,12 @@ impl From<JoseError> for BootstrapError {
 impl From<VerifyError> for BootstrapError {
     fn from(value: VerifyError) -> Self {
         Self::Verify(value)
+    }
+}
+
+impl From<ReplayError> for BootstrapError {
+    fn from(value: ReplayError) -> Self {
+        Self::Replay(value)
     }
 }
 
@@ -322,7 +335,7 @@ pub async fn build_state_from_config(config: RuntimeConfig) -> Result<HttpState,
         "client JWKS",
         config.allow_insecure_client_jwks,
     )?;
-    let replay = ReplayPolicy::new(InMemoryReplayStore::new(config.max_seen_jti, 256));
+    let replay = build_replay_policy(&config)?;
     Ok(HttpState::new_with_signer_arc(
         config,
         signer,
@@ -332,6 +345,17 @@ pub async fn build_state_from_config(config: RuntimeConfig) -> Result<HttpState,
         client_jwks,
         replay,
     ))
+}
+
+fn build_replay_policy(config: &RuntimeConfig) -> Result<ReplayPolicy, BootstrapError> {
+    match &config.replay_backend {
+        ReplayBackend::Memory => {
+            Ok(ReplayPolicy::new(InMemoryReplayStore::new(config.max_seen_jti, 256)))
+        }
+        ReplayBackend::File { dir } => {
+            Ok(ReplayPolicy::new(FileReplayStore::new(dir, config.max_seen_jti, 256)?))
+        }
+    }
 }
 
 /// Start the production HTTP server from process environment.
