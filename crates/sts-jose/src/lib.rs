@@ -3,8 +3,9 @@
 //! JOSE/JWK/JWKS, signing, and backend-selection crate for `sts-delegate-rs`.
 //!
 //! This crate owns the signing surface and fail-closed backend selection. The
-//! default backend is RS256; RFC 9964 ML-DSA support is available only behind
-//! the explicit `pqc-openssl-unstable` feature and never falls back to RS256.
+//! default backend is RFC 9964 ML-DSA-65 when the default PQC feature is built.
+//! Classical RS256 remains available only through explicit selection and a PQC
+//! selection never falls back to RS256.
 
 use std::fmt;
 use std::sync::Arc;
@@ -30,6 +31,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use simple_asn1::{ASN1Block, BigInt, BigUint};
 use sts_core::MintedClaims;
 
+pub const DEFAULT_STS_SIGNING_ALG: &str = "ML-DSA-65";
+
 /// The signing backend requested by policy/config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendSelection {
@@ -41,7 +44,8 @@ impl BackendSelection {
     pub fn parse(value: &str) -> Self {
         let trimmed = value.trim();
         match trimmed.to_ascii_lowercase().as_str() {
-            "" | "classical" | "rs256" => Self::Classical,
+            "" => Self::RequestedPqc(DEFAULT_STS_SIGNING_ALG.to_string()),
+            "classical" | "rs256" => Self::Classical,
             other if other.starts_with("ml-dsa") || other.starts_with("pqc") => {
                 Self::RequestedPqc(trimmed.to_string())
             }
@@ -1802,21 +1806,30 @@ mod tests {
     }
 
     #[test]
-    fn classical_backend_parses_as_classical() {
-        assert!(matches!(BackendSelection::parse(""), BackendSelection::Classical));
+    fn default_backend_parses_as_pqc() {
+        assert_eq!(
+            BackendSelection::parse(""),
+            BackendSelection::RequestedPqc(DEFAULT_STS_SIGNING_ALG.to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_classical_backend_parses_as_classical() {
         assert!(matches!(BackendSelection::parse("RS256"), BackendSelection::Classical));
+        assert!(matches!(BackendSelection::parse("classical"), BackendSelection::Classical));
     }
 
     #[cfg(not(feature = "pqc-openssl-unstable"))]
     #[test]
     fn pqc_backend_selector_fails_closed() {
-        let err = resolve_backend(&BackendSelection::parse("ML-DSA-65")).unwrap_err();
+        let err = resolve_backend(&BackendSelection::parse("")).unwrap_err();
         assert_eq!(err.kind, JoseErrorKind::UnsupportedAlgorithm);
     }
 
     #[cfg(feature = "pqc-openssl-unstable")]
     #[test]
     fn concrete_pqc_backend_selector_is_available_when_feature_enabled() {
+        resolve_backend(&BackendSelection::parse("")).expect("default backend");
         resolve_backend(&BackendSelection::parse("ML-DSA-65")).expect("backend");
         let err = resolve_backend(&BackendSelection::parse("pqc")).unwrap_err();
         assert_eq!(err.kind, JoseErrorKind::UnsupportedAlgorithm);

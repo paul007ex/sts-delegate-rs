@@ -25,7 +25,9 @@ const DEFAULT_JWKS_CACHE_MAX_AGE: i64 = 300;
 const DEFAULT_ASSERTION_MAX_TTL: i64 = 300;
 const DEFAULT_MAX_SEEN_JTI: usize = 100_000;
 const DEFAULT_MAX_TOKEN_LEN: usize = 8_192;
+pub const DEFAULT_STS_SIGNING_ALG: &str = "ML-DSA-65";
 const DEFAULT_PQC_PREFERRED_ALGS: &str = "ML-DSA-65,ML-DSA-87,ML-DSA-44";
+const DEFAULT_PQC_PREFERRED: bool = true;
 
 /// Stable configuration failure categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,8 +341,13 @@ impl RuntimeConfig {
             client_auth_policy: parse_client_auth_policy(source)?,
             impersonation_policy: parse_impersonation_policy(source)?,
             target_policy: load_target_policy_from_source(source)?,
-            sts_signing_alg: source.get("STS_SIGNING_ALG").unwrap_or("").trim().to_string(),
-            pqc_preferred: parse_bool(source, "STS_PQC_PREFERRED", false),
+            sts_signing_alg: source
+                .get("STS_SIGNING_ALG")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(DEFAULT_STS_SIGNING_ALG)
+                .to_string(),
+            pqc_preferred: parse_bool(source, "STS_PQC_PREFERRED", DEFAULT_PQC_PREFERRED),
             allow_non_pqc: parse_allow_non_pqc(source),
             pqc_preferred_algs: parse_pqc_preferred_algs(source)?,
             sts_signing_provider: source
@@ -635,7 +642,7 @@ fn parse_bool(source: &ConfigSource, key: &str, default: bool) -> bool {
 }
 
 fn parse_allow_non_pqc(source: &ConfigSource) -> bool {
-    let pqc_preferred = parse_bool(source, "STS_PQC_PREFERRED", false);
+    let pqc_preferred = parse_bool(source, "STS_PQC_PREFERRED", DEFAULT_PQC_PREFERRED);
     parse_bool(source, "STS_ALLOW_NON_PQC", !pqc_preferred)
 }
 
@@ -1063,12 +1070,29 @@ mod tests {
         assert_eq!(cfg.client_ids.len(), 1);
         assert_eq!(cfg.our_kid, DEFAULT_KID);
         assert_eq!(cfg.sts_signing_provider, "file");
-        assert!(!cfg.pqc_preferred);
-        assert!(cfg.allow_non_pqc);
+        assert_eq!(cfg.sts_signing_alg, DEFAULT_STS_SIGNING_ALG);
+        assert!(cfg.pqc_preferred);
+        assert!(!cfg.allow_non_pqc);
         assert_eq!(cfg.pqc_preferred_algs, vec!["ML-DSA-65", "ML-DSA-87", "ML-DSA-44"]);
         assert!(cfg.sts_signing_public_jwks_file.is_none());
         assert!(cfg.mock_external_signer_key_file.is_none());
         assert_eq!(cfg.replay_backend, ReplayBackend::Memory);
+    }
+
+    #[test]
+    fn runtime_config_allows_explicit_classical_compatibility_override() {
+        let source = ConfigSource::from_pairs([
+            ("IDP_ISSUER", "https://issuer.example/oauth2/default"),
+            ("EXPECTED_SUBJECT_AUD", "api://obo"),
+            ("ACTOR_IDS", "chat-mcp"),
+            ("STS_SIGNING_ALG", "RS256"),
+            ("STS_PQC_PREFERRED", "false"),
+            ("STS_ALLOW_NON_PQC", "true"),
+        ]);
+        let cfg = RuntimeConfig::from_source(&source).expect("config");
+        assert_eq!(cfg.sts_signing_alg, "RS256");
+        assert!(!cfg.pqc_preferred);
+        assert!(cfg.allow_non_pqc);
     }
 
     #[test]

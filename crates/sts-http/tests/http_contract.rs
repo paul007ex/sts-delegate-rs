@@ -97,6 +97,9 @@ fn test_state() -> (HttpState, RsaJoseSigner, RsaJoseSigner, RsaJoseSigner) {
         ("ACTOR_IDS", "chat-mcp"),
         ("CLIENT_IDS", "chat-mcp"),
         ("OBO_STS_ISSUER", "https://sts.example"),
+        ("STS_SIGNING_ALG", "RS256"),
+        ("STS_PQC_PREFERRED", "false"),
+        ("STS_ALLOW_NON_PQC", "true"),
         (
             "TARGET_POLICY_JSON",
             r#"{"api://chat-mcp":{"allowed_scopes":["chat.read","chat.write"],"default_scopes":["chat.read"]}}"#,

@@ -22,6 +22,7 @@ const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-
 const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 const JWT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:jwt";
 const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+const DEFAULT_STS_SIGNING_ALG: &str = "ML-DSA-65";
 
 /// Operator/runtime CLI for `sts-delegate-rs`.
 #[derive(Debug, Parser)]
@@ -399,7 +400,7 @@ fn run_pqc_preflight() -> Result<String, CliError> {
         .ok()
         .map(|value| sanitize(value.trim()))
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "RS256(default)".to_string());
+        .unwrap_or_else(|| format!("{DEFAULT_STS_SIGNING_ALG}(default)"));
     let mut lines = vec![
         "pqc_preflight_status=ok".to_string(),
         format!("selected_sts_signing_alg={selected_alg}"),
@@ -2127,6 +2128,7 @@ mod tests {
             .await
             .expect("preflight");
         assert!(output.contains("pqc_preflight_status=ok"));
+        assert!(output.contains("selected_sts_signing_alg=ML-DSA-65(default)"));
         assert!(output.contains("pqc_openssl_feature_enabled=false"));
         assert!(output.contains("openssl_version=not_compiled"));
         assert!(output.contains("mldsa_sign_verify=not_compiled"));
@@ -2139,6 +2141,7 @@ mod tests {
             .await
             .expect("preflight");
         assert!(output.contains("pqc_preflight_status=ok"));
+        assert!(output.contains("selected_sts_signing_alg=ML-DSA-65(default)"));
         assert!(output.contains("pqc_openssl_feature_enabled=true"));
         assert!(output.contains("openssl_version=OpenSSL"));
         assert!(output.contains("ML-DSA-44_sign_verify=ok"));

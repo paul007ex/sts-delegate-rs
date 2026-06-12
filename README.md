@@ -1,6 +1,6 @@
 # sts-delegate-rs
 
-Rust-native successor to `sts-delegate`: an RFC 8693 token-exchange STS with OAuth 2.1-aligned token-endpoint behavior where applicable, explicit crate boundaries, contract-first migration from the Python oracle, classical RS256 signing by default, and opt-in RFC 9964 ML-DSA support behind an explicit experimental feature gate.
+Rust-native successor to `sts-delegate`: an RFC 8693 token-exchange STS with OAuth 2.1-aligned token-endpoint behavior where applicable, explicit crate boundaries, contract-first migration from the Python oracle, and PQC-first RFC 9964 ML-DSA signing by default.
 
 ## Workspace shape
 
@@ -48,8 +48,11 @@ same checks and starts the Axum server only after they pass.
 Required environment includes `IDP_ISSUER` or `OKTA_ISSUER`,
 `EXPECTED_SUBJECT_AUD`, `ACTOR_IDS` or `GATEWAY_ACTOR_ID`,
 `OBO_STS_KEY_FILE`, `ACTOR_JWKS_FILE`, and either `IDP_JWKS_FILE` or
-`IDP_JWKS_URI`/OIDC discovery. `STS_HTTP_ADDR` defaults to
-`127.0.0.1:8888`.
+`IDP_JWKS_URI`/OIDC discovery. The default `OBO_STS_KEY_FILE` content is an
+RFC 9964 AKP ML-DSA private JWK for `STS_SIGNING_ALG=ML-DSA-65`.
+Classical RS256 remains available only as an explicit compatibility mode by
+setting `STS_SIGNING_ALG=RS256`, `STS_PQC_PREFERRED=false`, and
+`STS_ALLOW_NON_PQC=true`. `STS_HTTP_ADDR` defaults to `127.0.0.1:8888`.
 
 ## Install and package locally
 
@@ -153,23 +156,32 @@ Reference Kubernetes raw manifests and a Terraform Kubernetes module live under
 `deploy/`. They mount config and secrets at runtime, keep `replicas=1` until
 shared replay is configured, and expect TLS termination at ingress.
 
-The default signing runtime is classical RS256. Experimental ML-DSA signing,
-AKP JWKS publication, and ML-DSA verification can be compiled with
-`pqc-openssl-unstable`; runtime selection then requires a concrete
-`STS_SIGNING_ALG` such as `ML-DSA-65` and an RFC 9964 AKP private JWK seed file
-with matching public material. The published JWKS contains only public `AKP`
-members (`kty`, `kid`, `use`, `alg`, `pub`) and never `priv`. This path uses
-OpenSSL 3.5+ ML-DSA through `openssl-rs` and is not a FIPS-validation claim.
+The default signing runtime is PQC ML-DSA-65. Default Cargo builds include the
+OpenSSL-backed `pqc-openssl-unstable` feature, and unset `STS_SIGNING_ALG`
+selects `ML-DSA-65(default)`. Startup requires an RFC 9964 AKP private JWK seed
+file with matching public material. The published JWKS contains only public
+`AKP` members (`kty`, `kid`, `use`, `alg`, `pub`) and never `priv`. This path
+uses OpenSSL 3.5+ ML-DSA through `openssl-rs` and is not a FIPS-validation claim.
+
+Builds made with `--no-default-features` or deployments with an RSA/PEM signing
+key fail closed under the default selector. They do not silently fall back to
+RS256. To run classical compatibility mode, configure it explicitly:
+
+```bash
+STS_SIGNING_ALG=RS256
+STS_PQC_PREFERRED=false
+STS_ALLOW_NON_PQC=true
+```
 
 PQC preference is STS/resource-server policy, not OAuth-standard client
 negotiation. Token requests must not contain a caller-selected minted-token
-signing algorithm. Operators can make PQC preferred and disable silent downgrade:
+signing algorithm. The default runtime is already PQC-preferred with non-PQC
+fallback disabled:
 
 ```bash
 STS_PQC_PREFERRED=true
 STS_ALLOW_NON_PQC=false
 STS_PQC_PREFERRED_ALGS=ML-DSA-65,ML-DSA-87,ML-DSA-44
-STS_SIGNING_ALG=ML-DSA-65
 ```
 
 Target policy can express downstream verification capability:
@@ -193,20 +205,20 @@ as `signing_alg_selected`, `pqc_fallback`, and a sanitized fallback reason.
 Check compiled PQC/OpenSSL readiness without loading deployment keys:
 
 ```bash
-cargo run -p sts-cli --features pqc-openssl-unstable -- pqc preflight
+cargo run -p sts-cli -- pqc preflight
 ```
 
 Generate and inspect a local ML-DSA signing key without printing private
 material:
 
 ```bash
-cargo run -p sts-cli --features pqc-openssl-unstable -- \
+cargo run -p sts-cli -- \
   pqc key generate \
   --alg ML-DSA-65 \
   --out ./secrets/sts_mldsa_private.json \
   --public-jwks-out ./secrets/sts_mldsa_public.jwks.json
 
-cargo run -p sts-cli --features pqc-openssl-unstable -- \
+cargo run -p sts-cli -- \
   pqc key inspect --file ./secrets/sts_mldsa_private.json
 ```
 
@@ -365,10 +377,12 @@ The canary builds or reuses `target/debug/sts-cli`, starts a fresh
 `sts-cli serve` on a random loopback port, fetches public Okta JWKS into a
 temporary file, generates an ephemeral actor key/JWKS for that process, performs
 Bearer and DPoP token exchange, verifies minted JWTs against the Rust `/jwks`,
-and confirms DPoP replay rejection. In `--pqc` mode it generates a temporary
-ML-DSA STS signing key, starts the server with `STS_PQC_PREFERRED=true` and
-`STS_ALLOW_NON_PQC=false`, and requires `signing_alg_selected=ML-DSA-65` with
-`pqc_fallback=false`. `--prove-mcp --require-mcp` additionally mints and
+and confirms DPoP replay rejection. When run without `--pqc`, the canary
+intentionally sets explicit RS256 compatibility values to preserve the
+Python-oracle classical smoke path. In `--pqc` mode it generates a temporary
+ML-DSA STS signing key, starts the server with the PQC runtime defaults, and
+requires `signing_alg_selected=ML-DSA-65` with `pqc_fallback=false`.
+`--prove-mcp --require-mcp` additionally mints and
 verifies one token per configured MCP server, then calls the FastMCP tools. By
 default the MCP inbound call uses the original Okta subject token, which matches
 the current configured gateway/backend contract. Use

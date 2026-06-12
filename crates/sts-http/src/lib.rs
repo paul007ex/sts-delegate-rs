@@ -1943,6 +1943,9 @@ mod tests {
 	            ("ACTOR_IDS", "chat-mcp".to_string()),
 	            ("OBO_STS_ISSUER", "http://localhost:8888".to_string()),
 	            ("OBO_STS_KEY_FILE", sts_key_file.display().to_string()),
+            ("STS_SIGNING_ALG", "RS256".to_string()),
+            ("STS_PQC_PREFERRED", "false".to_string()),
+            ("STS_ALLOW_NON_PQC", "true".to_string()),
             ("IDP_JWKS_FILE", idp_jwks_file.display().to_string()),
             ("ACTOR_JWKS_FILE", actor_jwks_file.display().to_string()),
             ("CLIENT_JWKS_FILE", actor_jwks_file.display().to_string()),
@@ -1974,6 +1977,9 @@ mod tests {
             "ACTOR_JWKS_FILE",
             "CLIENT_JWKS_FILE",
             "TARGET_POLICY_JSON",
+            "STS_SIGNING_ALG",
+            "STS_PQC_PREFERRED",
+            "STS_ALLOW_NON_PQC",
         ]
         .into_iter()
         .map(|key| (key.to_string(), base.get(key).expect("source key").to_string()))
@@ -2120,7 +2126,7 @@ mod tests {
 
     #[cfg(feature = "pqc-openssl-unstable")]
     #[tokio::test]
-    async fn bootstrap_loads_feature_gated_mldsa_signer() {
+    async fn bootstrap_defaults_to_mldsa_signer() {
         let dir = temp_bootstrap_dir("mldsa-key");
         let fixture = bootstrap_fixture(&dir);
         let mldsa_key_file = dir.join("sts-mldsa-private.json");
@@ -2144,9 +2150,12 @@ mod tests {
 	                .to_string(),
 	        ));
         pairs.push(("OBO_STS_KEY_FILE".to_string(), mldsa_key_file.display().to_string()));
-        pairs.push(("STS_SIGNING_ALG".to_string(), "ML-DSA-65".to_string()));
-        pairs.push(("STS_PQC_PREFERRED".to_string(), "true".to_string()));
         let source = ConfigSource::from_pairs(pairs);
+
+        let config = RuntimeConfig::from_source(&source).expect("config");
+        assert_eq!(config.sts_signing_alg, "ML-DSA-65");
+        assert!(config.pqc_preferred);
+        assert!(!config.allow_non_pqc);
 
         let state = build_state_from_source(&source).await.expect("bootstrap");
         assert_eq!(state.signer.alg(), "ML-DSA-65");
@@ -2273,6 +2282,9 @@ mod tests {
             ("EXPECTED_SUBJECT_AUD", "api://obo"),
             ("ACTOR_IDS", "chat-mcp"),
             ("OBO_STS_ISSUER", "https://sts.example"),
+            ("STS_SIGNING_ALG", "RS256"),
+            ("STS_PQC_PREFERRED", "false"),
+            ("STS_ALLOW_NON_PQC", "true"),
             (
                 "TARGET_POLICY_JSON",
                 r#"{"api://chat-mcp":{"allowed_scopes":["chat.read","chat.write"],"default_scopes":["chat.read"]}}"#,

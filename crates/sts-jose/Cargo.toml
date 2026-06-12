@@ -9,7 +9,7 @@ repository.workspace = true
 version.workspace = true
 
 [features]
-default = []
+default = ["pqc-openssl-unstable"]
 pqc-openssl-unstable = ["dep:openssl"]
 
 [dependencies]

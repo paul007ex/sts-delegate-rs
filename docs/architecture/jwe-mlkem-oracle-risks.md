@@ -4,8 +4,8 @@ Status: proposed for issue #80.
 
 ## Context
 
-`sts-delegate-rs` now has experimental ML-DSA JWS signing, AKP JWKS publication,
-and downstream verification behind `pqc-openssl-unstable`. That does not imply
+`sts-delegate-rs` now has OpenSSL-backed ML-DSA JWS signing, AKP JWKS publication,
+and downstream verification as the default signing path. That does not imply
 JWE, ML-KEM, HPKE, encrypt, or decrypt support. Adding public encryption or
 decryption routes to an STS would create a new cryptographic service boundary,
 not a small extension to `/token`.

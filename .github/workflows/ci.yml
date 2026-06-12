@@ -30,10 +30,7 @@ jobs:
       - name: Secure Rust audit loop
         run: python3 scripts/security_audit_loop.py
 
-      - name: Workspace tests
-        run: cargo test --workspace
-
-      - name: Install OpenSSL 3.5 for PQC all-features gates
+      - name: Install OpenSSL 3.5 for PQC default gates
         run: |
           set -euo pipefail
           OPENSSL_INSTALL_DIR="$RUNNER_TEMP/openssl-${OPENSSL_35_VERSION}-install"
@@ -51,6 +48,9 @@ jobs:
             echo "PKG_CONFIG_PATH=$OPENSSL_INSTALL_DIR/lib64/pkgconfig:$OPENSSL_INSTALL_DIR/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
             echo "LD_LIBRARY_PATH=$OPENSSL_INSTALL_DIR/lib64:$OPENSSL_INSTALL_DIR/lib:${LD_LIBRARY_PATH:-}"
           } >> "$GITHUB_ENV"
+
+      - name: Workspace tests
+        run: cargo test --workspace
 
       - name: Workspace all-features tests
         run: cargo test --workspace --all-features

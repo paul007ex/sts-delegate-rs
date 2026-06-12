@@ -556,8 +556,6 @@ def build_cli(skip_build: bool, *, pqc: bool) -> Path:
     binary = REPO / "target/debug/sts-cli"
     if not skip_build or not binary.exists():
         command = ["cargo", "build", "-p", "sts-cli"]
-        if pqc:
-            command.extend(["--features", "pqc-openssl-unstable"])
         completed = subprocess.run(
             command,
             cwd=REPO,
@@ -1009,6 +1007,14 @@ def run_live(args: argparse.Namespace) -> bool:
                     "STS_PQC_PREFERRED": "true",
                     "STS_ALLOW_NON_PQC": "false",
                     "STS_PQC_PREFERRED_ALGS": PQC_SIGNING_ALG,
+                }
+            )
+        else:
+            process_env.update(
+                {
+                    "STS_SIGNING_ALG": "RS256",
+                    "STS_PQC_PREFERRED": "false",
+                    "STS_ALLOW_NON_PQC": "true",
                 }
             )
 
