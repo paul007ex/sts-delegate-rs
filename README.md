@@ -84,10 +84,25 @@ gh release download "$release_tag" \
 shasum -a 256 -c SHA256SUMS
 ```
 
-Published GHCR images, Homebrew formulas, `cargo-binstall`, and crates.io
-publication are not shipped in this phase. Track those as separate release
-follow-ups instead of treating local archives, hosted CLI archives, or local
-Docker builds as those distribution channels.
+Homebrew users can install from the live `paul007ex/sts-delegate-rs` tap. The
+formula downloads the hosted release archive and verifies its checksum:
+
+```bash
+brew tap paul007ex/sts-delegate-rs
+brew install sts-cli
+brew test sts-cli
+```
+
+Without a separate tap step:
+
+```bash
+brew install paul007ex/sts-delegate-rs/sts-cli
+```
+
+Published GHCR images, `cargo-binstall`, and crates.io publication are not
+shipped in this phase. Track those as separate release follow-ups instead of
+treating local archives, hosted CLI archives, local Docker builds, or the direct
+Homebrew tap as those distribution channels.
 
 To build a local Docker image:
 
