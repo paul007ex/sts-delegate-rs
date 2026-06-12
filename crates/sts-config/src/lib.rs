@@ -28,6 +28,8 @@ const DEFAULT_MAX_TOKEN_LEN: usize = 8_192;
 pub const DEFAULT_STS_SIGNING_ALG: &str = "ML-DSA-65";
 const DEFAULT_PQC_PREFERRED_ALGS: &str = "ML-DSA-65,ML-DSA-87,ML-DSA-44";
 const DEFAULT_PQC_PREFERRED: bool = true;
+const DEFAULT_INBOUND_ASSERTION_ALG: &str = "ML-DSA-65";
+const DEFAULT_INBOUND_PQC_PREFERRED: bool = true;
 
 /// Stable configuration failure categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,6 +217,12 @@ pub struct RuntimeConfig {
     pub allow_non_pqc: bool,
     /// PQC algorithms allowed by this STS profile, in preference order.
     pub pqc_preferred_algs: Vec<String>,
+    /// Prefer PQC verification for inbound actor and client JWT assertions.
+    pub inbound_pqc_preferred: bool,
+    /// Permit explicit non-PQC inbound actor/client JWT assertions.
+    pub allow_non_pqc_inbound: bool,
+    /// Actor/client assertion JWS algorithms accepted by the verifier.
+    pub inbound_assertion_algs: Vec<String>,
     pub sts_signing_provider: String,
     pub sts_signing_public_jwks_file: Option<PathBuf>,
     pub mock_external_signer_key_file: Option<PathBuf>,
@@ -314,6 +322,12 @@ impl RuntimeConfig {
 
         let client_ids = parse_client_ids(source, &actor_ids);
 
+        let inbound_pqc_preferred =
+            parse_bool(source, "STS_INBOUND_PQC_PREFERRED", DEFAULT_INBOUND_PQC_PREFERRED);
+        let allow_non_pqc_inbound = parse_allow_non_pqc_inbound(source, inbound_pqc_preferred);
+        let inbound_assertion_algs =
+            parse_inbound_assertion_algs(source, inbound_pqc_preferred, allow_non_pqc_inbound)?;
+
         Ok(Self {
             idp_issuer,
             expected_subject_aud,
@@ -350,6 +364,9 @@ impl RuntimeConfig {
             pqc_preferred: parse_bool(source, "STS_PQC_PREFERRED", DEFAULT_PQC_PREFERRED),
             allow_non_pqc: parse_allow_non_pqc(source),
             pqc_preferred_algs: parse_pqc_preferred_algs(source)?,
+            inbound_pqc_preferred,
+            allow_non_pqc_inbound,
+            inbound_assertion_algs,
             sts_signing_provider: source
                 .get("STS_SIGNING_PROVIDER")
                 .unwrap_or("file")
@@ -657,6 +674,75 @@ fn parse_pqc_preferred_algs(source: &ConfigSource) -> Result<Vec<String>, Config
         ));
     }
     Ok(algs)
+}
+
+fn parse_allow_non_pqc_inbound(source: &ConfigSource, inbound_pqc_preferred: bool) -> bool {
+    parse_bool(source, "STS_ALLOW_NON_PQC_INBOUND", !inbound_pqc_preferred)
+}
+
+fn parse_inbound_assertion_algs(
+    source: &ConfigSource,
+    inbound_pqc_preferred: bool,
+    allow_non_pqc_inbound: bool,
+) -> Result<Vec<String>, ConfigError> {
+    let raw = source.get("STS_INBOUND_ASSERTION_ALGS").map(str::trim);
+    let mut algs = if let Some(raw) = raw.filter(|value| !value.is_empty()) {
+        split_csv_vec(raw)
+    } else {
+        let mut defaults = Vec::new();
+        if inbound_pqc_preferred {
+            defaults.push(DEFAULT_INBOUND_ASSERTION_ALG.to_string());
+        }
+        if allow_non_pqc_inbound {
+            defaults.push("RS256".to_string());
+        }
+        defaults
+    };
+    dedup_preserving_order(&mut algs);
+    if algs.is_empty() {
+        return Err(ConfigError::new(
+            ConfigErrorKind::InvalidValue,
+            Some("STS_INBOUND_ASSERTION_ALGS".to_string()),
+            "STS_INBOUND_ASSERTION_ALGS must contain at least one algorithm",
+        ));
+    }
+    for alg in &algs {
+        if !is_supported_inbound_assertion_alg(alg) {
+            return Err(ConfigError::new(
+                ConfigErrorKind::InvalidValue,
+                Some("STS_INBOUND_ASSERTION_ALGS".to_string()),
+                format!("unsupported inbound assertion signing algorithm {alg}"),
+            ));
+        }
+    }
+    if algs.iter().any(|alg| alg == "RS256") && !allow_non_pqc_inbound {
+        return Err(ConfigError::new(
+            ConfigErrorKind::InvalidValue,
+            Some("STS_INBOUND_ASSERTION_ALGS".to_string()),
+            "RS256 inbound assertions require STS_ALLOW_NON_PQC_INBOUND=true",
+        ));
+    }
+    if !allow_non_pqc_inbound && !algs.iter().any(|alg| is_pqc_inbound_assertion_alg(alg)) {
+        return Err(ConfigError::new(
+            ConfigErrorKind::InvalidValue,
+            Some("STS_INBOUND_ASSERTION_ALGS".to_string()),
+            "non-PQC inbound assertions are disabled, but no PQC assertion algorithm is configured",
+        ));
+    }
+    Ok(algs)
+}
+
+fn is_supported_inbound_assertion_alg(alg: &str) -> bool {
+    alg == "RS256" || is_pqc_inbound_assertion_alg(alg)
+}
+
+fn is_pqc_inbound_assertion_alg(alg: &str) -> bool {
+    matches!(alg, "ML-DSA-44" | "ML-DSA-65" | "ML-DSA-87")
+}
+
+fn dedup_preserving_order(values: &mut Vec<String>) {
+    let mut seen = BTreeSet::new();
+    values.retain(|value| seen.insert(value.clone()));
 }
 
 fn parse_bool_with_fallback(
@@ -1074,6 +1160,9 @@ mod tests {
         assert!(cfg.pqc_preferred);
         assert!(!cfg.allow_non_pqc);
         assert_eq!(cfg.pqc_preferred_algs, vec!["ML-DSA-65", "ML-DSA-87", "ML-DSA-44"]);
+        assert!(cfg.inbound_pqc_preferred);
+        assert!(!cfg.allow_non_pqc_inbound);
+        assert_eq!(cfg.inbound_assertion_algs, vec!["ML-DSA-65"]);
         assert!(cfg.sts_signing_public_jwks_file.is_none());
         assert!(cfg.mock_external_signer_key_file.is_none());
         assert_eq!(cfg.replay_backend, ReplayBackend::Memory);
@@ -1088,11 +1177,17 @@ mod tests {
             ("STS_SIGNING_ALG", "RS256"),
             ("STS_PQC_PREFERRED", "false"),
             ("STS_ALLOW_NON_PQC", "true"),
+            ("STS_INBOUND_PQC_PREFERRED", "false"),
+            ("STS_ALLOW_NON_PQC_INBOUND", "true"),
+            ("STS_INBOUND_ASSERTION_ALGS", "RS256"),
         ]);
         let cfg = RuntimeConfig::from_source(&source).expect("config");
         assert_eq!(cfg.sts_signing_alg, "RS256");
         assert!(!cfg.pqc_preferred);
         assert!(cfg.allow_non_pqc);
+        assert!(!cfg.inbound_pqc_preferred);
+        assert!(cfg.allow_non_pqc_inbound);
+        assert_eq!(cfg.inbound_assertion_algs, vec!["RS256"]);
     }
 
     #[test]
@@ -1122,6 +1217,35 @@ mod tests {
         let cfg = RuntimeConfig::from_source(&source).expect("config");
         assert!(cfg.pqc_preferred);
         assert!(cfg.allow_non_pqc);
+    }
+
+    #[test]
+    fn runtime_config_parses_pqc_inbound_assertion_policy() {
+        let source = ConfigSource::from_pairs([
+            ("IDP_ISSUER", "https://issuer.example/oauth2/default"),
+            ("EXPECTED_SUBJECT_AUD", "api://obo"),
+            ("ACTOR_IDS", "chat-mcp"),
+            ("STS_ALLOW_NON_PQC_INBOUND", "true"),
+            ("STS_INBOUND_ASSERTION_ALGS", "ML-DSA-65,RS256,ML-DSA-65"),
+        ]);
+        let cfg = RuntimeConfig::from_source(&source).expect("config");
+        assert!(cfg.inbound_pqc_preferred);
+        assert!(cfg.allow_non_pqc_inbound);
+        assert_eq!(cfg.inbound_assertion_algs, vec!["ML-DSA-65", "RS256"]);
+    }
+
+    #[test]
+    fn runtime_config_rejects_rs256_inbound_without_explicit_compatibility() {
+        let source = ConfigSource::from_pairs([
+            ("IDP_ISSUER", "https://issuer.example/oauth2/default"),
+            ("EXPECTED_SUBJECT_AUD", "api://obo"),
+            ("ACTOR_IDS", "chat-mcp"),
+            ("STS_INBOUND_ASSERTION_ALGS", "RS256"),
+        ]);
+        let err = RuntimeConfig::from_source(&source).unwrap_err();
+        assert_eq!(err.kind, ConfigErrorKind::InvalidValue);
+        assert_eq!(err.key.as_deref(), Some("STS_INBOUND_ASSERTION_ALGS"));
+        assert!(err.message.contains("STS_ALLOW_NON_PQC_INBOUND=true"));
     }
 
     #[test]

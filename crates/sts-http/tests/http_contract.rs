@@ -106,6 +106,9 @@ fn test_state_with_sts_signer()
         ("STS_SIGNING_ALG", "RS256"),
         ("STS_PQC_PREFERRED", "false"),
         ("STS_ALLOW_NON_PQC", "true"),
+        ("STS_INBOUND_PQC_PREFERRED", "false"),
+        ("STS_ALLOW_NON_PQC_INBOUND", "true"),
+        ("STS_INBOUND_ASSERTION_ALGS", "RS256"),
         (
             "TARGET_POLICY_JSON",
             r#"{"api://chat-mcp":{"allowed_scopes":["chat.read","chat.write"],"default_scopes":["chat.read"]}}"#,

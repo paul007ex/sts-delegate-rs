@@ -18,7 +18,7 @@ the Rust repo has copied every Python document.
 | Delegation | Shipped: subject `sub` is preserved and actor is recorded in `act.sub`. | `crates/sts-core/src/lib.rs`; ledger R-068/R-070 | `claims.md`; `rfc8693-mapping.md` |
 | Impersonation | Shipped as opt-in policy path; minted token omits `act`. | ledger R-069/R-094 through R-101 | `configuration.md`; `rfc8693-mapping.md` |
 | DPoP | Shipped for token-endpoint proof validation and minted `cnf.jkt`; resource-server proof validation is out of scope. | `crates/sts-dpop`; ledger R-107 through R-120 | Python `tests/test_dpop.py` |
-| PQC | Shipped as the default OpenSSL-backed ML-DSA signing path with PQC-preferred target policy and no silent downgrade. Not FIPS validated. | README; ledger R-082/R-130; issues #72/#73/#74/#78/#131 | Python PQC intent docs |
+| PQC | Shipped as the default OpenSSL-backed ML-DSA signing path with PQC-preferred target policy, ML-DSA inbound actor/client assertion verification, and no silent downgrade. Not FIPS validated. | README; ledger R-082/R-082A/R-130; issues #72/#73/#74/#78/#131/#135 | Python PQC intent docs |
 | Metrics | Shipped opt-in `/metrics`; disabled by default. | README; ledger R-044 | Python transport docs |
 | Release artifacts | Shipped as source tags, hosted/local `sts-cli` archives, Homebrew tap, and local Docker build. | README; `.github/workflows/release.yml`; `scripts/package_release.sh` | No direct Python equivalent |
 
@@ -49,6 +49,7 @@ the Rust repo has copied every Python document.
 | Metrics | `STS_ENABLE_METRICS=true` | Opt-in only. |
 | Signing key | `OBO_STS_KEY_FILE` | File-backed RFC 9964 AKP ML-DSA default; explicit RS256 compatibility and KMS/HSM tracked separately in #43. |
 | PQC signing policy | `STS_PQC_PREFERRED`, `STS_ALLOW_NON_PQC`, `STS_PQC_PREFERRED_ALGS`, target `accepted_token_signing_algs`, target `pqc_required` | Product policy only; not OAuth-standard client negotiation. |
+| PQC inbound assertion policy | `STS_INBOUND_PQC_PREFERRED`, `STS_ALLOW_NON_PQC_INBOUND`, `STS_INBOUND_ASSERTION_ALGS` | Actor assertions and `private_key_jwt` client assertions default to `ML-DSA-65`; RS256 inbound compatibility must be explicit and metadata advertises the enforced allowlist. |
 | Replay store | In-process `InMemoryReplayStore` | Multi-replica shared replay tracked separately in #44. |
 
 ## Error and Endpoint Mapping

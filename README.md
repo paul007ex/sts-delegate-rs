@@ -52,7 +52,11 @@ Required environment includes `IDP_ISSUER` or `OKTA_ISSUER`,
 RFC 9964 AKP ML-DSA private JWK for `STS_SIGNING_ALG=ML-DSA-65`.
 Classical RS256 remains available only as an explicit compatibility mode by
 setting `STS_SIGNING_ALG=RS256`, `STS_PQC_PREFERRED=false`, and
-`STS_ALLOW_NON_PQC=true`. `STS_HTTP_ADDR` defaults to `127.0.0.1:8888`.
+`STS_ALLOW_NON_PQC=true`. Inbound actor and `private_key_jwt` assertions default
+to `ML-DSA-65` as well; RS256 inbound assertion compatibility requires
+`STS_INBOUND_PQC_PREFERRED=false`, `STS_ALLOW_NON_PQC_INBOUND=true`, and
+`STS_INBOUND_ASSERTION_ALGS=RS256`. `STS_HTTP_ADDR` defaults to
+`127.0.0.1:8888`.
 
 ## Install and package locally
 
@@ -182,6 +186,9 @@ fallback disabled:
 STS_PQC_PREFERRED=true
 STS_ALLOW_NON_PQC=false
 STS_PQC_PREFERRED_ALGS=ML-DSA-65,ML-DSA-87,ML-DSA-44
+STS_INBOUND_PQC_PREFERRED=true
+STS_ALLOW_NON_PQC_INBOUND=false
+STS_INBOUND_ASSERTION_ALGS=ML-DSA-65
 ```
 
 Target policy can express downstream verification capability:
@@ -223,9 +230,12 @@ cargo run -p sts-cli -- \
 ```
 
 Current PQC support is limited to ML-DSA JWS signing, public AKP JWKS
-publication, downstream verification, and a local file-backed ML-DSA
-generate/inspect/rotate CLI workflow. JWE, ML-KEM, encrypt/decrypt endpoints,
-and real cloud KMS/HSM providers are not shipped here.
+publication, downstream verification, inbound actor/`private_key_jwt` assertion
+verification, and a local file-backed ML-DSA generate/inspect/rotate CLI
+workflow. External IdP subject-token verification remains governed by the
+configured IdP JWKS; do not claim Okta or another IdP issues ML-DSA subject
+tokens without live tenant proof. JWE, ML-KEM, encrypt/decrypt endpoints, and
+real cloud KMS/HSM providers are not shipped here.
 
 External signing uses an explicit provider selection. The default remains the
 file-backed signer:

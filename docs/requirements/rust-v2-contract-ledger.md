@@ -117,6 +117,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-080 | Default signing backend selection is ML-DSA-65; classical selection requires explicit `classical` or `RS256`. | policy | implemented | jose/config | `crates/sts-jose/src/lib.rs:31`; issue #131 | JOSE/config tests | Blank no longer means RS256. |
 | R-081 | PQC or unknown signing backend selection must fail closed and never instantiate RS256. | must-not | implemented | jose/security | issue #5; `crates/sts-jose/src/lib.rs` | JOSE tests | Concrete ML-DSA selectors require the explicit feature; vague `pqc` and unknown algorithms do not fall back. |
 | R-082 | Real PQC support must be first-class when implemented, not marker-only or fallback-only. | must | implemented | jose/security | issue #19/#29/#72/#73/#74/#78/#131; RFC 9964; OpenSSL 3.5 EVP_PKEY-ML-DSA | `cargo test -p sts-jose --lib`; `cargo test -p sts-http`; `cargo test -p sts-cli pqc_preflight` | Uses OpenSSL 3.5+ ML-DSA through `openssl-rs` in default builds; PQC-preferred target policy fails closed unless explicit non-PQC fallback is allowed; no FIPS-validated or stable-backend claim. |
+| R-082A | Inbound actor and `private_key_jwt` client assertions default to ML-DSA-65; RS256 inbound compatibility requires explicit policy and metadata must advertise only the enforced allowlist. | must | implemented | config/verify/http | issue #135; `crates/sts-config/src/lib.rs`; `crates/sts-verify/src/lib.rs`; `crates/sts-http/src/lib.rs` | Config tests; `bootstrap_defaults_to_mldsa_signer`; no-default backend-unavailable bootstrap test; workspace/all-features tests | External IdP subject-token verification remains tied to configured IdP JWKS support; do not claim Okta issues ML-DSA user tokens without live proof. |
 | R-083 | Client assertion auth uses `private_key_jwt` assertion type. | must | implemented | http/verify | RFC 7523; `crates/sts-http/src/lib.rs:42` | HTTP tests | Wrong/missing assertion type rejected. |
 | R-084 | Client assertion `iss` and `sub` must match. | must | implemented | verify | RFC 7523; `crates/sts-verify/src/lib.rs:328` | verify/http tests | Prevent confused identities. |
 | R-085 | `client_id` form value must match authenticated client assertion subject. | must | implemented | http | issue #7; `crates/sts-http/tests/http_contract.rs:1337` | client mismatch test | Error is invalid_client. |
@@ -365,7 +366,7 @@ focused issue against the affected lane rather than using R-003 as a catch-all.
 
 ## Current Alpha Boundaries
 
-- Native PQC signing/JWKS/downstream verification is the default OpenSSL-backed signing path; PQC-preferred target policy fails closed unless explicit non-PQC fallback is allowed; classical RS256 is now compatibility mode only (#19/#29/#72/#73/#74/#78/#131).
+- Native PQC signing/JWKS/downstream verification and inbound actor/client assertion verification are the default OpenSSL-backed ML-DSA path; PQC-preferred target policy fails closed unless explicit non-PQC fallback is allowed; classical RS256 is now compatibility mode only (#19/#29/#72/#73/#74/#78/#131/#135).
 - Real Okta/MCP/Rust STS live-base canary proof is green and redacted; future failures should reopen a focused canary regression issue (#21).
 - Full Authorization Server features remain non-goals for this STS alpha.
 

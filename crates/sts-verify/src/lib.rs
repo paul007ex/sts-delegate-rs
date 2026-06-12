@@ -166,11 +166,12 @@ pub struct AssertionVerificationOptions<'a> {
     pub key_binding_registry: Option<&'a BTreeSet<String>>,
 }
 
-const INBOUND_JWT_SIGNING_ALGS: &[&str] = &["RS256"];
+const SUBJECT_TOKEN_SIGNING_ALGS: &[&str] = &["RS256"];
+const LEGACY_ASSERTION_SIGNING_ALGS: &[&str] = &["RS256"];
 
-/// Algorithms accepted for inbound subject, actor, and client assertion JWTs.
-pub fn inbound_jwt_signing_algs() -> Vec<String> {
-    INBOUND_JWT_SIGNING_ALGS.iter().map(|alg| (*alg).to_string()).collect()
+/// Algorithms accepted for external subject tokens such as Okta access tokens.
+pub fn subject_token_signing_algs() -> Vec<String> {
+    SUBJECT_TOKEN_SIGNING_ALGS.iter().map(|alg| (*alg).to_string()).collect()
 }
 
 /// Validate an issuer value without making network calls.
@@ -356,7 +357,7 @@ pub fn verify_subject_token(
     clock_skew_leeway: i64,
 ) -> Result<SubjectTokenClaims, VerifyError> {
     let claims: SubjectTokenClaims =
-        verify_claims_against_jwks_with_allowed_algs(token, jwks, INBOUND_JWT_SIGNING_ALGS)
+        verify_claims_against_jwks_with_allowed_algs(token, jwks, SUBJECT_TOKEN_SIGNING_ALGS)
             .map_err(map_jose_error)?
             .claims;
     let expected_issuer = validate_issuer(expected_issuer).map_err(map_verify_error)?;
@@ -377,12 +378,29 @@ pub fn verify_assertion(
     jwks: &JwksDocument,
     options: AssertionVerificationOptions<'_>,
 ) -> Result<AssertionClaims, VerifyError> {
-    let verified = verify_claims_against_jwks_with_allowed_algs::<AssertionClaims>(
-        token,
-        jwks,
-        INBOUND_JWT_SIGNING_ALGS,
-    )
-    .map_err(map_jose_error)?;
+    verify_assertion_with_allowed_alg_refs(token, jwks, LEGACY_ASSERTION_SIGNING_ALGS, options)
+}
+
+/// Verify a client or actor assertion with an explicit JWS algorithm policy.
+pub fn verify_assertion_with_allowed_algs(
+    token: &str,
+    jwks: &JwksDocument,
+    allowed_algs: &[String],
+    options: AssertionVerificationOptions<'_>,
+) -> Result<AssertionClaims, VerifyError> {
+    let allowed = allowed_algs.iter().map(String::as_str).collect::<Vec<_>>();
+    verify_assertion_with_allowed_alg_refs(token, jwks, &allowed, options)
+}
+
+fn verify_assertion_with_allowed_alg_refs(
+    token: &str,
+    jwks: &JwksDocument,
+    allowed_algs: &[&str],
+    options: AssertionVerificationOptions<'_>,
+) -> Result<AssertionClaims, VerifyError> {
+    let verified =
+        verify_claims_against_jwks_with_allowed_algs::<AssertionClaims>(token, jwks, allowed_algs)
+            .map_err(map_jose_error)?;
     let claims = verified.claims;
     let _expected_issuer = validate_issuer(options.expected_issuer).map_err(map_verify_error)?;
     if claims.iss != claims.sub {

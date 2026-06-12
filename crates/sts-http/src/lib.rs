@@ -52,8 +52,7 @@ use sts_replay::{
 };
 use sts_verify::{
     AssertionClaims, AssertionVerificationOptions, SubjectTokenClaims, VerifyError,
-    VerifyErrorKind, inbound_jwt_signing_algs, resolve_idp_jwks, verify_assertion,
-    verify_subject_token,
+    VerifyErrorKind, resolve_idp_jwks, verify_assertion_with_allowed_algs, verify_subject_token,
 };
 use url::Url;
 
@@ -455,6 +454,7 @@ pub async fn build_state_from_source(source: &ConfigSource) -> Result<HttpState,
 
 /// Build a complete HTTP state from an already-validated runtime config.
 pub async fn build_state_from_config(config: RuntimeConfig) -> Result<HttpState, BootstrapError> {
+    validate_inbound_assertion_algorithms(&config)?;
     let signer = load_signer(&config)?;
     let published_jwks = published_jwks(&config, signer.as_ref())?;
     let subject_jwks = load_subject_jwks(&config).await?;
@@ -489,6 +489,28 @@ fn build_replay_policy(config: &RuntimeConfig) -> Result<ReplayPolicy, Bootstrap
             Ok(ReplayPolicy::new(FileReplayStore::new(dir, config.max_seen_jti, 256)?))
         }
     }
+}
+
+fn validate_inbound_assertion_algorithms(config: &RuntimeConfig) -> Result<(), BootstrapError> {
+    for alg in &config.inbound_assertion_algs {
+        if is_pqc_jws_alg(alg) {
+            validate_pqc_inbound_assertion_backend(alg)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "pqc-openssl-unstable")]
+fn validate_pqc_inbound_assertion_backend(_alg: &str) -> Result<(), BootstrapError> {
+    Ok(())
+}
+
+#[cfg(not(feature = "pqc-openssl-unstable"))]
+fn validate_pqc_inbound_assertion_backend(alg: &str) -> Result<(), BootstrapError> {
+    Err(BootstrapError::Jose(JoseError::new(
+        JoseErrorKind::UnsupportedAlgorithm,
+        format!("PQC inbound assertion verification backend is not available for {alg}"),
+    )))
 }
 
 /// Start the production HTTP server from process environment.
@@ -1066,7 +1088,7 @@ async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
 
 async fn metadata(State(state): State<HttpState>) -> impl IntoResponse {
     let auth_methods = vec!["private_key_jwt".to_string()];
-    let auth_algs = inbound_jwt_signing_algs();
+    let auth_algs = state.config.inbound_assertion_algs.clone();
     let document = AuthorizationServerMetadata {
         issuer: state.config.our_issuer.clone(),
         token_endpoint: state.token_endpoint(),
@@ -1623,9 +1645,10 @@ fn authenticate_online_client(
     let endpoint = endpoint.to_string();
     let audiences = vec![state.config.our_issuer.clone(), endpoint];
     let key_binding_registry = key_binding_registry(state);
-    let claims = verify_assertion(
+    let claims = verify_assertion_with_allowed_algs(
         assertion,
         &state.client_jwks,
+        &state.config.inbound_assertion_algs,
         AssertionVerificationOptions {
             expected_issuer: &state.config.our_issuer,
             expected_audiences: &audiences,
@@ -1784,9 +1807,10 @@ fn authenticate_client_if_present(
         .ok_or_else(|| HttpError::invalid_client("client_assertion required"))?;
     let audiences = vec![state.config.our_issuer.clone(), state.token_endpoint()];
     let key_binding_registry = key_binding_registry(state);
-    let claims = verify_assertion(
+    let claims = verify_assertion_with_allowed_algs(
         assertion,
         &state.client_jwks,
+        &state.config.inbound_assertion_algs,
         AssertionVerificationOptions {
             expected_issuer: &state.config.our_issuer,
             expected_audiences: &audiences,
@@ -1938,9 +1962,10 @@ fn verify_actor_token(
 ) -> Result<AssertionClaims, HttpError> {
     let audiences = vec![state.config.our_issuer.clone(), state.token_endpoint()];
     let key_binding_registry = key_binding_registry(state);
-    verify_assertion(
+    verify_assertion_with_allowed_algs(
         actor_token,
         &state.actor_jwks,
+        &state.config.inbound_assertion_algs,
         AssertionVerificationOptions {
             expected_issuer: &state.config.our_issuer,
             expected_audiences: &audiences,
@@ -2380,22 +2405,26 @@ mod tests {
         );
 
         let source = ConfigSource::from_pairs([
-	            ("IDP_ISSUER", "https://issuer.example/oauth2/default".to_string()),
-	            ("EXPECTED_SUBJECT_AUD", "api://obo".to_string()),
-	            ("ACTOR_IDS", "chat-mcp".to_string()),
-	            ("OBO_STS_ISSUER", "http://localhost:8888".to_string()),
-	            ("OBO_STS_KEY_FILE", sts_key_file.display().to_string()),
+            ("IDP_ISSUER", "https://issuer.example/oauth2/default".to_string()),
+            ("EXPECTED_SUBJECT_AUD", "api://obo".to_string()),
+            ("ACTOR_IDS", "chat-mcp".to_string()),
+            ("OBO_STS_ISSUER", "http://localhost:8888".to_string()),
+            ("OBO_STS_KEY_FILE", sts_key_file.display().to_string()),
             ("STS_SIGNING_ALG", "RS256".to_string()),
             ("STS_PQC_PREFERRED", "false".to_string()),
             ("STS_ALLOW_NON_PQC", "true".to_string()),
+            ("STS_INBOUND_PQC_PREFERRED", "false".to_string()),
+            ("STS_ALLOW_NON_PQC_INBOUND", "true".to_string()),
+            ("STS_INBOUND_ASSERTION_ALGS", "RS256".to_string()),
             ("IDP_JWKS_FILE", idp_jwks_file.display().to_string()),
             ("ACTOR_JWKS_FILE", actor_jwks_file.display().to_string()),
             ("CLIENT_JWKS_FILE", actor_jwks_file.display().to_string()),
             (
                 "TARGET_POLICY_JSON",
-	                r#"{"api://chat-mcp":{"allowed_scopes":["chat.read"],"default_scopes":["chat.read"]}}"#.to_string(),
-	            ),
-	        ]);
+                r#"{"api://chat-mcp":{"allowed_scopes":["chat.read"],"default_scopes":["chat.read"]}}"#
+                    .to_string(),
+            ),
+        ]);
         BootstrapFixture {
             source,
             #[cfg(feature = "pqc-openssl-unstable")]
@@ -2422,6 +2451,9 @@ mod tests {
             "STS_SIGNING_ALG",
             "STS_PQC_PREFERRED",
             "STS_ALLOW_NON_PQC",
+            "STS_INBOUND_PQC_PREFERRED",
+            "STS_ALLOW_NON_PQC_INBOUND",
+            "STS_INBOUND_ASSERTION_ALGS",
         ]
         .into_iter()
         .map(|key| (key.to_string(), base.get(key).expect("source key").to_string()))
@@ -2566,6 +2598,30 @@ mod tests {
         assert!(err.to_string().contains("unsupported STS signing provider"));
     }
 
+    #[cfg(not(feature = "pqc-openssl-unstable"))]
+    #[tokio::test]
+    async fn bootstrap_rejects_default_pqc_inbound_when_backend_unavailable() {
+        let source = ConfigSource::from_pairs([
+            ("IDP_ISSUER", "https://issuer.example/oauth2/default"),
+            ("EXPECTED_SUBJECT_AUD", "api://obo"),
+            ("ACTOR_IDS", "chat-mcp"),
+            ("OBO_STS_ISSUER", "http://localhost:8888"),
+            ("STS_SIGNING_ALG", "RS256"),
+            ("STS_PQC_PREFERRED", "false"),
+            ("STS_ALLOW_NON_PQC", "true"),
+            (
+                "TARGET_POLICY_JSON",
+                r#"{"api://chat-mcp":{"allowed_scopes":["chat.read"],"default_scopes":["chat.read"]}}"#,
+            ),
+        ]);
+        let err = match build_state_from_source(&source).await {
+            Ok(_) => panic!("missing ML-DSA backend must fail closed at bootstrap"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, BootstrapError::Jose(_)));
+        assert!(err.to_string().contains("PQC inbound assertion verification backend"));
+    }
+
     #[cfg(feature = "pqc-openssl-unstable")]
     #[tokio::test]
     async fn bootstrap_defaults_to_mldsa_signer() {
@@ -2573,31 +2629,54 @@ mod tests {
         let fixture = bootstrap_fixture(&dir);
         let mldsa_key_file = dir.join("sts-mldsa-private.json");
         write_file(&mldsa_key_file, &mldsa_private_jwk([44_u8; 32], "sts-mldsa-kid"));
+        let inbound_assertion_signer = sts_jose::MlDsaJoseSigner::from_seed_for_tests(
+            sts_jose::MlDsaAlgorithm::MlDsa65,
+            [45_u8; 32],
+            "chat-mcp-mldsa-assertion-key-1",
+        )
+        .expect("mldsa assertion signer");
+        let wrong_assertion_signer = sts_jose::MlDsaJoseSigner::from_seed_for_tests(
+            sts_jose::MlDsaAlgorithm::MlDsa65,
+            [46_u8; 32],
+            "chat-mcp-mldsa-assertion-key-1",
+        )
+        .expect("wrong mldsa assertion signer");
+        let inbound_assertion_jwks_file = dir.join("inbound-mldsa-jwks.json");
+        write_file(
+            &inbound_assertion_jwks_file,
+            &serde_json::to_string(&inbound_assertion_signer.public_jwks())
+                .expect("mldsa inbound jwks"),
+        );
 
         let mut pairs = Vec::new();
-        for key in [
-            "IDP_ISSUER",
-            "EXPECTED_SUBJECT_AUD",
-            "ACTOR_IDS",
-            "OBO_STS_ISSUER",
-            "IDP_JWKS_FILE",
-            "ACTOR_JWKS_FILE",
-            "CLIENT_JWKS_FILE",
-        ] {
+        for key in
+            ["IDP_ISSUER", "EXPECTED_SUBJECT_AUD", "ACTOR_IDS", "OBO_STS_ISSUER", "IDP_JWKS_FILE"]
+        {
             pairs.push((key.to_string(), fixture.source.get(key).expect("source key").to_string()));
         }
         pairs.push((
-	            "TARGET_POLICY_JSON".to_string(),
-	            r#"{"api://chat-mcp":{"allowed_scopes":["chat.read"],"default_scopes":["chat.read"],"accepted_token_signing_algs":["ML-DSA-65","RS256"],"pqc_required":true}}"#
-	                .to_string(),
-	        ));
+            "TARGET_POLICY_JSON".to_string(),
+            r#"{"api://chat-mcp":{"allowed_scopes":["chat.read"],"default_scopes":["chat.read"],"accepted_token_signing_algs":["ML-DSA-65","RS256"],"pqc_required":true}}"#
+                .to_string(),
+        ));
         pairs.push(("OBO_STS_KEY_FILE".to_string(), mldsa_key_file.display().to_string()));
+        pairs.push((
+            "ACTOR_JWKS_FILE".to_string(),
+            inbound_assertion_jwks_file.display().to_string(),
+        ));
+        pairs.push((
+            "CLIENT_JWKS_FILE".to_string(),
+            inbound_assertion_jwks_file.display().to_string(),
+        ));
         let source = ConfigSource::from_pairs(pairs);
 
         let config = RuntimeConfig::from_source(&source).expect("config");
         assert_eq!(config.sts_signing_alg, "ML-DSA-65");
         assert!(config.pqc_preferred);
         assert!(!config.allow_non_pqc);
+        assert!(config.inbound_pqc_preferred);
+        assert!(!config.allow_non_pqc_inbound);
+        assert_eq!(config.inbound_assertion_algs, vec!["ML-DSA-65"]);
 
         let state = build_state_from_source(&source).await.expect("bootstrap");
         assert_eq!(state.signer.alg(), "ML-DSA-65");
@@ -2625,8 +2704,79 @@ mod tests {
 
         let now = unix_now();
         let subject_token = signed_subject_token(&fixture.subject_signer, now);
-        let actor_token = signed_assertion_bound_to_subject(
+        let rs256_actor_token = signed_assertion_bound_to_subject(
             &fixture.actor_signer,
+            now,
+            "actor-rs256-rejected",
+            "http://localhost:8888",
+            &subject_token,
+        );
+        let rs256_body = serde_urlencoded::to_string([
+            ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+            ("subject_token", subject_token.as_str()),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("actor_token", rs256_actor_token.as_str()),
+            ("actor_token_type", JWT_TOKEN_TYPE),
+            ("audience", "api://chat-mcp"),
+            ("scope", "chat.read"),
+        ])
+        .expect("form");
+        let rs256_response = post_token_form(state.clone(), rs256_body).await;
+        assert_eq!(rs256_response.status(), StatusCode::UNAUTHORIZED);
+        let rs256_body = read_json(rs256_response).await;
+        assert_eq!(rs256_body["error"], "invalid_client");
+        assert!(rs256_body.get("access_token").is_none());
+
+        let wrong_actor_token = signed_mldsa_assertion_bound_to_subject(
+            &wrong_assertion_signer,
+            now,
+            "actor-wrong-akp-public-key",
+            "http://localhost:8888",
+            &subject_token,
+        );
+        let wrong_body = serde_urlencoded::to_string([
+            ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+            ("subject_token", subject_token.as_str()),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("actor_token", wrong_actor_token.as_str()),
+            ("actor_token_type", JWT_TOKEN_TYPE),
+            ("audience", "api://chat-mcp"),
+            ("scope", "chat.read"),
+        ])
+        .expect("form");
+        let wrong_response = post_token_form(state.clone(), wrong_body).await;
+        assert_eq!(wrong_response.status(), StatusCode::UNAUTHORIZED);
+        let wrong_body = read_json(wrong_response).await;
+        assert_eq!(wrong_body["error"], "invalid_client");
+        assert!(wrong_body.get("access_token").is_none());
+
+        let metadata_response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/.well-known/oauth-authorization-server")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metadata_response.status(), StatusCode::OK);
+        let metadata = read_json(metadata_response).await;
+        assert_eq!(
+            metadata["token_endpoint_auth_signing_alg_values_supported"],
+            serde_json::json!(["ML-DSA-65"])
+        );
+        assert_eq!(
+            metadata["introspection_endpoint_auth_signing_alg_values_supported"],
+            serde_json::json!(["ML-DSA-65"])
+        );
+        assert_eq!(
+            metadata["revocation_endpoint_auth_signing_alg_values_supported"],
+            serde_json::json!(["ML-DSA-65"])
+        );
+
+        let actor_token = signed_mldsa_assertion_bound_to_subject(
+            &inbound_assertion_signer,
             now,
             "actor-mldsa-http-route",
             "http://localhost:8888",
@@ -2658,8 +2808,8 @@ mod tests {
         assert_eq!(verified.claims.scope, "chat.read");
         assert_eq!(verified.claims.act.expect("act").sub, "chat-mcp");
 
-        let introspect_assertion = signed_assertion_with_audience(
-            &fixture.actor_signer,
+        let introspect_assertion = signed_mldsa_assertion_with_audience(
+            &inbound_assertion_signer,
             now,
             "client-mldsa-introspect",
             "http://localhost:8888",
@@ -2688,8 +2838,8 @@ mod tests {
         assert_eq!(introspect_json["active"], true);
         assert_eq!(introspect_json["act"]["sub"], "chat-mcp");
 
-        let revoke_assertion = signed_assertion_with_audience(
-            &fixture.actor_signer,
+        let revoke_assertion = signed_mldsa_assertion_with_audience(
+            &inbound_assertion_signer,
             now,
             "client-mldsa-revoke",
             "http://localhost:8888",
@@ -2715,8 +2865,8 @@ mod tests {
             .unwrap();
         assert_eq!(revoke_response.status(), StatusCode::OK);
 
-        let revoked_assertion = signed_assertion_with_audience(
-            &fixture.actor_signer,
+        let revoked_assertion = signed_mldsa_assertion_with_audience(
+            &inbound_assertion_signer,
             now,
             "client-mldsa-revoked-introspect",
             "http://localhost:8888",
@@ -2814,6 +2964,9 @@ mod tests {
             ("STS_SIGNING_ALG", "RS256"),
             ("STS_PQC_PREFERRED", "false"),
             ("STS_ALLOW_NON_PQC", "true"),
+            ("STS_INBOUND_PQC_PREFERRED", "false"),
+            ("STS_ALLOW_NON_PQC_INBOUND", "true"),
+            ("STS_INBOUND_ASSERTION_ALGS", "RS256"),
             (
                 "TARGET_POLICY_JSON",
                 r#"{"api://chat-mcp":{"allowed_scopes":["chat.read","chat.write"],"default_scopes":["chat.read"]}}"#,
@@ -2903,6 +3056,48 @@ mod tests {
                 sub_tok_hash: Some(URL_SAFE_NO_PAD.encode(hash.as_ref())),
             })
             .expect("assertion")
+    }
+
+    #[cfg(feature = "pqc-openssl-unstable")]
+    fn signed_mldsa_assertion_with_audience(
+        signer: &sts_jose::MlDsaJoseSigner,
+        now: i64,
+        jti: &str,
+        aud: &str,
+    ) -> String {
+        signer
+            .sign_json_claims(&AssertionWireClaims {
+                iss: "chat-mcp".to_string(),
+                sub: "chat-mcp".to_string(),
+                aud: aud.to_string(),
+                exp: now + 300,
+                iat: now,
+                jti: jti.to_string(),
+                sub_tok_hash: None,
+            })
+            .expect("mldsa assertion")
+    }
+
+    #[cfg(feature = "pqc-openssl-unstable")]
+    fn signed_mldsa_assertion_bound_to_subject(
+        signer: &sts_jose::MlDsaJoseSigner,
+        now: i64,
+        jti: &str,
+        aud: &str,
+        subject_token: &str,
+    ) -> String {
+        let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, subject_token.as_bytes());
+        signer
+            .sign_json_claims(&AssertionWireClaims {
+                iss: "chat-mcp".to_string(),
+                sub: "chat-mcp".to_string(),
+                aud: aud.to_string(),
+                exp: now + 300,
+                iat: now,
+                jti: jti.to_string(),
+                sub_tok_hash: Some(URL_SAFE_NO_PAD.encode(hash.as_ref())),
+            })
+            .expect("mldsa assertion")
     }
 
     async fn post_token_form(state: HttpState, body: String) -> Response {
