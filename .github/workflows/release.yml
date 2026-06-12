@@ -18,6 +18,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
   cancel-in-progress: false
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   package:
     name: package ${{ matrix.name }}
@@ -130,7 +133,7 @@ jobs:
             exit 1
           fi
           while IFS= read -r checksum_file; do
-            cat "$checksum_file"
+            sed -E 's#([[:space:]])(\*?)dist/#\1\2#' "$checksum_file"
           done <<<"$checksum_files" > release-upload/SHA256SUMS
 
           archive_count="$(find release-upload -maxdepth 1 -type f -name 'sts-cli-*.tar.gz' | wc -l | tr -d ' ')"
