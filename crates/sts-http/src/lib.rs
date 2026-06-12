@@ -18,7 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, State};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::header::{
@@ -206,12 +206,21 @@ impl HttpState {
     }
 
     fn resource_identifier_for_metadata_path(&self, request_path: &str) -> String {
-        if let Some(path) = self.issuer_path()
-            && request_path == format!("/.well-known/oauth-protected-resource{path}")
-        {
-            return self.config.our_issuer.clone();
+        let suffix =
+            request_path.strip_prefix("/.well-known/oauth-protected-resource").unwrap_or("");
+        let resource_path = suffix.trim_matches('/');
+        if !resource_path.is_empty() {
+            return format!("{}/{}", self.issuer_origin(), resource_path);
         }
         self.issuer_origin()
+    }
+
+    fn resource_metadata_url_for_resource_path(&self, request_path: &str) -> String {
+        let resource_path = request_path.trim_matches('/');
+        if resource_path.is_empty() {
+            return format!("{}/.well-known/oauth-protected-resource", self.issuer_origin());
+        }
+        format!("{}/.well-known/oauth-protected-resource/{}", self.issuer_origin(), resource_path)
     }
 }
 
@@ -346,8 +355,14 @@ pub fn router(state: HttpState) -> Router {
         .route("/jwks", get(jwks))
         .route("/openapi.json", get(openapi))
         .route("/.well-known/oauth-authorization-server", get(metadata))
+        .route("/mcp", any(protected_resource_challenge))
+        .route("/{resource}/mcp", any(protected_resource_challenge))
         .route(
             "/.well-known/oauth-protected-resource",
+            get(protected_resource_metadata).post(method_not_allowed),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/{*resource}",
             get(protected_resource_metadata).post(method_not_allowed),
         );
 
@@ -362,6 +377,8 @@ pub fn router(state: HttpState) -> Router {
             .route(&format!("{path}/revoke"), post(revoke).get(method_not_allowed))
             .route(&format!("{path}/jwks"), get(jwks))
             .route(&format!("/.well-known/oauth-authorization-server{path}"), get(metadata))
+            .route(&format!("{path}/mcp"), any(protected_resource_challenge))
+            .route(&format!("{path}/{{resource}}/mcp"), any(protected_resource_challenge))
             .route(
                 &format!("/.well-known/oauth-protected-resource{path}"),
                 get(protected_resource_metadata).post(method_not_allowed),
@@ -1071,6 +1088,33 @@ async fn metadata(State(state): State<HttpState>) -> impl IntoResponse {
         protected_resources: vec![state.config.our_issuer.clone()],
     };
     (public_cache_headers(state.config.jwks_cache_max_age), Json(document))
+}
+
+/// RFC 9728 bearer challenge for protected-resource business endpoints.
+///
+/// The STS/AS endpoints keep their own OAuth/client-auth errors; only resource
+/// server style paths use `resource_metadata` discovery challenges.
+async fn protected_resource_challenge(
+    OriginalUri(uri): OriginalUri,
+    State(state): State<HttpState>,
+) -> Result<Response, HttpError> {
+    let resource_metadata = state.resource_metadata_url_for_resource_path(uri.path());
+    let challenge = format!(r#"Bearer resource_metadata="{resource_metadata}""#);
+    let challenge = HeaderValue::from_str(&challenge).map_err(|_| {
+        HttpError::server_error("resource metadata challenge could not be rendered")
+    })?;
+    let mut headers = token_headers();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(WWW_AUTHENTICATE, challenge);
+    Ok((
+        StatusCode::UNAUTHORIZED,
+        headers,
+        Json(serde_json::json!({
+            "error": "invalid_token",
+            "error_description": "valid bearer token required",
+        })),
+    )
+        .into_response())
 }
 
 async fn protected_resource_metadata(

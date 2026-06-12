@@ -340,6 +340,11 @@ operators:
 - `GET /.well-known/oauth-protected-resource` implements RFC 9728 protected
   resource metadata for the resource represented by the metadata URL. It does
   not imply a full `/authorize` or OIDC server.
+- Protected-resource style endpoints such as `/mcp` and `/{resource}/mcp`
+  return an RFC 9728 `WWW-Authenticate: Bearer resource_metadata="..."`
+  challenge when the bearer token is missing or unusable. STS/AS endpoints
+  such as `/token`, `/introspect`, `/revoke`, `/jwks`, and RFC 8414 metadata do
+  not emit that protected-resource challenge.
 
 Offline JWT validation through `/jwks` cannot observe revocation. Resource
 servers that need revocation status must call `/introspect` or another online

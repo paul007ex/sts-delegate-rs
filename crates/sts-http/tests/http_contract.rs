@@ -254,6 +254,30 @@ async fn get_path(state: HttpState, uri: &str) -> Response<Body> {
         .unwrap()
 }
 
+async fn request_path(
+    state: HttpState,
+    method: Method,
+    uri: &str,
+    extra_headers: &[(&str, &str)],
+) -> Response<Body> {
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (name, value) in extra_headers {
+        builder = builder.header(*name, *value);
+    }
+    router(state).oneshot(builder.body(Body::empty()).unwrap()).await.unwrap()
+}
+
+fn www_authenticate(response: &Response<Body>) -> Option<&str> {
+    response.headers().get(WWW_AUTHENTICATE).and_then(|value| value.to_str().ok())
+}
+
+fn assert_no_resource_metadata_challenge(response: &Response<Body>) {
+    assert!(
+        !www_authenticate(response).unwrap_or("").contains("resource_metadata="),
+        "STS/AS endpoint must not emit RFC 9728 protected-resource challenge"
+    );
+}
+
 async fn post_form_to_uri(state: HttpState, uri: &str, body: String) -> Response<Body> {
     router(state)
         .oneshot(
@@ -1171,6 +1195,106 @@ async fn rfc9728_protected_resource_metadata_is_get_only() {
     assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     let body = read_json(response).await;
     assert_eq!(body["error"], "invalid_request");
+}
+
+#[tokio::test]
+async fn rfc9728_resource_challenge_covers_missing_malformed_and_invalid_bearer() {
+    let (state, _, _, _) = test_state();
+    let expected = r#"Bearer resource_metadata="https://sts.example/.well-known/oauth-protected-resource/mcp""#;
+    let cases = [
+        (None, ""),
+        (Some("Bearer not-a-jwt"), "not-a-jwt"),
+        (Some("Bearer eyJhbGciOiJSUzI1NiJ9.bad.sig"), "eyJhbGciOiJSUzI1NiJ9.bad.sig"),
+    ];
+
+    for (authorization, sensitive_fragment) in cases {
+        let headers =
+            authorization.map_or_else(Vec::new, |value| vec![(AUTHORIZATION.as_str(), value)]);
+        let response = request_path(state.clone(), Method::GET, "/mcp", &headers).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(www_authenticate(&response), Some(expected));
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let body = read_json(response).await;
+        assert_eq!(body["error"], "invalid_token");
+        let rendered = body.to_string();
+        assert!(!rendered.contains("Bearer "));
+        if !sensitive_fragment.is_empty() {
+            assert!(!rendered.contains(sensitive_fragment));
+            assert!(!expected.contains(sensitive_fragment));
+        }
+    }
+}
+
+#[tokio::test]
+async fn rfc9728_path_bearing_resource_challenge_uses_exact_metadata_url() {
+    let (state, _, _, _) = test_state();
+    let response = request_path(
+        state.clone(),
+        Method::POST,
+        "/databricks/mcp",
+        &[(AUTHORIZATION.as_str(), "Bearer invalid-resource-token")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        www_authenticate(&response),
+        Some(
+            r#"Bearer resource_metadata="https://sts.example/.well-known/oauth-protected-resource/databricks/mcp""#
+        )
+    );
+    let body = read_json(response).await;
+    assert!(!body.to_string().contains("invalid-resource-token"));
+
+    let metadata =
+        read_json(get_path(state, "/.well-known/oauth-protected-resource/databricks/mcp").await)
+            .await;
+    assert_eq!(metadata["resource"], "https://sts.example/databricks/mcp");
+    assert_eq!(metadata["authorization_servers"], json!(["https://sts.example"]));
+}
+
+#[tokio::test]
+async fn rfc9728_path_bearing_issuer_resource_challenge_uses_exact_metadata_url() {
+    let state = path_bearing_state();
+    let response = request_path(state.clone(), Method::GET, "/tenant1/databricks/mcp", &[]).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        www_authenticate(&response),
+        Some(
+            r#"Bearer resource_metadata="https://sts.example/.well-known/oauth-protected-resource/tenant1/databricks/mcp""#
+        )
+    );
+
+    let metadata = read_json(
+        get_path(state, "/.well-known/oauth-protected-resource/tenant1/databricks/mcp").await,
+    )
+    .await;
+    assert_eq!(metadata["resource"], "https://sts.example/tenant1/databricks/mcp");
+    assert_eq!(metadata["authorization_servers"], json!(["https://sts.example/tenant1"]));
+}
+
+#[tokio::test]
+async fn rfc9728_resource_challenge_is_not_added_to_sts_as_endpoints() {
+    let (state, _, _, _) = test_state();
+
+    let token_response =
+        post_form_to_uri(state.clone(), "/token", "grant_type=x".to_string()).await;
+    assert_no_resource_metadata_challenge(&token_response);
+
+    let introspect_response =
+        post_form_to_uri(state.clone(), "/introspect", "token=x".to_string()).await;
+    assert_no_resource_metadata_challenge(&introspect_response);
+
+    let revoke_response = post_form_to_uri(state.clone(), "/revoke", "token=x".to_string()).await;
+    assert_no_resource_metadata_challenge(&revoke_response);
+
+    let jwks_response = get_path(state.clone(), "/jwks").await;
+    assert_no_resource_metadata_challenge(&jwks_response);
+
+    let metadata_response = get_path(state, "/.well-known/oauth-authorization-server").await;
+    assert_no_resource_metadata_challenge(&metadata_response);
 }
 
 #[tokio::test]

@@ -36,6 +36,42 @@
         }
       }
     },
+    "/mcp": {
+      "get": {
+        "summary": "Protected resource challenge",
+        "responses": {
+          "401": {
+            "description": "Bearer challenge with RFC 9728 resource_metadata"
+          }
+        }
+      },
+      "post": {
+        "summary": "Protected resource challenge",
+        "responses": {
+          "401": {
+            "description": "Bearer challenge with RFC 9728 resource_metadata"
+          }
+        }
+      }
+    },
+    "/{resource}/mcp": {
+      "get": {
+        "summary": "Path-bearing protected resource challenge",
+        "responses": {
+          "401": {
+            "description": "Bearer challenge with path-bearing RFC 9728 resource_metadata"
+          }
+        }
+      },
+      "post": {
+        "summary": "Path-bearing protected resource challenge",
+        "responses": {
+          "401": {
+            "description": "Bearer challenge with path-bearing RFC 9728 resource_metadata"
+          }
+        }
+      }
+    },
     "/introspect": {
       "post": {
         "summary": "RFC 7662 token introspection for STS-issued access tokens",
