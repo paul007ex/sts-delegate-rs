@@ -1773,19 +1773,27 @@ mod tests {
     }
 
     #[cfg(feature = "pqc-openssl-unstable")]
-    fn mldsa_private_jwk(seed: [u8; 32], kid: &str) -> String {
-        let signer =
-            MlDsaJoseSigner::from_seed_for_tests(MlDsaAlgorithm::MlDsa65, seed, kid).unwrap();
+    fn mldsa_private_jwk_for_algorithm(
+        algorithm: MlDsaAlgorithm,
+        seed: [u8; 32],
+        kid: &str,
+    ) -> String {
+        let signer = MlDsaJoseSigner::from_seed_for_tests(algorithm, seed, kid).unwrap();
         let public = signer.public_jwks().keys[0].pub_.clone().expect("public key");
         serde_json::json!({
             "kty": "AKP",
             "kid": kid,
             "use": "sig",
-            "alg": "ML-DSA-65",
+            "alg": algorithm.jose_alg(),
             "pub": public,
             "priv": URL_SAFE_NO_PAD.encode(seed),
         })
         .to_string()
+    }
+
+    #[cfg(feature = "pqc-openssl-unstable")]
+    fn mldsa_private_jwk(seed: [u8; 32], kid: &str) -> String {
+        mldsa_private_jwk_for_algorithm(MlDsaAlgorithm::MlDsa65, seed, kid)
     }
 
     #[cfg(feature = "pqc-openssl-unstable")]
@@ -1834,6 +1842,50 @@ mod tests {
         let decoded: MintedClaims = verify_claims_against_jwks(&token, &jwks).expect("verify");
         assert_eq!(decoded.sub, "user@example.com");
         assert_eq!(decoded.aud, "api://chat-mcp");
+    }
+
+    #[cfg(feature = "pqc-openssl-unstable")]
+    #[test]
+    fn all_mldsa_algorithms_sign_publish_akp_and_verify_claims() {
+        for (algorithm, seed_byte) in [
+            (MlDsaAlgorithm::MlDsa44, 44_u8),
+            (MlDsaAlgorithm::MlDsa65, 65_u8),
+            (MlDsaAlgorithm::MlDsa87, 87_u8),
+        ] {
+            let private_jwk = mldsa_private_jwk_for_algorithm(algorithm, [seed_byte; 32], "ml-kid");
+            let signer = MlDsaJoseSigner::from_private_jwk_for_backend(
+                &BackendSelection::parse(algorithm.jose_alg()),
+                &private_jwk,
+                "fallback",
+            )
+            .expect("mldsa signer");
+
+            let token = signer.sign_claims(&claims()).expect("sign");
+            let header: serde_json::Value = serde_json::from_slice(
+                &URL_SAFE_NO_PAD.decode(token.split('.').next().unwrap().as_bytes()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(header["alg"], algorithm.jose_alg());
+            assert_eq!(header["typ"], "at+jwt");
+
+            let jwks = signer.public_jwks();
+            let public = &jwks.keys[0];
+            assert_eq!(public.kty, "AKP");
+            assert_eq!(public.alg, algorithm.jose_alg());
+            assert_eq!(
+                URL_SAFE_NO_PAD
+                    .decode(public.pub_.as_ref().expect("public").as_bytes())
+                    .expect("public base64url")
+                    .len(),
+                algorithm.public_key_len()
+            );
+            let public_json = serde_json::to_value(&jwks).expect("jwks json");
+            assert!(public_json["keys"][0].get("priv").is_none());
+
+            let decoded: MintedClaims = verify_claims_against_jwks(&token, &jwks).expect("verify");
+            assert_eq!(decoded.sub, "user@example.com");
+            assert_eq!(decoded.aud, "api://chat-mcp");
+        }
     }
 
     #[cfg(feature = "pqc-openssl-unstable")]

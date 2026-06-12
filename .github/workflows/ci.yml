@@ -28,3 +28,6 @@ jobs:
 
       - name: Workspace tests
         run: cargo test --workspace
+
+      - name: Workspace tests with experimental feature gates
+        run: cargo test --workspace --all-features
