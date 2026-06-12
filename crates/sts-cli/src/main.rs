@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use sha2::{Digest, Sha256};
+use sts_dpop::{DpopHolderKey, DpopProofBuild, dpop_htu_for_request_uri, generate_dpop_jti};
 use sts_jose::{
     JoseSigner, JwksDocument, PublicJwk, RsaJoseSigner, rsa_public_key_bits_from_jwk,
     verify_claims_against_jwks_with_header,
@@ -52,6 +53,11 @@ enum Command {
         #[command(subcommand)]
         command: KeyCommand,
     },
+    /// Manage DPoP holder keys for sender-constrained token exchange.
+    Dpop {
+        #[command(subcommand)]
+        command: DpopCommand,
+    },
     /// Call the STS token endpoint with a redacted RFC 8693 token exchange request.
     Exchange(Box<ExchangeArgs>),
 }
@@ -83,6 +89,21 @@ enum KeyCommand {
     Rotate(RotateArgs),
 }
 
+#[derive(Debug, Subcommand)]
+enum DpopCommand {
+    /// Manage DPoP holder keys.
+    Key {
+        #[command(subcommand)]
+        command: DpopKeyCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DpopKeyCommand {
+    /// Generate a private P-256 DPoP holder JWK without printing private material.
+    Generate(DpopKeyGenerateArgs),
+}
+
 #[derive(Debug, Args)]
 struct InspectFileArgs {
     /// Path to a public JWKS or public JWK JSON file.
@@ -101,6 +122,13 @@ struct RotateArgs {
     /// Validate the rotation plan without writing files or generating replacement key material.
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct DpopKeyGenerateArgs {
+    /// Output path for the private DPoP holder JWK. The file must not already exist.
+    #[arg(long, value_name = "PATH")]
+    out: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -145,8 +173,11 @@ struct ExchangeArgs {
     #[arg(long)]
     requested_token_type: Option<String>,
     /// File containing a precomputed DPoP proof JWT to send in the DPoP header.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "dpop_key_file")]
     dpop_proof_file: Option<PathBuf>,
+    /// Private DPoP holder JWK used to generate a fresh token-endpoint proof.
+    #[arg(long, value_name = "PATH", conflicts_with = "dpop_proof_file")]
+    dpop_key_file: Option<PathBuf>,
     /// Public JWKS file used to verify the minted JWT before printing claims.
     #[arg(long, value_name = "PATH", conflicts_with = "jwks_url")]
     jwks_file: Option<PathBuf>,
@@ -231,6 +262,11 @@ async fn run(cli: Cli) -> Result<String, CliError> {
             KeyCommand::Inspect(args) => inspect_file(&args.file, InspectMode::SingleKey),
             KeyCommand::Rotate(args) => rotate_signing_key(args),
         },
+        Command::Dpop { command } => match command {
+            DpopCommand::Key { command } => match command {
+                DpopKeyCommand::Generate(args) => generate_dpop_key(args),
+            },
+        },
         Command::Exchange(args) => run_exchange(*args).await,
     }
 }
@@ -246,10 +282,22 @@ async fn run_smoke(args: SmokeArgs) -> Result<String, CliError> {
     Ok(format!("smoke_status=ok\nnetwork={network}\n"))
 }
 
+fn generate_dpop_key(args: DpopKeyGenerateArgs) -> Result<String, CliError> {
+    let generated = DpopHolderKey::generate_private_jwk()
+        .map_err(|err| CliError::runtime(format!("failed to generate DPoP holder key: {err}")))?;
+    write_new_secret_text(&args.out, &generated.private_jwk_json, 0o600)?;
+    Ok(format!(
+        "dpop_key_status=generated\nprivate_key_file={}\nprivate_key_mode=0600\nalg=ES256\ncrv=P-256\njkt_sha256_prefix={}\n",
+        sanitize_path(&args.out),
+        sha256_hex_prefix(&generated.public_jkt),
+    ))
+}
+
 struct ExchangeHttpRequest {
     token_endpoint: String,
     body: String,
     dpop_proof: Option<String>,
+    dpop_jkt: Option<String>,
 }
 
 async fn run_exchange(args: ExchangeArgs) -> Result<String, CliError> {
@@ -293,7 +341,14 @@ async fn run_exchange(args: ExchangeArgs) -> Result<String, CliError> {
         )));
     }
 
-    render_exchange_success(&args, status.as_u16(), response_body, &client).await
+    render_exchange_success(
+        &args,
+        status.as_u16(),
+        response_body,
+        request.dpop_jkt.as_deref(),
+        &client,
+    )
+    .await
 }
 
 fn build_exchange_http_request(args: &ExchangeArgs) -> Result<ExchangeHttpRequest, CliError> {
@@ -314,6 +369,24 @@ fn build_exchange_http_request(args: &ExchangeArgs) -> Result<ExchangeHttpReques
         .as_deref()
         .map(|path| read_secret_file(path, "DPoP proof"))
         .transpose()?;
+    let (dpop_proof, dpop_jkt) = if let Some(path) = &args.dpop_key_file {
+        let raw = read_secret_file(path, "DPoP holder key")?;
+        let key = DpopHolderKey::from_private_jwk(&raw)
+            .map_err(|err| CliError::usage(format!("invalid DPoP holder key: {err}")))?;
+        let htu = dpop_htu_for_request_uri(&token_endpoint)
+            .map_err(|err| CliError::usage(format!("invalid DPoP token endpoint: {err}")))?;
+        let proof = key
+            .sign_proof(DpopProofBuild {
+                htm: "POST".to_string(),
+                htu,
+                iat: unix_timestamp_now()?,
+                jti: generate_dpop_jti(),
+            })
+            .map_err(|err| CliError::runtime(format!("failed to sign DPoP proof: {err}")))?;
+        (Some(proof), Some(key.public_jkt().to_string()))
+    } else {
+        (dpop_proof, None)
+    };
 
     let mut form = Vec::new();
     push_form_param(&mut form, "grant_type", TOKEN_EXCHANGE_GRANT_TYPE)?;
@@ -345,7 +418,7 @@ fn build_exchange_http_request(args: &ExchangeArgs) -> Result<ExchangeHttpReques
 
     let body = serde_urlencoded::to_string(&form)
         .map_err(|err| CliError::runtime(format!("failed to encode exchange form: {err}")))?;
-    Ok(ExchangeHttpRequest { token_endpoint, body, dpop_proof })
+    Ok(ExchangeHttpRequest { token_endpoint, body, dpop_proof, dpop_jkt })
 }
 
 fn resolve_token_endpoint(args: &ExchangeArgs) -> Result<String, CliError> {
@@ -374,6 +447,47 @@ fn read_secret_file(path: &Path, label: &str) -> Result<String, CliError> {
         return Err(CliError::usage(format!("{label} file {} is empty", sanitize_path(path))));
     }
     Ok(value.to_string())
+}
+
+fn write_new_secret_text(path: &Path, value: &str, mode: u32) -> Result<(), CliError> {
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|err| {
+            CliError::runtime(format!("failed to create directory {}: {err}", parent.display()))
+        })?;
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    let mut file = options.open(path).map_err(|err| {
+        CliError::runtime(format!("failed to create secret file {}: {err}", sanitize_path(path)))
+    })?;
+    file.write_all(value.as_bytes()).and_then(|_| file.sync_all()).map_err(|err| {
+        CliError::runtime(format!("failed to write secret file {}: {err}", sanitize_path(path)))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|err| {
+            CliError::runtime(format!(
+                "failed to set permissions on secret file {}: {err}",
+                sanitize_path(path)
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn unix_timestamp_now() -> Result<i64, CliError> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| CliError::runtime(format!("system clock is before Unix epoch: {err}")))?
+        .as_secs();
+    i64::try_from(seconds)
+        .map_err(|_| CliError::runtime("system time exceeds supported JWT timestamp range"))
 }
 
 fn push_form_param(
@@ -424,6 +538,7 @@ async fn render_exchange_success(
     args: &ExchangeArgs,
     http_status: u16,
     body: serde_json::Value,
+    expected_dpop_jkt: Option<&str>,
     client: &reqwest::Client,
 ) -> Result<String, CliError> {
     let access_token =
@@ -499,6 +614,28 @@ async fn render_exchange_success(
     }
     if let Some(kid) = verified_kid {
         safe.insert("jwt_header_kid".to_string(), serde_json::json!(sanitize(&kid)));
+    }
+    if let Some(expected_jkt) = expected_dpop_jkt {
+        let claims = claims.as_ref().ok_or_else(|| {
+            CliError::runtime("DPoP exchange response access_token is not a compact JWT")
+        })?;
+        let actual_jkt = claims
+            .get("cnf")
+            .and_then(|cnf| cnf.get("jkt"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                CliError::runtime("DPoP exchange response missing access_token cnf.jkt")
+            })?;
+        if actual_jkt != expected_jkt {
+            return Err(CliError::runtime(
+                "DPoP exchange response cnf.jkt does not match holder key",
+            ));
+        }
+        safe.insert("dpop_cnf_jkt_matches_holder".to_string(), serde_json::json!(true));
+        safe.insert(
+            "dpop_holder_jkt_sha256_prefix".to_string(),
+            serde_json::json!(sha256_hex_prefix(expected_jkt)),
+        );
     }
     if let Some(claims) = claims {
         safe.insert("claims".to_string(), safe_claims_summary(&claims));
@@ -693,6 +830,8 @@ fn render_exchange_map_lines(
         "jwt_header_alg",
         "jwt_header_kid",
         "jwt_header_typ",
+        "dpop_cnf_jkt_matches_holder",
+        "dpop_holder_jkt_sha256_prefix",
     ] {
         if let Some(value) = safe.get(name) {
             output.push_str(&format!("{name}={}\n", display_json_scalar(value)));
@@ -1286,6 +1425,21 @@ mod tests {
     }
 
     #[test]
+    fn parser_accepts_dpop_key_generate_command() {
+        let cli = Cli::try_parse_from(["sts-cli", "dpop", "key", "generate", "--out", "dpop.json"])
+            .expect("parse dpop key generate");
+
+        match cli.command {
+            Command::Dpop {
+                command: DpopCommand::Key { command: DpopKeyCommand::Generate(args) },
+            } => {
+                assert_eq!(args.out, PathBuf::from("dpop.json"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parser_accepts_exchange_command() {
         let cli = Cli::try_parse_from([
             "sts-cli",
@@ -1302,6 +1456,8 @@ mod tests {
             "https://chat.example/resource",
             "--scope",
             "chat.read",
+            "--dpop-key-file",
+            "dpop-private.json",
             "--jwks-file",
             "jwks.json",
         ])
@@ -1317,6 +1473,7 @@ mod tests {
                 assert_eq!(args.audience, vec!["api://chat-mcp"]);
                 assert_eq!(args.resource, vec!["https://chat.example/resource"]);
                 assert_eq!(args.scope.as_deref(), Some("chat.read"));
+                assert_eq!(args.dpop_key_file, Some(PathBuf::from("dpop-private.json")));
                 assert_eq!(args.jwks_file, Some(PathBuf::from("jwks.json")));
                 assert_eq!(args.output, ExchangeOutputFormat::Redacted);
             }
@@ -1424,6 +1581,82 @@ mod tests {
         assert!(!output.contains("actor-token-secret"));
         assert!(!output.contains("dpop.proof.secret"));
         assert!(!output.contains("minted-jti-secret"));
+        assert!(!output.contains("user@example.com"));
+        assert!(!output.contains("eyJ"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn exchange_generates_dpop_proof_and_checks_holder_binding() {
+        let dir = unique_temp_dir("sts-cli-exchange-dpop-generated");
+        let subject_file = dir.join("subject.txt");
+        let actor_file = dir.join("actor.jwt");
+        let dpop_key_file = dir.join("dpop_private_jwk.json");
+        let jwks_file = dir.join("jwks.json");
+        fs::write(&subject_file, "subject-token-secret\n").expect("write subject");
+        fs::write(&actor_file, "actor-token-secret\n").expect("write actor");
+        let generated = DpopHolderKey::generate_private_jwk().expect("dpop key");
+        fs::write(&dpop_key_file, &generated.private_jwk_json).expect("write dpop key");
+
+        let signer = RsaJoseSigner::generate_for_tests("sts-kid").expect("signer");
+        write_jwks(&jwks_file, signer.public_jwks().keys);
+        let minted_token = signer
+            .sign_json_claims(&serde_json::json!({
+                "iss": "http://127.0.0.1:8888/tenant1",
+                "sub": "user@example.com",
+                "aud": "api://chat-mcp",
+                "scope": "chat.read",
+                "act": {"sub": "chat-mcp"},
+                "cnf": {"jkt": generated.public_jkt},
+                "iat": 1_000,
+                "exp": 2_000,
+                "jti": "minted-dpop-jti-secret"
+            }))
+            .expect("sign minted token");
+        let (sts_url, captured, handle) = spawn_exchange_server(
+            200,
+            serde_json::json!({
+                "access_token": minted_token,
+                "issued_token_type": ACCESS_TOKEN_TYPE,
+                "token_type": "DPoP",
+                "expires_in": 300,
+                "scope": "chat.read"
+            })
+            .to_string(),
+        );
+
+        let mut args = exchange_args(Some(sts_url.clone()), None, subject_file, Some(actor_file));
+        args.audience = vec!["api://chat-mcp".to_string()];
+        args.scope = Some("chat.read".to_string());
+        args.dpop_key_file = Some(dpop_key_file);
+        args.jwks_file = Some(jwks_file);
+
+        let output =
+            run(Cli { command: Command::Exchange(Box::new(args)) }).await.expect("exchange");
+        let request = captured.recv_timeout(Duration::from_secs(3)).expect("captured request");
+        handle.join().expect("server joined");
+
+        let proof = header_value(&request.headers, "DPoP").expect("dpop header");
+        let htu = format!("{sts_url}/token");
+        let binding = sts_dpop::validate_dpop_proof(sts_dpop::DpopProofRequest {
+            proof,
+            htm: "POST",
+            htu: &htu,
+            now: unix_timestamp_now().expect("now"),
+            clock_skew_leeway: 300,
+        })
+        .expect("valid generated proof");
+        assert_eq!(binding.jkt, generated.public_jkt);
+
+        assert!(output.contains("exchange_status=ok"));
+        assert!(output.contains("token_type=DPoP"));
+        assert!(output.contains("dpop_cnf_jkt_matches_holder=true"));
+        assert!(output.contains("dpop_holder_jkt_sha256_prefix="));
+        assert!(output.contains("claims.cnf_jkt_sha256_prefix="));
+        assert!(!output.contains("subject-token-secret"));
+        assert!(!output.contains("actor-token-secret"));
+        assert!(!output.contains(&generated.public_jkt));
+        assert!(!output.contains("minted-dpop-jti-secret"));
         assert!(!output.contains("user@example.com"));
         assert!(!output.contains("eyJ"));
         let _ = fs::remove_dir_all(dir);
@@ -1544,6 +1777,59 @@ mod tests {
         let _ = fs::remove_file(path);
         assert!(output.contains("key_status=public"));
         assert!(output.contains("key[0].kid=kid-1"));
+    }
+
+    #[tokio::test]
+    async fn dpop_key_generate_writes_private_file_without_printing_material() {
+        let dir = unique_temp_dir("sts-cli-dpop-key-generate");
+        let key_file = dir.join("dpop_private_jwk.json");
+
+        let output = run(Cli {
+            command: Command::Dpop {
+                command: DpopCommand::Key {
+                    command: DpopKeyCommand::Generate(DpopKeyGenerateArgs {
+                        out: key_file.clone(),
+                    }),
+                },
+            },
+        })
+        .await
+        .expect("generate dpop key");
+
+        let raw = fs::read_to_string(&key_file).expect("read generated key");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("private jwk");
+        assert_eq!(value["kty"], "EC");
+        assert_eq!(value["crv"], "P-256");
+        assert_eq!(value["alg"], "ES256");
+        assert!(value.get("d").is_some());
+        DpopHolderKey::from_private_jwk(&raw).expect("load generated key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&key_file).expect("key metadata").permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        assert!(output.contains("dpop_key_status=generated"));
+        assert!(output.contains("private_key_mode=0600"));
+        assert!(output.contains("jkt_sha256_prefix="));
+        assert!(!output.contains(r#""d""#));
+        assert!(!output.contains(value["d"].as_str().expect("d")));
+
+        let err = run(Cli {
+            command: Command::Dpop {
+                command: DpopCommand::Key {
+                    command: DpopKeyCommand::Generate(DpopKeyGenerateArgs { out: key_file }),
+                },
+            },
+        })
+        .await
+        .expect_err("existing key must not be overwritten");
+        assert_eq!(err.code, 1);
+        assert!(err.message.contains("failed to create secret file"));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -1813,6 +2099,13 @@ mod tests {
         form.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
     }
 
+    fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+        headers.lines().find_map(|line| {
+            let (header_name, value) = line.split_once(':')?;
+            header_name.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+
     fn exchange_args(
         sts_url: Option<String>,
         token_endpoint: Option<String>,
@@ -1834,6 +2127,7 @@ mod tests {
             scope: None,
             requested_token_type: None,
             dpop_proof_file: None,
+            dpop_key_file: None,
             jwks_file: None,
             jwks_url: None,
             output: ExchangeOutputFormat::Redacted,

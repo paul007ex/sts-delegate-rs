@@ -1567,6 +1567,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "sha2",
+ "sts-dpop",
  "sts-http",
  "sts-jose",
  "tokio",

@@ -11,9 +11,12 @@ use std::str::FromStr;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::jwk::{AlgorithmParameters, Jwk, ThumbprintHash};
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
-use serde::Deserialize;
-use serde_json::Value;
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use p256::ecdsa::SigningKey;
+use p256::pkcs8::EncodePrivateKey;
+use rand_core::{OsRng, RngCore};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use url::Url;
 
 /// Public DPoP signing algorithms that this verifier enforces.
@@ -50,6 +53,32 @@ pub struct DpopBinding {
     pub jti: String,
     pub iat: i64,
     pub replay_expires_at: i64,
+}
+
+/// RFC 9449 ES256 holder key used to generate token-endpoint DPoP proofs.
+#[derive(Clone)]
+pub struct DpopHolderKey {
+    signing_key: SigningKey,
+    x: String,
+    y: String,
+    d: String,
+    jkt: String,
+}
+
+/// Generated holder-key material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedDpopHolderKey {
+    pub private_jwk_json: String,
+    pub public_jkt: String,
+}
+
+/// Input required to create one DPoP proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DpopProofBuild {
+    pub htm: String,
+    pub htu: String,
+    pub iat: i64,
+    pub jti: String,
 }
 
 /// DPoP validation failure category.
@@ -97,6 +126,156 @@ struct VerifiedDpopClaims {
     htu: Option<Value>,
     #[serde(default)]
     iat: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct OutboundDpopClaims<'a> {
+    jti: &'a str,
+    htm: &'a str,
+    htu: &'a str,
+    iat: i64,
+}
+
+impl DpopHolderKey {
+    /// Generate a fresh ES256 holder key and return private JWK JSON for
+    /// operator custody. The private value must be written to a secret file by
+    /// the caller and is never logged by this crate.
+    pub fn generate_private_jwk() -> Result<GeneratedDpopHolderKey, DpopError> {
+        let key = Self::from_signing_key(SigningKey::random(&mut OsRng))?;
+        let mut private_jwk = key.public_jwk_value();
+        let object = private_jwk.as_object_mut().ok_or_else(|| {
+            DpopError::invalid("generated DPoP key did not produce a JSON object")
+        })?;
+        object.insert("d".to_string(), json!(key.d));
+        object.insert("use".to_string(), json!("sig"));
+        object.insert("kid".to_string(), json!(key.jkt));
+
+        let mut private_jwk_json = serde_json::to_string_pretty(&private_jwk)
+            .map_err(|_| DpopError::invalid("failed to encode generated DPoP private JWK"))?;
+        private_jwk_json.push('\n');
+
+        Ok(GeneratedDpopHolderKey { private_jwk_json, public_jkt: key.jkt })
+    }
+
+    /// Load an ES256 DPoP holder key from a private P-256 JWK.
+    pub fn from_private_jwk(raw: &str) -> Result<Self, DpopError> {
+        let value: Value = serde_json::from_str(raw)
+            .map_err(|_| DpopError::invalid("DPoP holder key file is not valid JSON"))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| DpopError::invalid("DPoP holder key must be a JSON object"))?;
+
+        let kty = required_jwk_string(object, "kty")?;
+        let crv = required_jwk_string(object, "crv")?;
+        let x = required_jwk_string(object, "x")?;
+        let y = required_jwk_string(object, "y")?;
+        let d = required_jwk_string(object, "d")?;
+        if kty != "EC" || crv != "P-256" {
+            return Err(DpopError::invalid("DPoP holder key must be an EC P-256 JWK"));
+        }
+        if let Some(alg) = object.get("alg").and_then(Value::as_str)
+            && alg != "ES256"
+        {
+            return Err(DpopError::invalid("DPoP holder key alg must be ES256 when present"));
+        }
+        if object.contains_key("k") {
+            return Err(DpopError::invalid("DPoP holder key must not be symmetric JWK material"));
+        }
+
+        let d_bytes = decode_coordinate(&d, "d")?;
+        let signing_key = SigningKey::from_bytes(p256::FieldBytes::from_slice(&d_bytes))
+            .map_err(|_| DpopError::invalid("DPoP holder key private scalar is invalid"))?;
+        let key = Self::from_signing_key(signing_key)?;
+        if key.x != x || key.y != y {
+            return Err(DpopError::invalid(
+                "DPoP holder key public coordinates do not match private scalar",
+            ));
+        }
+        Ok(key)
+    }
+
+    /// Public JWK SHA-256 thumbprint used as `cnf.jkt`.
+    pub fn public_jkt(&self) -> &str {
+        &self.jkt
+    }
+
+    /// Sign one RFC 9449 DPoP proof with this holder key.
+    pub fn sign_proof(&self, proof: DpopProofBuild) -> Result<String, DpopError> {
+        if proof.htm.trim().is_empty() || proof.htu.trim().is_empty() {
+            return Err(DpopError::invalid("DPoP proof htm/htu must not be empty"));
+        }
+        validate_jti(&proof.jti)?;
+        let mut header = Header::new(Algorithm::ES256);
+        header.typ = Some(DPOP_TYP.to_string());
+        header.jwk = Some(self.public_jwk()?);
+        let claims = OutboundDpopClaims {
+            jti: &proof.jti,
+            htm: proof.htm.as_str(),
+            htu: proof.htu.as_str(),
+            iat: proof.iat,
+        };
+        let der = self
+            .signing_key
+            .to_pkcs8_der()
+            .map_err(|_| DpopError::invalid("failed to encode DPoP holder key"))?;
+        encode(&header, &claims, &EncodingKey::from_ec_der(der.as_bytes()))
+            .map_err(|_| DpopError::invalid("failed to sign DPoP proof"))
+    }
+
+    fn from_signing_key(signing_key: SigningKey) -> Result<Self, DpopError> {
+        let verifying_key = signing_key.verifying_key();
+        let point = verifying_key.to_encoded_point(false);
+        let x = URL_SAFE_NO_PAD.encode(
+            point.x().ok_or_else(|| DpopError::invalid("DPoP public key missing x coordinate"))?,
+        );
+        let y = URL_SAFE_NO_PAD.encode(
+            point.y().ok_or_else(|| DpopError::invalid("DPoP public key missing y coordinate"))?,
+        );
+        let d = URL_SAFE_NO_PAD.encode(signing_key.to_bytes());
+        let public_jwk_value = json!({
+            "kty": "EC",
+            "crv": "P-256",
+            "x": x.clone(),
+            "y": y.clone(),
+            "alg": "ES256",
+        });
+        let public_jwk: Jwk = serde_json::from_value(public_jwk_value)
+            .map_err(|_| DpopError::invalid("generated DPoP public JWK is invalid"))?;
+        let jkt = public_jwk.thumbprint(ThumbprintHash::SHA256);
+        Ok(Self { signing_key, x, y, d, jkt })
+    }
+
+    fn public_jwk_value(&self) -> Value {
+        json!({
+            "kty": "EC",
+            "crv": "P-256",
+            "x": self.x,
+            "y": self.y,
+            "alg": "ES256",
+        })
+    }
+
+    fn public_jwk(&self) -> Result<Jwk, DpopError> {
+        serde_json::from_value(self.public_jwk_value())
+            .map_err(|_| DpopError::invalid("DPoP public JWK is invalid"))
+    }
+}
+
+/// Generate a bounded random DPoP proof `jti`.
+pub fn generate_dpop_jti() -> String {
+    let mut bytes = [0_u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Normalize a request URI into the RFC 9449 `htu` value by stripping query and
+/// fragment components.
+pub fn dpop_htu_for_request_uri(uri: &str) -> Result<String, DpopError> {
+    let mut parsed =
+        Url::parse(uri).map_err(|_| DpopError::invalid("DPoP htu must be an absolute URI"))?;
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Ok(parsed.to_string())
 }
 
 /// Validate the stateless RFC 9449 token-endpoint DPoP proof requirements.
@@ -166,6 +345,28 @@ fn decode_json_part(part: &str, name: &str) -> Result<Value, DpopError> {
     })?;
     serde_json::from_slice(&bytes)
         .map_err(|_| DpopError::invalid(format!("DPoP proof {name} is not valid JSON")))
+}
+
+fn required_jwk_string(
+    object: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<String, DpopError> {
+    object
+        .get(name)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| DpopError::invalid(format!("DPoP holder key missing {name}")))
+}
+
+fn decode_coordinate(value: &str, name: &str) -> Result<Vec<u8>, DpopError> {
+    let decoded = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| DpopError::invalid(format!("DPoP holder key {name} is not base64url")))?;
+    if decoded.len() != 32 {
+        return Err(DpopError::invalid(format!("DPoP holder key {name} must be 32 bytes")));
+    }
+    Ok(decoded)
 }
 
 fn validate_header(header: &Value) -> Result<(Algorithm, Jwk), DpopError> {
@@ -331,6 +532,105 @@ mod tests {
     use p256::pkcs8::EncodePrivateKey;
     use rand_core::OsRng;
     use serde_json::json;
+
+    #[test]
+    fn generated_holder_key_signs_valid_token_endpoint_proof() {
+        let generated = DpopHolderKey::generate_private_jwk().expect("generated key");
+        let key = DpopHolderKey::from_private_jwk(&generated.private_jwk_json).expect("load key");
+        assert_eq!(key.public_jkt(), generated.public_jkt);
+        assert!(generated.private_jwk_json.contains("\"d\""));
+        assert!(!generated.private_jwk_json.contains("\"k\""));
+
+        let htu =
+            dpop_htu_for_request_uri("https://sts.example/token?ignored=1#fragment").expect("htu");
+        assert_eq!(htu, "https://sts.example/token");
+        let proof = key
+            .sign_proof(DpopProofBuild {
+                htm: "POST".to_string(),
+                htu: htu.clone(),
+                iat: 100,
+                jti: "proof-generated-1".to_string(),
+            })
+            .expect("proof");
+
+        let binding = validate_dpop_proof(DpopProofRequest {
+            proof: &proof,
+            htm: "POST",
+            htu: &htu,
+            now: 100,
+            clock_skew_leeway: 5,
+        })
+        .expect("valid proof");
+        assert_eq!(binding.jkt, generated.public_jkt);
+        assert_eq!(binding.jti, "proof-generated-1");
+
+        let (header, _, _) = compact_parts(&proof).expect("compact proof");
+        let header = decode_json_part(header, "header").expect("header");
+        assert_eq!(header["typ"], "dpop+jwt");
+        assert_eq!(header["alg"], "ES256");
+        assert!(header["jwk"].get("d").is_none());
+        assert!(header["jwk"].get("k").is_none());
+    }
+
+    #[test]
+    fn generated_holder_key_proof_rejects_wrong_method_or_uri() {
+        let generated = DpopHolderKey::generate_private_jwk().expect("generated key");
+        let key = DpopHolderKey::from_private_jwk(&generated.private_jwk_json).expect("load key");
+        let proof = key
+            .sign_proof(DpopProofBuild {
+                htm: "POST".to_string(),
+                htu: "https://sts.example/token".to_string(),
+                iat: 100,
+                jti: "proof-wrong-target".to_string(),
+            })
+            .expect("proof");
+
+        let wrong_method = validate_dpop_proof(DpopProofRequest {
+            proof: &proof,
+            htm: "GET",
+            htu: "https://sts.example/token",
+            now: 100,
+            clock_skew_leeway: 5,
+        })
+        .unwrap_err();
+        assert!(wrong_method.message.contains("htm"));
+
+        let wrong_uri = validate_dpop_proof(DpopProofRequest {
+            proof: &proof,
+            htm: "POST",
+            htu: "https://sts.example/other",
+            now: 100,
+            clock_skew_leeway: 5,
+        })
+        .unwrap_err();
+        assert!(wrong_uri.message.contains("htu"));
+    }
+
+    #[test]
+    fn holder_key_loader_rejects_mismatched_or_symmetric_private_material() {
+        let generated = DpopHolderKey::generate_private_jwk().expect("generated key");
+        let mut value: Value =
+            serde_json::from_str(&generated.private_jwk_json).expect("private jwk json");
+        value["x"] = json!(URL_SAFE_NO_PAD.encode([1_u8; 32]));
+        let err = match DpopHolderKey::from_private_jwk(&value.to_string()) {
+            Ok(_) => panic!("mismatched coordinates must fail"),
+            Err(err) => err,
+        };
+        assert!(err.message.contains("coordinates"));
+
+        let err = match DpopHolderKey::from_private_jwk(r#"{"kty":"oct","k":"secret"}"#) {
+            Ok(_) => panic!("symmetric key must fail"),
+            Err(err) => err,
+        };
+        assert!(err.message.contains("missing"));
+    }
+
+    #[test]
+    fn generated_jti_is_bounded() {
+        let jti = generate_dpop_jti();
+        assert!(!jti.is_empty());
+        assert!(jti.len() <= MAX_DPOP_JTI_LEN);
+    }
 
     fn es256_proof(now: i64, jti: &str, htm: &str, htu: &str) -> String {
         es256_proof_with_claims(json!({

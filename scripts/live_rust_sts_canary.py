@@ -401,6 +401,25 @@ def build_cli(skip_build: bool) -> Path:
     return binary
 
 
+def run_cli(binary: Path, args: list[str], *, timeout: int = 30) -> str:
+    completed = subprocess.run(
+        [str(binary), *args],
+        cwd=REPO,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=timeout,
+    )
+    combined = f"{completed.stdout}\n{completed.stderr}"
+    if completed.returncode != 0:
+        raise CanaryError(
+            f"sts-cli {' '.join(args[:2])} failed rc={completed.returncode}: {redact_string(combined[-500:])}"
+        )
+    if JWT_RE.search(combined) or BEARER_RE.search(combined):
+        raise CanaryError("sts-cli output contained an unredacted token-looking value")
+    return completed.stdout
+
+
 def process_command(pid: int) -> str | None:
     try:
         completed = subprocess.run(
@@ -726,6 +745,59 @@ def run_live(args: argparse.Namespace) -> bool:
             if replay_status != 400 or not isinstance(replay_body, dict) or replay_body.get("error") != "invalid_dpop_proof":
                 raise CanaryError(f"DPoP replay was not rejected status={replay_status} body={redact(replay_body)}")
             log("dpop_replay_rejected", status=replay_status, error=replay_body.get("error"))
+
+            cli_subject_file = tmpdir / "cli_subject_token.txt"
+            cli_actor_file = tmpdir / "cli_actor_token.jwt"
+            cli_jwks_file = tmpdir / "cli_rust_jwks.json"
+            cli_dpop_key_file = tmpdir / "cli_dpop_holder_private_jwk.json"
+            cli_subject_file.write_text(subject_token, encoding="utf-8")
+            cli_actor = actor_assertion(actor_jwk, config["actor_id"], issuer, subject_token)
+            cli_actor_file.write_text(cli_actor, encoding="utf-8")
+            cli_jwks_file.write_text(json.dumps(jwks, sort_keys=True), encoding="utf-8")
+            for path in (cli_subject_file, cli_actor_file, cli_jwks_file):
+                path.chmod(0o600)
+
+            key_output = run_cli(
+                binary,
+                ["dpop", "key", "generate", "--out", str(cli_dpop_key_file)],
+            )
+            if "dpop_key_status=generated" not in key_output or "jkt_sha256_prefix=" not in key_output:
+                raise CanaryError("sts-cli dpop key generate did not report safe key status")
+
+            cli_output = run_cli(
+                binary,
+                [
+                    "exchange",
+                    "--token-endpoint",
+                    token_endpoint,
+                    "--subject-token-file",
+                    str(cli_subject_file),
+                    "--actor-token-file",
+                    str(cli_actor_file),
+                    "--audience",
+                    config["target_audience"],
+                    "--scope",
+                    config["target_scope"],
+                    "--dpop-key-file",
+                    str(cli_dpop_key_file),
+                    "--jwks-file",
+                    str(cli_jwks_file),
+                ],
+            )
+            for expected in (
+                "exchange_status=ok",
+                "token_type=DPoP",
+                "jwt_signature_verified=true",
+                "dpop_cnf_jkt_matches_holder=true",
+                "claims.cnf_jkt_sha256_prefix=",
+            ):
+                if expected not in cli_output:
+                    raise CanaryError(f"sts-cli DPoP exchange output missing {expected}")
+            log(
+                "cli_dpop_exchange_pass",
+                output_sha256_prefix=sha256_prefix(cli_output),
+                key_output_sha256_prefix=sha256_prefix(key_output),
+            )
             log("live_rust_sts_canary_result", result="pass")
             return True
         except Exception as exc:

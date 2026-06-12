@@ -144,12 +144,15 @@ cargo run -p sts-cli -- key rotate --dry-run \
 cargo run -p sts-cli -- key rotate \
   --key-file secrets/obo_sts_private_key.json \
   --extra-jwks-file secrets/obo_sts_retiring_jwks.json
+cargo run -p sts-cli -- dpop key generate \
+  --out secrets/dpop_holder_private_jwk.json
 cargo run -p sts-cli -- exchange \
   --sts-url http://127.0.0.1:8888/tenant1 \
   --subject-token-file user_access_token.txt \
   --actor-token-file chat-mcp.jwt \
   --audience api://databricks-mcp \
   --scope databricks.read \
+  --dpop-key-file secrets/dpop_holder_private_jwk.json \
   --jwks-url http://127.0.0.1:8888/tenant1/jwks
 ```
 
@@ -163,11 +166,14 @@ private or symmetric JWK input.
 `application/x-www-form-urlencoded` to `/token`, reads subject, actor, and
 client assertion values from files, and prints response metadata plus decoded
 safe claims by default. Submitted tokens, client assertions, DPoP proofs, raw
-JWT IDs, and the minted access token are not printed unless `--print-token` is
-set explicitly. Pass `--jwks-file` or `--jwks-url` to verify the minted JWT
-before claims are rendered. `--dpop-proof-file` can forward a precomputed DPoP
-proof in the `DPoP` header; CLI-managed holder-key custody and proof generation
-are tracked separately in issue #40.
+JWT IDs, holder-key thumbprints, and the minted access token are not printed
+unless `--print-token` is set explicitly. Pass `--jwks-file` or `--jwks-url` to
+verify the minted JWT before claims are rendered. `dpop key generate` writes a
+private P-256 holder JWK to a new `0600` file without printing private material;
+`exchange --dpop-key-file` signs a fresh RFC 9449 token-endpoint proof for the
+resolved `POST /token` request and verifies the minted token `cnf.jkt` matches
+the holder key. `--dpop-proof-file` remains available to forward a precomputed
+DPoP proof in the `DPoP` header for advanced/debug workflows.
 
 `key rotate` is the file-backed RSA private JWK rotation workflow. It validates
 the current private JWK and existing public overlap JWKS, stages the old public
