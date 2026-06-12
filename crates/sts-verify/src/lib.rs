@@ -384,26 +384,22 @@ pub fn verify_assertion(
     )
     .map_err(map_jose_error)?;
     let claims = verified.claims;
-    let expected_issuer = validate_issuer(options.expected_issuer).map_err(map_verify_error)?;
+    let _expected_issuer = validate_issuer(options.expected_issuer).map_err(map_verify_error)?;
     if claims.iss != claims.sub {
         return Err(VerifyError::new(
             VerifyErrorKind::InvalidClaims,
             "assertion iss and sub must match",
         ));
     }
-    if claims.iss != expected_issuer
-        && claims.aud != serde_json::Value::String(expected_issuer.clone())
-    {
-        // Keep the audience gate explicit; the caller can accept either the issuer
-        // or the token endpoint in expected_audiences.
-        let aud_ok =
-            options.expected_audiences.iter().any(|value| audience_matches(&claims.aud, value));
-        if !aud_ok {
-            return Err(VerifyError::new(
-                VerifyErrorKind::InvalidAudience,
-                "assertion audience does not identify this authorization server",
-            ));
-        }
+    // RFC 7523 Section 3 requires every assertion to identify this authorization
+    // server as an intended audience. Issuer equality is not an audience substitute.
+    let aud_ok =
+        options.expected_audiences.iter().any(|value| audience_matches(&claims.aud, value));
+    if !aud_ok {
+        return Err(VerifyError::new(
+            VerifyErrorKind::InvalidAudience,
+            "assertion audience does not identify this authorization server",
+        ));
     }
     if let Some(registry) = options.key_binding_registry
         && !kid_belongs_to_claimed_identity(&verified.kid, &claims.sub, registry)
@@ -730,5 +726,43 @@ mod tests {
         .unwrap();
         assert_eq!(claims.sub, "chat-mcp");
         assert!(claims.sub_tok_hash.is_some());
+    }
+
+    #[test]
+    fn rfc7523_assertion_audience_is_always_validated() {
+        let signer = signer();
+        let issued_at = now_unix();
+        let token = signer
+            .sign_json_claims(&AssertionWireClaims {
+                iss: "https://sts.example".to_string(),
+                sub: "https://sts.example".to_string(),
+                aud: "https://attacker.example/token".to_string(),
+                exp: issued_at + 600,
+                iat: issued_at,
+                jti: "jti-audience-bypass".to_string(),
+                sub_tok_hash: subject_token_hash("subject-token"),
+            })
+            .expect("sign");
+
+        let err = match verify_assertion(
+            &token,
+            &signer.public_jwks(),
+            AssertionVerificationOptions {
+                expected_issuer: "https://sts.example/",
+                expected_audiences: &[
+                    "https://sts.example".to_string(),
+                    "https://sts.example/token".to_string(),
+                ],
+                clock_skew_leeway: 30,
+                max_ttl: 3600,
+                binding_subject_token: Some("subject-token"),
+                require_subject_binding: true,
+                key_binding_registry: None,
+            },
+        ) {
+            Ok(_) => panic!("assertion with wrong audience was accepted"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind, VerifyErrorKind::InvalidAudience);
     }
 }
