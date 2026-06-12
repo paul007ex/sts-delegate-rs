@@ -457,7 +457,7 @@ fn validate_jti(jti: &str) -> Result<&str, DpopError> {
 }
 
 fn validate_htm(claim_htm: &str, htm: &str) -> Result<(), DpopError> {
-    if !claim_htm.eq_ignore_ascii_case(htm) {
+    if claim_htm != htm {
         return Err(DpopError::invalid("DPoP proof htm does not match the request method"));
     }
     Ok(())
@@ -509,11 +509,7 @@ fn canonical_htu(value: &str) -> Option<String> {
         Some(port) if Some(port) != default_port(&scheme) => format!("{host}:{port}"),
         _ => host,
     };
-    let mut canonical = format!("{scheme}://{netloc}{}", parsed.path());
-    while canonical.ends_with('/') {
-        canonical.pop();
-    }
-    Some(canonical)
+    Some(format!("{scheme}://{netloc}{}", parsed.path()))
 }
 
 fn default_port(scheme: &str) -> Option<u16> {
@@ -607,6 +603,32 @@ mod tests {
     }
 
     #[test]
+    fn rfc9449_dpop_htm_matches_http_method_case_sensitively() {
+        let generated = DpopHolderKey::generate_private_jwk().expect("generated key");
+        let key = DpopHolderKey::from_private_jwk(&generated.private_jwk_json).expect("load key");
+        let proof = key
+            .sign_proof(DpopProofBuild {
+                htm: "post".to_string(),
+                htu: "https://sts.example/token".to_string(),
+                iat: 100,
+                jti: "proof-lowercase-method".to_string(),
+            })
+            .expect("proof");
+
+        let err = match validate_dpop_proof(DpopProofRequest {
+            proof: &proof,
+            htm: "POST",
+            htu: "https://sts.example/token",
+            now: 100,
+            clock_skew_leeway: 5,
+        }) {
+            Ok(_) => panic!("lowercase DPoP htm was accepted for uppercase request method"),
+            Err(err) => err,
+        };
+        assert!(err.message.contains("htm"));
+    }
+
+    #[test]
     fn holder_key_loader_rejects_mismatched_or_symmetric_private_material() {
         let generated = DpopHolderKey::generate_private_jwk().expect("generated key");
         let mut value: Value =
@@ -690,7 +712,7 @@ mod tests {
         let proof = es256_proof(100, "proof-1", "POST", "https://STS.EXAMPLE:443/token?x=1");
         let binding = validate_dpop_proof(DpopProofRequest {
             proof: &proof,
-            htm: "post",
+            htm: "POST",
             htu: "https://sts.example/token",
             now: 100,
             clock_skew_leeway: 30,
@@ -814,6 +836,23 @@ mod tests {
             clock_skew_leeway: 30,
         })
         .unwrap_err();
+        assert!(err.message.contains("htu"));
+    }
+
+    #[test]
+    fn rfc9449_dpop_htu_keeps_path_trailing_slash_significant() {
+        let proof =
+            es256_proof(100, "proof-trailing-slash-path", "POST", "https://sts.example/token/");
+        let err = match validate_dpop_proof(DpopProofRequest {
+            proof: &proof,
+            htm: "POST",
+            htu: "https://sts.example/token",
+            now: 100,
+            clock_skew_leeway: 30,
+        }) {
+            Ok(_) => panic!("DPoP htu with a different path trailing slash was accepted"),
+            Err(err) => err,
+        };
         assert!(err.message.contains("htu"));
     }
 

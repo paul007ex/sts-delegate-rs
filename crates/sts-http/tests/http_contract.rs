@@ -751,6 +751,36 @@ async fn contract_dpop_delegation_binds_token_and_returns_dpop_type() {
 }
 
 #[tokio::test]
+async fn contract_dpop_method_and_path_mismatch_are_invalid_dpop_proof() {
+    let (state, subject_signer, actor_signer, _) = test_state();
+    let now = unix_now();
+    let cases = [
+        ("dpop-lowercase-htm", "post", "https://sts.example/token", "htm"),
+        ("dpop-path-trailing-slash", "POST", "https://sts.example/token/", "htu"),
+    ];
+
+    for (proof_jti, htm, htu, expected_description) in cases {
+        let subject_token = signed_subject_token(&subject_signer, now);
+        let actor_token = signed_assertion(&actor_signer, now, proof_jti);
+        let proof = dpop_proof(now, proof_jti, htm, htu);
+        let response = post_token_form_with_dpop_values(
+            state.clone(),
+            delegation_form(&subject_token, &actor_token),
+            &[&proof],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{proof_jti}");
+        let body = read_json(response).await;
+        assert_eq!(body["error"], "invalid_dpop_proof", "{proof_jti}");
+        assert!(
+            body["error_description"].as_str().unwrap_or("").contains(expected_description),
+            "{proof_jti}: {body}"
+        );
+        assert!(body.get("access_token").is_none(), "{proof_jti}");
+    }
+}
+
+#[tokio::test]
 async fn contract_dpop_replay_reuses_holder_key_and_jti_fail_closed() {
     let (state, subject_signer, actor_signer, _) = test_state();
     let now = unix_now();
