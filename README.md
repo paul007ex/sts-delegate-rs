@@ -72,9 +72,32 @@ The local archive contains the `sts-cli` binary plus public README/LICENSE mater
 when present. It does not include generated keys, tokens, environment files, or
 runtime policy files. `dist/` is ignored by git.
 
-Hosted release binaries, Docker/GHCR images, Homebrew formulas, `cargo-binstall`,
-and crates.io publication are not shipped in this phase. Track those as separate
-release follow-ups instead of treating local archives as hosted distribution.
+Hosted release binaries, published GHCR images, Homebrew formulas,
+`cargo-binstall`, and crates.io publication are not shipped in this phase. Track
+those as separate release follow-ups instead of treating local archives or local
+Docker builds as hosted distribution.
+
+To build a local Docker image:
+
+```bash
+docker build -t sts-delegate-rs:local .
+scripts/docker_smoke.sh sts-delegate-rs:local
+docker run --rm sts-delegate-rs:local --help
+```
+
+The Dockerfile is a local build path, not a GHCR publication claim. Runtime
+configuration and secrets must be supplied at `docker run` time with env vars and
+read-only mounted files; they are not baked into the image:
+
+```bash
+docker run --rm -p 8888:8888 \
+  --env-file sts.env \
+  -v "$PWD/secrets:/run/secrets/sts:ro" \
+  sts-delegate-rs:local serve
+```
+
+The image runs as a non-root `sts` user. Mounted key/JWKS files must be readable
+by that user or by a compatible group.
 
 The default signing runtime is classical RS256. Experimental ML-DSA signing,
 AKP JWKS publication, and ML-DSA verification can be compiled with
@@ -160,6 +183,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 python3 scripts/live_rust_sts_canary.py --self-test-redaction
 scripts/package_release.sh
 shasum -a 256 -c dist/SHA256SUMS
+docker build -t sts-delegate-rs:local .
+scripts/docker_smoke.sh sts-delegate-rs:local
 ```
 
 GitHub tag source archives and local `dist/` archives are the release artifacts for
