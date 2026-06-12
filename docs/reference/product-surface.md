@@ -9,7 +9,10 @@ the Rust repo has copied every Python document.
 | Surface | Rust status | Primary evidence | Python oracle source |
 | --- | --- | --- | --- |
 | Token exchange endpoint | Shipped: `POST /token` only. The legacy `/exchange` route is absent. | `crates/sts-http/src/lib.rs`; `crates/sts-http/tests/http_contract.rs`; ledger R-023/R-041 | `sts_delegate/docs/reference/api.md` |
-| Metadata | Shipped: `GET /.well-known/oauth-authorization-server`, including path-aware issuer aliases. No authorization endpoint is shipped. | ledger R-024 through R-031A | `sts_delegate/docs/reference/api.md` |
+| Introspection | Shipped: authenticated `POST /introspect` for STS-issued access tokens. Inactive responses are minimal. | issues #68; ledger R-023B/R-038A | No direct Python equivalent |
+| Revocation | Shipped: authenticated `POST /revoke` for STS-issued access tokens, enforced by `/introspect`. Unknown tokens return 200. | issues #88; ledger R-023C/R-038B | No direct Python equivalent |
+| Authorization server metadata | Shipped: `GET /.well-known/oauth-authorization-server`, including path-aware issuer aliases and truthful token/introspection/revocation endpoint links. No authorization endpoint is shipped. | ledger R-024 through R-031A | `sts_delegate/docs/reference/api.md` |
+| Protected resource metadata | Shipped: `GET /.well-known/oauth-protected-resource`, including path-aware resource aliases and enumerable target scopes. | issue #112; ledger R-023D | No direct Python equivalent |
 | JWKS | Shipped: `GET /jwks` publishes public STS signing keys only. | ledger R-032/R-079 | `sts_delegate/docs/reference/claims.md` |
 | CLI | Shipped: `serve`, `bootstrap-check`, `smoke`, `canary check-config`, JWKS/key inspection, file-backed RSA rotation, DPoP key generation, and redacted `exchange`. | `README.md`; `crates/sts-cli/src/main.rs`; ledger R-129 | Python CLI/docs are historical only |
 | Delegation | Shipped: subject `sub` is preserved and actor is recorded in `act.sub`. | `crates/sts-core/src/lib.rs`; ledger R-068/R-070 | `claims.md`; `rfc8693-mapping.md` |
@@ -59,6 +62,8 @@ the Rust repo has copied every Python document.
 | `invalid_scope` | JSON OAuth error from `/token` | No scope remains after downscoping. |
 | `server_error` | Sanitized JSON OAuth error | Signing/internal failures should not leak private detail. |
 | HTTP 503 | Deployment/runtime exhaustion path | Replay-store exhaustion is fail-closed. |
+| `active:false` | Minimal JSON from `/introspect` | Expired, revoked, malformed, wrong issuer, bad signature, unknown `kid`, or unsupported tokens. |
+| Revocation 200 | Empty/safe success response from `/revoke` | Valid, already revoked, malformed, and unknown tokens all avoid token-existence disclosure. |
 
 ## Docs Port Plan
 
@@ -77,7 +82,10 @@ the Rust repo has copied every Python document.
 ## Non-Goals
 
 - Do not document Rust as a full OAuth Authorization Server. It does not ship `/authorize`,
-  revocation, introspection, dynamic registration, or refresh-token issuance.
+  dynamic registration, refresh-token issuance, login, consent, ID tokens, UserInfo, or browser
+  sessions.
+- Do not imply `/revoke` provides refresh-token family revocation. Current revocation is scoped to
+  STS-issued access tokens and is observable through `/introspect`.
 - Do not claim KMS/HSM key custody until #43 lands.
 - Do not claim JWE, ML-KEM, encrypt/decrypt endpoints, PQC key rotation, or PQC VPN
   readiness from ML-DSA sign/JWKS/verify alone.

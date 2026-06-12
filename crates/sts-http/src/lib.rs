@@ -6,7 +6,7 @@
 //! error rendering. Token policy, verification, replay, and signing remain in
 //! their owning crates.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{OriginalUri, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -28,6 +28,7 @@ use http::header::{
 use http::{HeaderMap, StatusCode};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sts_config::{
     ClientAuthPolicy, ConfigError, ConfigSource, ReplayBackend, RuntimeConfig, TokenExchangeMode,
 };
@@ -43,7 +44,7 @@ use sts_jose::MlDsaJoseSigner;
 use sts_jose::{
     BackendSelection, ExternalRs256JoseSigner, JoseError, JoseErrorKind, JoseSigner, JwksDocument,
     MockExternalRs256Provider, PublicJwk, RsaJoseSigner, is_pqc_jws_alg,
-    rsa_public_key_bits_from_jwk, validate_public_jwk,
+    rsa_public_key_bits_from_jwk, validate_public_jwk, verify_claims_against_jwks_with_header,
 };
 use sts_replay::{
     FileReplayStore, InMemoryReplayStore, ReplayError, ReplayErrorKind, ReplayPolicy,
@@ -94,6 +95,7 @@ pub struct HttpState {
     pub actor_jwks: JwksDocument,
     pub client_jwks: JwksDocument,
     pub replay: Arc<ReplayPolicy>,
+    revocations: Arc<RevocationState>,
     metrics: Arc<MetricsState>,
 }
 
@@ -161,6 +163,7 @@ impl HttpState {
             actor_jwks,
             client_jwks,
             replay: Arc::new(replay),
+            revocations: Arc::new(RevocationState::default()),
             metrics: Arc::new(MetricsState::default()),
         }
     }
@@ -173,11 +176,83 @@ impl HttpState {
         format!("{}/jwks", self.config.our_issuer.trim_end_matches('/'))
     }
 
+    fn introspection_endpoint(&self) -> String {
+        format!("{}/introspect", self.config.our_issuer.trim_end_matches('/'))
+    }
+
+    fn revocation_endpoint(&self) -> String {
+        format!("{}/revoke", self.config.our_issuer.trim_end_matches('/'))
+    }
+
     fn issuer_path(&self) -> Option<String> {
         let parsed = Url::parse(&self.config.our_issuer).ok()?;
         let path = parsed.path().trim_end_matches('/');
         (!path.is_empty()).then(|| path.to_string())
     }
+
+    fn issuer_origin(&self) -> String {
+        let Ok(parsed) = Url::parse(&self.config.our_issuer) else {
+            return self.config.our_issuer.trim_end_matches('/').to_string();
+        };
+        let Some(host) = parsed.host_str() else {
+            return self.config.our_issuer.trim_end_matches('/').to_string();
+        };
+        let mut origin = format!("{}://{}", parsed.scheme(), host);
+        if let Some(port) = parsed.port() {
+            origin.push(':');
+            origin.push_str(&port.to_string());
+        }
+        origin
+    }
+
+    fn resource_identifier_for_metadata_path(&self, request_path: &str) -> String {
+        if let Some(path) = self.issuer_path()
+            && request_path == format!("/.well-known/oauth-protected-resource{path}")
+        {
+            return self.config.our_issuer.clone();
+        }
+        self.issuer_origin()
+    }
+}
+
+#[derive(Default)]
+struct RevocationState {
+    revoked: Mutex<BTreeMap<String, i64>>,
+}
+
+impl RevocationState {
+    fn revoke(&self, token: &str, exp: i64, now: i64, max_seen: usize) -> Result<(), HttpError> {
+        let mut revoked = self.revoked.lock().map_err(|_| {
+            HttpError::service_unavailable("revocation store unavailable, retry shortly")
+        })?;
+        sweep_revoked(&mut revoked, now);
+        let key = revocation_key(token);
+        if !revoked.contains_key(&key) && revoked.len() >= max_seen {
+            return Err(HttpError::service_unavailable("revocation store full, retry shortly"));
+        }
+        revoked.insert(key, exp);
+        Ok(())
+    }
+
+    fn is_revoked_or_unavailable(&self, token: &str, now: i64) -> bool {
+        let Ok(mut revoked) = self.revoked.lock() else {
+            return true;
+        };
+        sweep_revoked(&mut revoked, now);
+        revoked.contains_key(&revocation_key(token))
+    }
+}
+
+fn sweep_revoked(revoked: &mut BTreeMap<String, i64>, now: i64) {
+    revoked.retain(|_, exp| *exp >= now);
+}
+
+fn revocation_key(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sts-revocation-v1");
+    hasher.update([0]);
+    hasher.update(token.as_bytes());
+    hex_lower(&hasher.finalize())
 }
 
 #[derive(Default)]
@@ -266,9 +341,15 @@ fn escape_prometheus_label(value: &str) -> String {
 pub fn router(state: HttpState) -> Router {
     let mut app = Router::new()
         .route("/token", post(token).fallback(token_method_not_allowed))
+        .route("/introspect", post(introspect).get(method_not_allowed))
+        .route("/revoke", post(revoke).get(method_not_allowed))
         .route("/jwks", get(jwks))
         .route("/openapi.json", get(openapi))
-        .route("/.well-known/oauth-authorization-server", get(metadata));
+        .route("/.well-known/oauth-authorization-server", get(metadata))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(protected_resource_metadata).post(method_not_allowed),
+        );
 
     if state.config.enable_metrics {
         app = app.route("/metrics", get(metrics));
@@ -277,8 +358,14 @@ pub fn router(state: HttpState) -> Router {
     if let Some(path) = state.issuer_path() {
         app = app
             .route(&format!("{path}/token"), post(token).fallback(token_method_not_allowed))
+            .route(&format!("{path}/introspect"), post(introspect).get(method_not_allowed))
+            .route(&format!("{path}/revoke"), post(revoke).get(method_not_allowed))
             .route(&format!("{path}/jwks"), get(jwks))
-            .route(&format!("/.well-known/oauth-authorization-server{path}"), get(metadata));
+            .route(&format!("/.well-known/oauth-authorization-server{path}"), get(metadata))
+            .route(
+                &format!("/.well-known/oauth-protected-resource{path}"),
+                get(protected_resource_metadata).post(method_not_allowed),
+            );
     }
 
     app.with_state(state)
@@ -720,12 +807,32 @@ pub struct AuthorizationServerMetadata {
     pub issuer: String,
     pub token_endpoint: String,
     pub jwks_uri: String,
+    pub introspection_endpoint: String,
+    pub revocation_endpoint: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub response_types_supported: Vec<String>,
     pub grant_types_supported: Vec<String>,
     pub token_endpoint_auth_methods_supported: Vec<String>,
     pub token_endpoint_auth_signing_alg_values_supported: Vec<String>,
+    pub introspection_endpoint_auth_methods_supported: Vec<String>,
+    pub introspection_endpoint_auth_signing_alg_values_supported: Vec<String>,
+    pub revocation_endpoint_auth_methods_supported: Vec<String>,
+    pub revocation_endpoint_auth_signing_alg_values_supported: Vec<String>,
     pub dpop_signing_alg_values_supported: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub protected_resources: Vec<String>,
+}
+
+/// RFC 9728 protected resource metadata for STS-protected APIs/resources.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtectedResourceMetadata {
+    pub resource: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub authorization_servers: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scopes_supported: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bearer_methods_supported: Vec<String>,
 }
 
 /// OAuth token response for RFC 8693 token exchange.
@@ -759,6 +866,15 @@ struct TokenForm {
     resource: Option<String>,
     scope: Option<String>,
     requested_token_type: Option<String>,
+    client_id: Option<String>,
+    client_assertion: Option<String>,
+    client_assertion_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OnlineTokenForm {
+    token: Option<String>,
+    token_type_hint: Option<String>,
     client_id: Option<String>,
     client_assertion: Option<String>,
     client_assertion_type: Option<String>,
@@ -932,20 +1048,57 @@ async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
 }
 
 async fn metadata(State(state): State<HttpState>) -> impl IntoResponse {
+    let auth_methods = vec!["private_key_jwt".to_string()];
+    let auth_algs = inbound_jwt_signing_algs();
     let document = AuthorizationServerMetadata {
         issuer: state.config.our_issuer.clone(),
         token_endpoint: state.token_endpoint(),
         jwks_uri: state.jwks_uri(),
+        introspection_endpoint: state.introspection_endpoint(),
+        revocation_endpoint: state.revocation_endpoint(),
         response_types_supported: Vec::new(),
         grant_types_supported: vec![TOKEN_EXCHANGE_GRANT_TYPE.to_string()],
-        token_endpoint_auth_methods_supported: vec!["private_key_jwt".to_string()],
-        token_endpoint_auth_signing_alg_values_supported: inbound_jwt_signing_algs(),
+        token_endpoint_auth_methods_supported: auth_methods.clone(),
+        token_endpoint_auth_signing_alg_values_supported: auth_algs.clone(),
+        introspection_endpoint_auth_methods_supported: auth_methods.clone(),
+        introspection_endpoint_auth_signing_alg_values_supported: auth_algs.clone(),
+        revocation_endpoint_auth_methods_supported: auth_methods,
+        revocation_endpoint_auth_signing_alg_values_supported: auth_algs,
         dpop_signing_alg_values_supported: DPOP_SIGNING_ALGS_SUPPORTED
             .iter()
             .map(|alg| (*alg).to_string())
             .collect(),
+        protected_resources: vec![state.config.our_issuer.clone()],
     };
     (public_cache_headers(state.config.jwks_cache_max_age), Json(document))
+}
+
+async fn protected_resource_metadata(
+    OriginalUri(uri): OriginalUri,
+    State(state): State<HttpState>,
+) -> impl IntoResponse {
+    let mut scopes = BTreeSet::new();
+    for target in state.config.target_policy.targets.values() {
+        scopes.extend(target.allowed_scopes.iter().cloned());
+    }
+    let document = ProtectedResourceMetadata {
+        resource: state.resource_identifier_for_metadata_path(uri.path()),
+        authorization_servers: vec![state.config.our_issuer.clone()],
+        scopes_supported: scopes.into_iter().collect(),
+        bearer_methods_supported: vec!["header".to_string()],
+    };
+    (public_cache_headers(state.config.jwks_cache_max_age), Json(document))
+}
+
+async fn method_not_allowed() -> impl IntoResponse {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        token_headers(),
+        Json(serde_json::json!({
+            "error": "invalid_request",
+            "error_description": "method not allowed",
+        })),
+    )
 }
 
 async fn token_method_not_allowed() -> impl IntoResponse {
@@ -994,6 +1147,30 @@ fn is_recognized_token_form_key(key: &str) -> bool {
             | "client_id"
             | "client_assertion"
             | "client_assertion_type"
+    )
+}
+
+fn parse_online_token_form(headers: &HeaderMap, body: &[u8]) -> Result<OnlineTokenForm, HttpError> {
+    require_form_urlencoded(headers)?;
+    reject_authorization_header_client_auth(headers)?;
+    let pairs = url::form_urlencoded::parse(body).into_owned().collect::<Vec<_>>();
+    let mut seen = BTreeSet::new();
+    let mut form = OnlineTokenForm::default();
+    for (key, value) in pairs {
+        if is_online_token_param(&key) && !seen.insert(key.clone()) {
+            return Err(HttpError::invalid_request(format!(
+                "parameter {key:?} is included more than once"
+            )));
+        }
+        assign_online_token_form_value(&mut form, &key, value);
+    }
+    Ok(form)
+}
+
+fn is_online_token_param(key: &str) -> bool {
+    matches!(
+        key,
+        "token" | "token_type_hint" | "client_id" | "client_assertion" | "client_assertion_type"
     )
 }
 
@@ -1047,8 +1224,68 @@ fn assign_token_form_value(form: &mut TokenForm, key: &str, value: String) {
     }
 }
 
+fn assign_online_token_form_value(form: &mut OnlineTokenForm, key: &str, value: String) {
+    match key {
+        "token" => form.token = non_empty_form_value(value),
+        "token_type_hint" => form.token_type_hint = non_empty_form_value(value),
+        "client_id" => form.client_id = non_empty_form_value(value),
+        "client_assertion" => form.client_assertion = non_empty_form_value(value),
+        "client_assertion_type" => form.client_assertion_type = non_empty_form_value(value),
+        _ => {}
+    }
+}
+
 fn non_empty_form_value(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
+}
+
+fn required_online_token(form: &OnlineTokenForm, max_token_len: usize) -> Result<&str, HttpError> {
+    let token = form
+        .token
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| HttpError::invalid_request("token is required"))?;
+    if token.len() > max_token_len {
+        return Err(HttpError::invalid_request("token too large"));
+    }
+    Ok(token)
+}
+
+async fn introspect(
+    headers: HeaderMap,
+    State(state): State<HttpState>,
+    body: Bytes,
+) -> Result<(HeaderMap, Json<serde_json::Value>), HttpError> {
+    let form = parse_online_token_form(&headers, &body)?;
+    let token = required_online_token(&form, state.config.max_token_len)?.to_string();
+    let endpoint = state.introspection_endpoint();
+    let claims = authenticate_online_client(&state, &form, &endpoint)?;
+    record_client_assertion_replay(&state, &claims, unix_now())?;
+
+    let response = introspection_response_for_token(&state, &token, unix_now());
+    Ok((token_headers(), Json(response)))
+}
+
+async fn revoke(
+    headers: HeaderMap,
+    State(state): State<HttpState>,
+    body: Bytes,
+) -> Result<Response, HttpError> {
+    let form = parse_online_token_form(&headers, &body)?;
+    let token = required_online_token(&form, state.config.max_token_len)?.to_string();
+    let endpoint = state.revocation_endpoint();
+    let claims = authenticate_online_client(&state, &form, &endpoint)?;
+    record_client_assertion_replay(&state, &claims, unix_now())?;
+
+    if let Some(token_claims) = verified_sts_access_token(&state, &token, unix_now(), false) {
+        state.revocations.revoke(
+            &token,
+            token_claims.exp,
+            unix_now(),
+            state.config.max_seen_jti,
+        )?;
+    }
+    Ok((StatusCode::OK, token_headers()).into_response())
 }
 
 async fn token(
@@ -1306,6 +1543,129 @@ fn record_dpop_replay(state: &HttpState, binding: &DpopBinding, now: i64) -> Res
 
 fn token_type_for_sender(binding: &Option<DpopBinding>) -> &'static str {
     if binding.is_some() { "DPoP" } else { "Bearer" }
+}
+
+fn authenticate_online_client(
+    state: &HttpState,
+    form: &OnlineTokenForm,
+    endpoint: &str,
+) -> Result<AssertionClaims, HttpError> {
+    let request = ExchangeRequest {
+        client_id: form.client_id.clone(),
+        client_assertion: form.client_assertion.clone(),
+        client_assertion_type: form.client_assertion_type.clone(),
+        ..ExchangeRequest::default()
+    };
+    let has_client_auth = request.client_assertion.is_some()
+        || request.client_assertion_type.is_some()
+        || request.client_id.is_some();
+    if !has_client_auth {
+        return Err(HttpError::invalid_client("client_assertion required"));
+    }
+    for (field, value) in [
+        ("client_assertion", request.client_assertion.as_ref()),
+        ("client_assertion_type", request.client_assertion_type.as_ref()),
+        ("client_id", request.client_id.as_ref()),
+    ] {
+        if value.is_some_and(|value| value.trim().is_empty()) {
+            return Err(HttpError::invalid_client(format!("{field} present but empty")));
+        }
+    }
+    validate_client_assertion_type(&request)?;
+    let assertion = request
+        .client_assertion
+        .as_deref()
+        .ok_or_else(|| HttpError::invalid_client("client_assertion required"))?;
+    let endpoint = endpoint.to_string();
+    let audiences = vec![state.config.our_issuer.clone(), endpoint];
+    let key_binding_registry = key_binding_registry(state);
+    let claims = verify_assertion(
+        assertion,
+        &state.client_jwks,
+        AssertionVerificationOptions {
+            expected_issuer: &state.config.our_issuer,
+            expected_audiences: &audiences,
+            clock_skew_leeway: state.config.clock_skew_leeway,
+            max_ttl: state.config.assertion_max_ttl,
+            binding_subject_token: None,
+            require_subject_binding: false,
+            key_binding_registry: Some(&key_binding_registry),
+        },
+    )
+    .map_err(|err| HttpError::invalid_client(err.message))?;
+    if !state.config.client_ids.contains(&claims.sub) {
+        return Err(HttpError::invalid_client(format!("client {:?} not permitted", claims.sub)));
+    }
+    if let Some(client_id) = request.client_id.as_deref()
+        && client_id != claims.sub
+    {
+        return Err(HttpError::invalid_client(
+            "client_id does not match the authenticated client_assertion",
+        ));
+    }
+    client_assertion_jti(&claims)?;
+    Ok(claims)
+}
+
+fn introspection_response_for_token(state: &HttpState, token: &str, now: i64) -> serde_json::Value {
+    let Some(claims) = verified_sts_access_token(state, token, now, true) else {
+        return serde_json::json!({"active": false});
+    };
+    let mut body = serde_json::Map::new();
+    body.insert("active".to_string(), serde_json::Value::Bool(true));
+    body.insert("iss".to_string(), claims.iss.into());
+    body.insert("sub".to_string(), claims.sub.into());
+    body.insert("aud".to_string(), claims.aud.into());
+    body.insert("scope".to_string(), claims.scope.into());
+    body.insert("exp".to_string(), claims.exp.into());
+    body.insert("iat".to_string(), claims.iat.into());
+    body.insert("client_id".to_string(), claims.client_id.into());
+    if let Some(act) = claims.act
+        && let Ok(value) = serde_json::to_value(act)
+    {
+        body.insert("act".to_string(), value);
+    }
+    if let Some(jkt) = claims.cnf_jkt {
+        body.insert("cnf".to_string(), serde_json::json!({"jkt": jkt}));
+    }
+    serde_json::Value::Object(body)
+}
+
+/// RFC 7662 active-state checks for STS-issued self-contained access tokens.
+fn verified_sts_access_token(
+    state: &HttpState,
+    token: &str,
+    now: i64,
+    check_revocation: bool,
+) -> Option<sts_core::MintedClaims> {
+    let verified = verify_claims_against_jwks_with_header::<sts_core::MintedClaims>(
+        token,
+        &state.published_jwks,
+    )
+    .ok()?;
+    if verified.typ.as_deref() != Some("at+jwt") {
+        return None;
+    }
+    let claims = verified.claims;
+    if claims.iss != state.config.our_issuer {
+        return None;
+    }
+    if !state.config.target_policy.targets.contains_key(&claims.aud) {
+        return None;
+    }
+    if claims.sub.trim().is_empty()
+        || claims.client_id.trim().is_empty()
+        || claims.scope.trim().is_empty()
+    {
+        return None;
+    }
+    if claims.exp <= now || claims.iat > now + state.config.clock_skew_leeway {
+        return None;
+    }
+    if check_revocation && state.revocations.is_revoked_or_unavailable(token, now) {
+        return None;
+    }
+    Some(claims)
 }
 
 /// Resolve RFC 8693 delegation versus impersonation before caller authentication.
@@ -1825,6 +2185,16 @@ fn new_jti() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 fn unix_now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
@@ -2244,6 +2614,93 @@ mod tests {
         assert_eq!(verified.claims.scope, "chat.read");
         assert_eq!(verified.claims.act.expect("act").sub, "chat-mcp");
 
+        let introspect_assertion = signed_assertion_with_audience(
+            &fixture.actor_signer,
+            now,
+            "client-mldsa-introspect",
+            "http://localhost:8888",
+        );
+        let introspect_body = serde_urlencoded::to_string([
+            ("token", token),
+            ("token_type_hint", "access_token"),
+            ("client_assertion_type", CLIENT_ASSERTION_TYPE),
+            ("client_assertion", introspect_assertion.as_str()),
+            ("client_id", "chat-mcp"),
+        ])
+        .expect("form");
+        let introspect_response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/introspect")
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(introspect_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(introspect_response.status(), StatusCode::OK);
+        let introspect_json = read_json(introspect_response).await;
+        assert_eq!(introspect_json["active"], true);
+        assert_eq!(introspect_json["act"]["sub"], "chat-mcp");
+
+        let revoke_assertion = signed_assertion_with_audience(
+            &fixture.actor_signer,
+            now,
+            "client-mldsa-revoke",
+            "http://localhost:8888",
+        );
+        let revoke_body = serde_urlencoded::to_string([
+            ("token", token),
+            ("token_type_hint", "access_token"),
+            ("client_assertion_type", CLIENT_ASSERTION_TYPE),
+            ("client_assertion", revoke_assertion.as_str()),
+            ("client_id", "chat-mcp"),
+        ])
+        .expect("form");
+        let revoke_response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/revoke")
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(revoke_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoke_response.status(), StatusCode::OK);
+
+        let revoked_assertion = signed_assertion_with_audience(
+            &fixture.actor_signer,
+            now,
+            "client-mldsa-revoked-introspect",
+            "http://localhost:8888",
+        );
+        let revoked_introspect_body = serde_urlencoded::to_string([
+            ("token", token),
+            ("client_assertion_type", CLIENT_ASSERTION_TYPE),
+            ("client_assertion", revoked_assertion.as_str()),
+            ("client_id", "chat-mcp"),
+        ])
+        .expect("form");
+        let revoked_introspect_response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/introspect")
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(revoked_introspect_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked_introspect_response.status(), StatusCode::OK);
+        assert_eq!(
+            read_json(revoked_introspect_response).await,
+            serde_json::json!({"active": false})
+        );
+
         let jwks_response = router(state)
             .oneshot(
                 Request::builder().method(Method::GET).uri("/jwks").body(Body::empty()).unwrap(),
@@ -2440,6 +2897,9 @@ mod tests {
         assert_eq!(body["issuer"], "https://sts.example");
         assert_eq!(body["token_endpoint"], "https://sts.example/token");
         assert_eq!(body["jwks_uri"], "https://sts.example/jwks");
+        assert_eq!(body["introspection_endpoint"], "https://sts.example/introspect");
+        assert_eq!(body["revocation_endpoint"], "https://sts.example/revoke");
+        assert_eq!(body["protected_resources"], serde_json::json!(["https://sts.example"]));
         assert!(body.get("response_types_supported").is_none());
     }
 
