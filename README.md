@@ -112,6 +112,20 @@ Release validation currently uses:
 cargo fmt --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+python3 scripts/live_rust_sts_canary.py --self-test-redaction
 ```
 
 GitHub tag source archives are the release artifacts for this phase. `cargo package --workspace` expects internal workspace crates such as `sts-core` to exist in the crates.io index after Cargo prepares local `path` dependencies for publication. That is not the current release model and remains out of scope until a crates.io publishing milestone is opened.
+
+When real Okta inputs are configured locally, the live Rust process canary proves
+the customer flow without printing tokens:
+
+```bash
+python3 scripts/live_rust_sts_canary.py --require-live
+```
+
+The canary builds or reuses `target/debug/sts-cli`, starts a fresh
+`sts-cli serve` on a random loopback port, fetches public Okta JWKS into a
+temporary file, generates an ephemeral actor key/JWKS for that process, performs
+Bearer and DPoP token exchange, verifies minted JWTs against the Rust `/jwks`,
+and confirms DPoP replay rejection.
