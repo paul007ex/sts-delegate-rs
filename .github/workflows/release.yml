@@ -129,6 +129,7 @@ jobs:
         run: |
           mkdir -p release-upload
           find release-assets -type f -name 'sts-cli-*.tar.gz' -exec cp {} release-upload/ \;
+          find release-assets -type f -name 'sts-cli-*.spdx.json' -exec cp {} release-upload/ \;
 
           checksum_files="$(find release-assets -type f -name 'SHA256SUMS.*' -print | sort)"
           if [[ -z "$checksum_files" ]]; then
