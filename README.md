@@ -196,9 +196,24 @@ Check compiled PQC/OpenSSL readiness without loading deployment keys:
 cargo run -p sts-cli --features pqc-openssl-unstable -- pqc preflight
 ```
 
+Generate and inspect a local ML-DSA signing key without printing private
+material:
+
+```bash
+cargo run -p sts-cli --features pqc-openssl-unstable -- \
+  pqc key generate \
+  --alg ML-DSA-65 \
+  --out ./secrets/sts_mldsa_private.json \
+  --public-jwks-out ./secrets/sts_mldsa_public.jwks.json
+
+cargo run -p sts-cli --features pqc-openssl-unstable -- \
+  pqc key inspect --file ./secrets/sts_mldsa_private.json
+```
+
 Current PQC support is limited to ML-DSA JWS signing, public AKP JWKS
-publication, and downstream verification. JWE, ML-KEM, encrypt/decrypt
-endpoints, KMS/HSM providers, and PQC key rotation are not shipped here.
+publication, downstream verification, and a local file-backed ML-DSA
+generate/inspect/rotate CLI workflow. JWE, ML-KEM, encrypt/decrypt endpoints,
+and real cloud KMS/HSM providers are not shipped here.
 
 External signing uses an explicit provider selection. The default remains the
 file-backed signer:
@@ -300,13 +315,14 @@ resolved `POST /token` request and verifies the minted token `cnf.jkt` matches
 the holder key. `--dpop-proof-file` remains available to forward a precomputed
 DPoP proof in the `DPoP` header for advanced/debug workflows.
 
-`key rotate` is the file-backed RSA private JWK rotation workflow. It validates
-the current private JWK and existing public overlap JWKS, stages the old public
-key in `OBO_STS_EXTRA_JWKS_FILE` format, then atomically replaces the private key
-with a new RSA private JWK using restrictive file permissions on Unix. The
-command prints only public key ids, file paths, counts, and restart status; it
-does not print private key material. KMS/HSM and ML-DSA/PQC rotation remain
-separate future work.
+`key rotate` is the file-backed RSA private JWK rotation workflow. `pqc key
+rotate` is the matching feature-gated local ML-DSA AKP rotation workflow. Each
+command validates the current private JWK and existing public overlap JWKS,
+stages the old public key in `OBO_STS_EXTRA_JWKS_FILE`-compatible format, then
+atomically replaces the private key using restrictive file permissions on Unix.
+The commands print only public key ids, file paths, counts, and restart status;
+they do not print private key material. Cloud KMS/HSM rotation remains a
+provider-specific future workflow.
 
 ## Release shape
 
@@ -342,10 +358,16 @@ the customer flow without printing tokens:
 
 ```bash
 python3 scripts/live_rust_sts_canary.py --require-live
+python3 scripts/live_rust_sts_canary.py --pqc --require-live
 ```
 
 The canary builds or reuses `target/debug/sts-cli`, starts a fresh
 `sts-cli serve` on a random loopback port, fetches public Okta JWKS into a
 temporary file, generates an ephemeral actor key/JWKS for that process, performs
 Bearer and DPoP token exchange, verifies minted JWTs against the Rust `/jwks`,
-and confirms DPoP replay rejection.
+and confirms DPoP replay rejection. In `--pqc` mode it generates a temporary
+ML-DSA STS signing key, starts the server with `STS_PQC_PREFERRED=true` and
+`STS_ALLOW_NON_PQC=false`, and requires `signing_alg_selected=ML-DSA-65` with
+`pqc_fallback=false`. `--prove-mcp --require-mcp` additionally mints one token
+per configured MCP server and calls the FastMCP tools with those STS-issued
+tokens.

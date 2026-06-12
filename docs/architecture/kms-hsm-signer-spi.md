@@ -20,14 +20,16 @@ pub trait JoseSigner: Send + Sync {
 }
 ```
 
-That shape works for local RSA, feature-gated ML-DSA signers, and external RS256
-signers. External providers do not move key custody into `sts-http`, and provider
-selection must not silently fall back to the file signer when provider calls fail.
+That shape works for local RSA, feature-gated ML-DSA signers, external RS256
+signers, and the feature-gated external ML-DSA signer boundary. External
+providers do not move key custody into `sts-http`, and provider selection must
+not silently fall back to the file signer or a classical algorithm when provider
+calls fail.
 
 ## Implemented Provider Boundary
 
-`sts-jose` includes an external RS256 provider boundary that keeps JOSE
-serialization in Rust but delegates the private signing operation:
+`sts-jose` includes external provider boundaries that keep JOSE serialization in
+Rust but delegate the private signing operation:
 
 - `alg`: initially `RS256`;
 - `kid`: configured expected key ID;
@@ -36,6 +38,17 @@ serialization in Rust but delegates the private signing operation:
 - `sign_rs256`: signs the exact JWS signing input bytes;
 - `verify_claims`: verifies the compact JWS against `public_jwks()` just like local
   signers.
+
+Under `pqc-openssl-unstable`, the ML-DSA boundary mirrors the same ownership
+model:
+
+- `ExternalMlDsaSignerProvider::algorithm()` exposes ML-DSA-44, ML-DSA-65, or
+  ML-DSA-87 capability metadata;
+- `sign_mldsa()` signs the exact JWS signing input bytes;
+- the STS owns `kid` and public AKP JWKS metadata and rejects mismatches;
+- provider failure fails closed and does not downgrade to RS256 unless the
+  deployment policy explicitly allowed a non-PQC fallback before provider
+  selection.
 
 `STS_SIGNING_PROVIDER=mock-external` exercises this boundary with a local mock
 provider. It is not a production custody claim. It exists so bootstrap, JWKS,
@@ -67,8 +80,11 @@ Provider credentials should come from the cloud runtime identity or a mounted
 credential file managed by the deployment, never from command-line arguments or
 issue evidence.
 
-Only `file` and `mock-external` are implemented today. `aws-kms`, `gcp-kms`, and
-`pkcs11` must fail closed until their providers are implemented and tested.
+Only `file` and `mock-external` are implemented today. ML-DSA external-provider
+tests use an in-process mock to prove the custody boundary; they are not a claim
+that AWS KMS, Google Cloud KMS, or a PKCS#11 device can sign ML-DSA today.
+`aws-kms`, `gcp-kms`, and `pkcs11` must fail closed until their providers are
+implemented and tested against the selected algorithm family.
 
 ## Implemented Tests
 
@@ -77,6 +93,8 @@ Only `file` and `mock-external` are implemented today. `aws-kms`, `gcp-kms`, and
 - wrong configured `kid` or provider public key mismatch fails bootstrap;
 - provider signing failure maps to sanitized OAuth `server_error`;
 - provider unavailable does not fall back to `OBO_STS_KEY_FILE` or RS256 local key;
+- feature-gated external ML-DSA signer mints a token that verifies against AKP
+  JWKS, and provider failure/backend mismatch fails closed;
 - file-backed signer remains the default unless `STS_SIGNING_PROVIDER` selects an
   external provider.
 

@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+env:
+  OPENSSL_35_VERSION: 3.5.7
+  OPENSSL_35_SHA256: a8c0d28a529ca480f9f36cf5792e2cd21984552a3c8e4aa11a24aa31aeac98e8
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -28,6 +32,24 @@ jobs:
 
       - name: Workspace tests
         run: cargo test --workspace
+
+      - name: Install OpenSSL 3.5 for PQC all-features gates
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_35_VERSION}/openssl-${OPENSSL_35_VERSION}.tar.gz"
+          echo "${OPENSSL_35_SHA256} *openssl-${OPENSSL_35_VERSION}.tar.gz" | sha256sum -c -
+          tar -xzf "openssl-${OPENSSL_35_VERSION}.tar.gz"
+          cd "openssl-${OPENSSL_35_VERSION}"
+          ./config no-shared no-tests "--prefix=$RUNNER_TEMP/openssl-${OPENSSL_35_VERSION}"
+          make -j"$(nproc)"
+          make install_sw
+          {
+            echo "OPENSSL_DIR=$RUNNER_TEMP/openssl-${OPENSSL_35_VERSION}"
+            echo "OPENSSL_STATIC=1"
+            echo "PKG_CONFIG_PATH=$RUNNER_TEMP/openssl-${OPENSSL_35_VERSION}/lib64/pkgconfig:$RUNNER_TEMP/openssl-${OPENSSL_35_VERSION}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+            echo "LD_LIBRARY_PATH=$RUNNER_TEMP/openssl-${OPENSSL_35_VERSION}/lib64:$RUNNER_TEMP/openssl-${OPENSSL_35_VERSION}/lib:${LD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
 
       - name: Workspace all-features tests
         run: cargo test --workspace --all-features
