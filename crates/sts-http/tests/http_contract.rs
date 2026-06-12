@@ -15,6 +15,8 @@ use sts_config::{
 use sts_core::{ACCESS_TOKEN_TYPE, JWT_TOKEN_TYPE, MintedClaims, TOKEN_EXCHANGE_GRANT_TYPE};
 use sts_http::{HttpState, router};
 use sts_jose::{JoseError, JoseErrorKind, JoseSigner, JwksDocument, RsaJoseSigner};
+#[cfg(feature = "pqc-openssl-unstable")]
+use sts_jose::{MlDsaAlgorithm, MlDsaJoseSigner};
 use sts_replay::{FileReplayStore, ReplayPolicy};
 use tower::ServiceExt;
 
@@ -112,6 +114,38 @@ fn test_state() -> (HttpState, RsaJoseSigner, RsaJoseSigner, RsaJoseSigner) {
         ReplayPolicy::in_memory(),
     );
     (state, subject_signer, actor_signer, client_signer)
+}
+
+#[cfg(feature = "pqc-openssl-unstable")]
+fn pqc_test_state() -> (HttpState, RsaJoseSigner, RsaJoseSigner) {
+    let sts_signer =
+        MlDsaJoseSigner::from_seed_for_tests(MlDsaAlgorithm::MlDsa65, [65_u8; 32], "sts-ml-kid")
+            .expect("mldsa signer");
+    let subject_signer = signer(21, "subject-kid");
+    let actor_signer = signer(22, "chat-mcp-actor-key-1");
+    let client_signer = signer(23, "chat-mcp-key-1");
+    let mut config = RuntimeConfig::from_source(&ConfigSource::from_pairs([
+        ("IDP_ISSUER", "https://issuer.example/oauth2/default"),
+        ("EXPECTED_SUBJECT_AUD", "api://obo"),
+        ("ACTOR_IDS", "chat-mcp"),
+        ("CLIENT_IDS", "chat-mcp"),
+        ("OBO_STS_ISSUER", "https://sts.example"),
+        (
+            "TARGET_POLICY_JSON",
+            r#"{"api://chat-mcp":{"allowed_scopes":["chat.read","chat.write"],"default_scopes":["chat.read"]}}"#,
+        ),
+    ]))
+    .expect("config");
+    config.require_subject_binding = false;
+    let state = HttpState::new(
+        config,
+        sts_signer,
+        subject_signer.public_jwks(),
+        actor_signer.public_jwks(),
+        client_signer.public_jwks(),
+        ReplayPolicy::in_memory(),
+    );
+    (state, subject_signer, actor_signer)
 }
 
 fn path_bearing_state() -> HttpState {
@@ -815,6 +849,49 @@ async fn contract_discovery_and_jwks_match_python_oracle_shape() {
     for private_member in ["d", "p", "q", "dp", "dq", "qi"] {
         assert!(key.get(private_member).is_none(), "JWKS leaked {private_member}");
     }
+}
+
+#[cfg(feature = "pqc-openssl-unstable")]
+#[tokio::test]
+async fn contract_pqc_token_endpoint_mints_mldsa_access_token_and_public_akp_jwks() {
+    let (state, subject_signer, actor_signer) = pqc_test_state();
+    let now = unix_now();
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let actor_token = signed_assertion(&actor_signer, now, "pqc-actor-jti");
+
+    let jwks_response = get_path(state.clone(), "/jwks").await;
+    assert_eq!(jwks_response.status(), StatusCode::OK);
+    let jwks = read_json(jwks_response).await;
+    let key = &jwks["keys"][0];
+    assert_eq!(key["kty"], "AKP");
+    assert_eq!(key["kid"], "sts-ml-kid");
+    assert_eq!(key["use"], "sig");
+    assert_eq!(key["alg"], "ML-DSA-65");
+    assert!(key["pub"].as_str().is_some_and(|value| !value.is_empty()));
+    for private_member in ["priv", "d", "p", "q", "dp", "dq", "qi"] {
+        assert!(key.get(private_member).is_none(), "JWKS leaked {private_member}");
+    }
+
+    let response =
+        post_token_form(state.clone(), delegation_form(&subject_token, &actor_token)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = read_json(response).await;
+    assert_eq!(response_body["issued_token_type"], ACCESS_TOKEN_TYPE);
+    assert_eq!(response_body["token_type"], "Bearer");
+
+    let token = response_body["access_token"].as_str().expect("access token");
+    let header = jwt_segment(token, 0);
+    assert_eq!(header["alg"], "ML-DSA-65");
+    assert_eq!(header["kid"], "sts-ml-kid");
+    assert_eq!(header["typ"], "at+jwt");
+
+    let verified: sts_core::MintedClaims =
+        sts_jose::verify_claims_against_jwks(token, &state.published_jwks)
+            .expect("downstream verifies mldsa access token");
+    assert_eq!(verified.sub, "alice@example.com");
+    assert_eq!(verified.aud, "api://chat-mcp");
+    assert_eq!(verified.scope, "chat.read");
+    assert_eq!(verified.act.expect("actor claim").sub, "chat-mcp");
 }
 
 #[tokio::test]
