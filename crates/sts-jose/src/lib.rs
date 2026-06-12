@@ -166,6 +166,7 @@ struct PrivateAkpJwk {
 struct CompactJwsHeader {
     alg: String,
     kid: Option<String>,
+    typ: Option<String>,
 }
 
 /// Deserialized claims plus the protected-header key id selected for verification.
@@ -174,6 +175,7 @@ pub struct VerifiedJws<T> {
     pub claims: T,
     pub alg: String,
     pub kid: String,
+    pub typ: Option<String>,
 }
 
 /// Decoded public RSA JWK components.
@@ -470,7 +472,7 @@ fn verify_claims_against_jwks_inner<T: DeserializeOwned>(
         }
     };
 
-    Ok(VerifiedJws { claims, alg: header.alg, kid: kid.to_string() })
+    Ok(VerifiedJws { claims, alg: header.alg, kid: kid.to_string(), typ: header.typ })
 }
 
 fn verify_rs256_claims_against_jwk<T: DeserializeOwned>(

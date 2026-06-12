@@ -1619,6 +1619,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "sha2",
  "sts-config",
  "sts-core",
  "sts-dpop",

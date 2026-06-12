@@ -10,7 +10,7 @@ Rust-native successor to `sts-delegate`: an RFC 8693 token-exchange STS with OAu
 - `sts-verify` - trust anchors, issuer verification, client/actor assertion checks
 - `sts-replay` - jti replay state and sender-constraining replay keys
 - `sts-config` - configuration and bootstrap
-- `sts-http` - `/token`, `/jwks`, discovery, and error mapping
+- `sts-http` - `/token`, `/introspect`, `/revoke`, `/jwks`, discovery, protected-resource metadata, and error mapping
 - `sts-cli` - rotation, canary, smoke, and ops helpers
 
 ## Migration rule
@@ -326,6 +326,24 @@ private P-256 holder JWK to a new `0600` file without printing private material;
 resolved `POST /token` request and verifies the minted token `cnf.jkt` matches
 the holder key. `--dpop-proof-file` remains available to forward a precomputed
 DPoP proof in the `DPoP` header for advanced/debug workflows.
+
+The HTTP server also ships online validation endpoints for resource servers and
+operators:
+
+- `POST /introspect` implements RFC 7662-style introspection for STS-issued
+  access tokens. Callers authenticate with `private_key_jwt`; inactive,
+  malformed, expired, revoked, wrong-issuer, or unverifiable tokens return only
+  `{"active":false}`.
+- `POST /revoke` implements RFC 7009-style revocation for STS-issued access
+  tokens. Revocation stores a bounded token fingerprint, not the raw token or
+  raw `jti`; unknown or malformed tokens still return HTTP 200.
+- `GET /.well-known/oauth-protected-resource` implements RFC 9728 protected
+  resource metadata for the resource represented by the metadata URL. It does
+  not imply a full `/authorize` or OIDC server.
+
+Offline JWT validation through `/jwks` cannot observe revocation. Resource
+servers that need revocation status must call `/introspect` or another online
+validation path.
 
 `key rotate` is the file-backed RSA private JWK rotation workflow. `pqc key
 rotate` is the matching feature-gated local ML-DSA AKP rotation workflow. Each

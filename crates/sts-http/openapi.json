@@ -26,6 +26,112 @@
         }
       }
     },
+    "/.well-known/oauth-protected-resource": {
+      "get": {
+        "summary": "OAuth protected resource metadata",
+        "responses": {
+          "200": {
+            "description": "Protected resource metadata"
+          }
+        }
+      }
+    },
+    "/introspect": {
+      "post": {
+        "summary": "RFC 7662 token introspection for STS-issued access tokens",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "token",
+                  "client_assertion",
+                  "client_assertion_type"
+                ],
+                "properties": {
+                  "token": {
+                    "type": "string"
+                  },
+                  "token_type_hint": {
+                    "type": "string"
+                  },
+                  "client_id": {
+                    "type": "string"
+                  },
+                  "client_assertion": {
+                    "type": "string"
+                  },
+                  "client_assertion_type": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Token introspection response"
+          },
+          "400": {
+            "description": "OAuth error response"
+          },
+          "401": {
+            "description": "Client authentication failed"
+          }
+        }
+      }
+    },
+    "/revoke": {
+      "post": {
+        "summary": "RFC 7009 revocation for STS-issued access tokens",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "token",
+                  "client_assertion",
+                  "client_assertion_type"
+                ],
+                "properties": {
+                  "token": {
+                    "type": "string"
+                  },
+                  "token_type_hint": {
+                    "type": "string"
+                  },
+                  "client_id": {
+                    "type": "string"
+                  },
+                  "client_assertion": {
+                    "type": "string"
+                  },
+                  "client_assertion_type": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Revocation response"
+          },
+          "400": {
+            "description": "OAuth error response"
+          },
+          "401": {
+            "description": "Client authentication failed"
+          }
+        }
+      }
+    },
     "/token": {
       "post": {
         "summary": "OAuth 2.0 token exchange",

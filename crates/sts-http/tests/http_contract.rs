@@ -87,6 +87,12 @@ impl JoseSigner for FailingSigner {
 }
 
 fn test_state() -> (HttpState, RsaJoseSigner, RsaJoseSigner, RsaJoseSigner) {
+    let (state, _, subject_signer, actor_signer, client_signer) = test_state_with_sts_signer();
+    (state, subject_signer, actor_signer, client_signer)
+}
+
+fn test_state_with_sts_signer()
+-> (HttpState, RsaJoseSigner, RsaJoseSigner, RsaJoseSigner, RsaJoseSigner) {
     let sts_signer = signer(10, "sts-kid");
     let subject_signer = signer(11, "subject-kid");
     let actor_signer = signer(12, "chat-mcp-actor-key-1");
@@ -115,7 +121,7 @@ fn test_state() -> (HttpState, RsaJoseSigner, RsaJoseSigner, RsaJoseSigner) {
         client_signer.public_jwks(),
         ReplayPolicy::in_memory(),
     );
-    (state, subject_signer, actor_signer, client_signer)
+    (state, sts_signer, subject_signer, actor_signer, client_signer)
 }
 
 fn path_bearing_state() -> HttpState {
@@ -201,7 +207,7 @@ fn signed_subject_token_with_act(signer: &RsaJoseSigner, now: i64, act: Value) -
 }
 
 fn signed_assertion(signer: &RsaJoseSigner, now: i64, jti: &str) -> String {
-    signed_assertion_with_exp_delta(signer, now, jti, 300)
+    signed_assertion_for_audience(signer, now, jti, 300, "https://sts.example")
 }
 
 fn signed_assertion_with_exp_delta(
@@ -210,11 +216,21 @@ fn signed_assertion_with_exp_delta(
     jti: &str,
     exp_delta: i64,
 ) -> String {
+    signed_assertion_for_audience(signer, now, jti, exp_delta, "https://sts.example")
+}
+
+fn signed_assertion_for_audience(
+    signer: &RsaJoseSigner,
+    now: i64,
+    jti: &str,
+    exp_delta: i64,
+    audience: &str,
+) -> String {
     signer
         .sign_json_claims(&AssertionWireClaims {
             iss: "chat-mcp".to_string(),
             sub: "chat-mcp".to_string(),
-            aud: "https://sts.example".to_string(),
+            aud: audience.to_string(),
             exp: now + exp_delta,
             iat: now,
             jti: jti.to_string(),
@@ -310,6 +326,114 @@ fn impersonation_form(subject_token: &str, client_assertion: &str) -> String {
     .expect("form")
 }
 
+fn introspection_form(token: &str, client_assertion: &str) -> String {
+    serde_urlencoded::to_string([
+        ("token", token),
+        ("token_type_hint", "access_token"),
+        ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+        ("client_assertion", client_assertion),
+        ("client_id", "chat-mcp"),
+    ])
+    .expect("form")
+}
+
+fn revocation_form(token: &str, client_assertion: &str) -> String {
+    serde_urlencoded::to_string([
+        ("token", token),
+        ("token_type_hint", "access_token"),
+        ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+        ("client_assertion", client_assertion),
+        ("client_id", "chat-mcp"),
+    ])
+    .expect("form")
+}
+
+async fn post_introspect_form(state: HttpState, body: String) -> Response<Body> {
+    post_form_to_uri(state, "/introspect", body).await
+}
+
+async fn post_revoke_form(state: HttpState, body: String) -> Response<Body> {
+    post_form_to_uri(state, "/revoke", body).await
+}
+
+async fn post_raw_to_uri(
+    state: HttpState,
+    uri: &str,
+    body: impl Into<Body>,
+    content_type: Option<&str>,
+) -> Response<Body> {
+    let mut builder = Request::builder().method(Method::POST).uri(uri);
+    if let Some(content_type) = content_type {
+        builder = builder.header(CONTENT_TYPE, content_type);
+    }
+    router(state).oneshot(builder.body(body.into()).unwrap()).await.unwrap()
+}
+
+async fn minted_delegation_token(
+    state: HttpState,
+    subject_signer: &RsaJoseSigner,
+    actor_signer: &RsaJoseSigner,
+    actor_jti: &str,
+) -> String {
+    let now = unix_now();
+    let subject_token = signed_subject_token(subject_signer, now);
+    let actor_token = signed_assertion(actor_signer, now, actor_jti);
+    let response = post_token_form(state, delegation_form(&subject_token, &actor_token)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    body["access_token"].as_str().expect("access token").to_string()
+}
+
+async fn minted_impersonation_token(
+    state: HttpState,
+    subject_signer: &RsaJoseSigner,
+    client_signer: &RsaJoseSigner,
+    client_jti: &str,
+) -> String {
+    let now = unix_now();
+    let subject_token = signed_subject_token(subject_signer, now);
+    let client_assertion = signed_assertion(client_signer, now, client_jti);
+    let response =
+        post_token_form(state, impersonation_form(&subject_token, &client_assertion)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    body["access_token"].as_str().expect("access token").to_string()
+}
+
+fn signed_sts_access_token(
+    signer: &RsaJoseSigner,
+    now: i64,
+    issuer: &str,
+    audience: &str,
+    exp_delta: i64,
+) -> String {
+    signer
+        .sign_claims(&MintedClaims::new(
+            issuer,
+            "alice@example.com",
+            audience,
+            "chat.read",
+            now,
+            now + exp_delta,
+            format!("minted-test-jti-{now}-{audience}"),
+            "chat-mcp",
+        ))
+        .expect("minted token")
+}
+
+fn tamper_signature(token: &str) -> String {
+    let mut parts = token.split('.').map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(parts.len(), 3);
+    parts[2].push('A');
+    parts.join(".")
+}
+
+async fn assert_inactive_only(response: Response<Body>) {
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body, json!({"active": false}));
+}
+
 #[tokio::test]
 async fn contract_openapi_json_is_curated_and_docs_are_absent_by_default() {
     let (state, _, _, _) = test_state();
@@ -325,8 +449,11 @@ async fn contract_openapi_json_is_curated_and_docs_are_absent_by_default() {
     assert_eq!(body["info"]["version"], env!("CARGO_PKG_VERSION"));
     let paths = body["paths"].as_object().expect("paths");
     assert!(paths.contains_key("/token"));
+    assert!(paths.contains_key("/introspect"));
+    assert!(paths.contains_key("/revoke"));
     assert!(paths.contains_key("/jwks"));
     assert!(paths.contains_key("/.well-known/oauth-authorization-server"));
+    assert!(paths.contains_key("/.well-known/oauth-protected-resource"));
     assert!(!paths.contains_key("/exchange"));
     assert!(!paths.contains_key("/metrics"));
 
@@ -929,10 +1056,23 @@ async fn contract_discovery_and_jwks_match_python_oracle_shape() {
     assert_eq!(metadata["issuer"], "https://sts.example");
     assert_eq!(metadata["token_endpoint"], "https://sts.example/token");
     assert_eq!(metadata["jwks_uri"], "https://sts.example/jwks");
+    assert_eq!(metadata["introspection_endpoint"], "https://sts.example/introspect");
+    assert_eq!(metadata["revocation_endpoint"], "https://sts.example/revoke");
     assert!(metadata.get("response_types_supported").is_none());
     assert_eq!(metadata["grant_types_supported"], json!([TOKEN_EXCHANGE_GRANT_TYPE]));
     assert_eq!(metadata["token_endpoint_auth_methods_supported"], json!(["private_key_jwt"]));
     assert_eq!(metadata["token_endpoint_auth_signing_alg_values_supported"], json!(["RS256"]));
+    assert_eq!(
+        metadata["introspection_endpoint_auth_methods_supported"],
+        json!(["private_key_jwt"])
+    );
+    assert_eq!(
+        metadata["introspection_endpoint_auth_signing_alg_values_supported"],
+        json!(["RS256"])
+    );
+    assert_eq!(metadata["revocation_endpoint_auth_methods_supported"], json!(["private_key_jwt"]));
+    assert_eq!(metadata["revocation_endpoint_auth_signing_alg_values_supported"], json!(["RS256"]));
+    assert_eq!(metadata["protected_resources"], json!(["https://sts.example"]));
     assert!(
         metadata["dpop_signing_alg_values_supported"]
             .as_array()
@@ -984,6 +1124,350 @@ async fn rfc8414_omits_zero_element_metadata_arrays() {
 }
 
 #[tokio::test]
+async fn rfc9728_protected_resource_metadata_advertises_target_policy() {
+    let (state, _, _, _) = test_state();
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/.well-known/oauth-protected-resource")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CACHE_CONTROL).and_then(|value| value.to_str().ok()),
+        Some("public, max-age=300")
+    );
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let metadata = read_json(response).await;
+    assert_eq!(metadata["resource"], "https://sts.example");
+    assert_eq!(metadata["authorization_servers"], json!(["https://sts.example"]));
+    assert_eq!(metadata["bearer_methods_supported"], json!(["header"]));
+    assert_eq!(metadata["scopes_supported"], json!(["chat.read", "chat.write"]));
+    assert!(metadata.get("authorization_endpoint").is_none());
+    assert!(metadata.get("userinfo_endpoint").is_none());
+}
+
+#[tokio::test]
+async fn rfc9728_protected_resource_metadata_is_get_only() {
+    let (state, _, _, _) = test_state();
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/.well-known/oauth-protected-resource")
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("token=x"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_request");
+}
+
+#[tokio::test]
+async fn rfc7662_introspection_active_delegation_token_returns_safe_claims() {
+    let (state, subject_signer, actor_signer, client_signer) = test_state();
+    let token = minted_delegation_token(
+        state.clone(),
+        &subject_signer,
+        &actor_signer,
+        "actor-introspect-1",
+    )
+    .await;
+    let now = unix_now();
+    let client_assertion = signed_assertion(&client_signer, now, "client-introspect-active-1");
+
+    let response = post_introspect_form(state, introspection_form(&token, &client_assertion)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CACHE_CONTROL).and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    let body = read_json(response).await;
+    assert_eq!(body["active"], true);
+    assert_eq!(body["iss"], "https://sts.example");
+    assert_eq!(body["sub"], "alice@example.com");
+    assert_eq!(body["aud"], "api://chat-mcp");
+    assert_eq!(body["scope"], "chat.read");
+    assert_eq!(body["client_id"], "chat-mcp");
+    assert_eq!(body["act"]["sub"], "chat-mcp");
+    assert!(body.get("jti").is_none(), "introspection must not leak raw jti");
+    assert!(body.get("token").is_none(), "introspection must not echo raw token");
+}
+
+#[tokio::test]
+async fn rfc7662_introspection_active_impersonation_token_omits_act() {
+    let (mut state, subject_signer, _, client_signer) = test_state();
+    state.config.token_exchange_mode = TokenExchangeMode::Impersonation;
+    allow_impersonation_anywhere(&mut state, "chat-mcp");
+    let token = minted_impersonation_token(
+        state.clone(),
+        &subject_signer,
+        &client_signer,
+        "client-introspect-impersonation-mint",
+    )
+    .await;
+    let now = unix_now();
+    let client_assertion = signed_assertion(&client_signer, now, "client-introspect-impersonation");
+
+    let response = post_introspect_form(state, introspection_form(&token, &client_assertion)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["active"], true);
+    assert_eq!(body["sub"], "alice@example.com");
+    assert_eq!(body["aud"], "api://chat-mcp");
+    assert!(body.get("act").is_none(), "impersonation token must not grow act in introspection");
+}
+
+#[tokio::test]
+async fn rfc7662_introspection_rejects_missing_or_bad_client_auth() {
+    let (state, _, _, client_signer) = test_state();
+    let no_auth = post_introspect_form(state.clone(), "token=opaque".to_string()).await;
+    assert_eq!(no_auth.status(), StatusCode::UNAUTHORIZED);
+    let no_auth_body = read_json(no_auth).await;
+    assert_eq!(no_auth_body["error"], "invalid_client");
+
+    let bad_auth = post_introspect_form(
+        state.clone(),
+        serde_urlencoded::to_string([
+            ("token", "opaque"),
+            ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+            ("client_assertion", "not-a-jwt"),
+            ("client_id", "chat-mcp"),
+        ])
+        .expect("form"),
+    )
+    .await;
+    assert_eq!(bad_auth.status(), StatusCode::UNAUTHORIZED);
+    let bad_auth_body = read_json(bad_auth).await;
+    assert_eq!(bad_auth_body["error"], "invalid_client");
+
+    let now = unix_now();
+    let client_assertion = signed_assertion(&client_signer, now, "client-introspect-missing-token");
+    let missing_token = post_introspect_form(
+        state,
+        serde_urlencoded::to_string([
+            ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+            ("client_assertion", client_assertion.as_str()),
+            ("client_id", "chat-mcp"),
+        ])
+        .expect("form"),
+    )
+    .await;
+    assert_eq!(missing_token.status(), StatusCode::BAD_REQUEST);
+    let missing_token_body = read_json(missing_token).await;
+    assert_eq!(missing_token_body["error"], "invalid_request");
+}
+
+#[tokio::test]
+async fn rfc7662_introspection_inactive_cases_are_minimal() {
+    let (state, sts_signer, _, _, client_signer) = test_state_with_sts_signer();
+    let wrong_kid_signer = signer(91, "unknown-sts-kid");
+    let now = unix_now();
+    let valid =
+        signed_sts_access_token(&sts_signer, now, "https://sts.example", "api://chat-mcp", 300);
+    let cases = [
+        ("malformed", "not-a-jwt".to_string()),
+        (
+            "expired",
+            signed_sts_access_token(
+                &sts_signer,
+                now - 600,
+                "https://sts.example",
+                "api://chat-mcp",
+                -1,
+            ),
+        ),
+        (
+            "wrong-issuer",
+            signed_sts_access_token(
+                &sts_signer,
+                now,
+                "https://other-sts.example",
+                "api://chat-mcp",
+                300,
+            ),
+        ),
+        (
+            "wrong-audience",
+            signed_sts_access_token(&sts_signer, now, "https://sts.example", "api://other", 300),
+        ),
+        (
+            "unknown-kid",
+            signed_sts_access_token(
+                &wrong_kid_signer,
+                now,
+                "https://sts.example",
+                "api://chat-mcp",
+                300,
+            ),
+        ),
+        ("bad-signature", tamper_signature(&valid)),
+    ];
+
+    for (name, token) in cases {
+        let client_assertion =
+            signed_assertion(&client_signer, now, &format!("client-introspect-inactive-{name}"));
+        let response =
+            post_introspect_form(state.clone(), introspection_form(&token, &client_assertion))
+                .await;
+        assert_inactive_only(response).await;
+    }
+}
+
+#[tokio::test]
+async fn rfc7662_introspection_ignores_hint_and_unknown_params_safely() {
+    let (state, subject_signer, actor_signer, client_signer) = test_state();
+    let token = minted_delegation_token(
+        state.clone(),
+        &subject_signer,
+        &actor_signer,
+        "actor-introspect-2",
+    )
+    .await;
+    let now = unix_now();
+    let client_assertion = signed_assertion(&client_signer, now, "client-introspect-hints-1");
+    let body = serde_urlencoded::to_string([
+        ("token", token.as_str()),
+        ("token_type_hint", "unsupported-token-type"),
+        ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+        ("client_assertion", client_assertion.as_str()),
+        ("client_id", "chat-mcp"),
+        ("unknown_parameter", "ignored"),
+    ])
+    .expect("form");
+
+    let response = post_introspect_form(state, body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["active"], true);
+}
+
+#[tokio::test]
+async fn rfc7662_introspection_rejects_wrong_content_type() {
+    let (state, _, _, _) = test_state();
+    let response =
+        post_raw_to_uri(state, "/introspect", "token=opaque", Some("application/json")).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_request");
+}
+
+#[tokio::test]
+async fn rfc7009_revocation_makes_introspection_inactive() {
+    let (state, subject_signer, actor_signer, client_signer) = test_state();
+    let token =
+        minted_delegation_token(state.clone(), &subject_signer, &actor_signer, "actor-revoke-1")
+            .await;
+    let now = unix_now();
+
+    let active_assertion = signed_assertion(&client_signer, now, "client-revoke-introspect-before");
+    let active_response =
+        post_introspect_form(state.clone(), introspection_form(&token, &active_assertion)).await;
+    assert_eq!(read_json(active_response).await["active"], true);
+
+    let revoke_assertion = signed_assertion(&client_signer, now, "client-revoke-valid-1");
+    let revoke_response =
+        post_revoke_form(state.clone(), revocation_form(&token, &revoke_assertion)).await;
+    assert_eq!(revoke_response.status(), StatusCode::OK);
+    assert_eq!(
+        revoke_response.headers().get(CACHE_CONTROL).and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+
+    let inactive_assertion =
+        signed_assertion(&client_signer, now, "client-revoke-introspect-after");
+    let inactive_response =
+        post_introspect_form(state, introspection_form(&token, &inactive_assertion)).await;
+    assert_inactive_only(inactive_response).await;
+}
+
+#[tokio::test]
+async fn rfc7009_revocation_unknown_malformed_and_repeated_are_successful() {
+    let (state, subject_signer, actor_signer, client_signer) = test_state();
+    let token =
+        minted_delegation_token(state.clone(), &subject_signer, &actor_signer, "actor-revoke-2")
+            .await;
+    let now = unix_now();
+    let cases = [
+        ("unknown", "opaque-token".to_string()),
+        ("malformed", "not-a-jwt".to_string()),
+        ("valid-once", token.clone()),
+        ("valid-repeat", token),
+    ];
+
+    for (name, token) in cases {
+        let client_assertion =
+            signed_assertion(&client_signer, now, &format!("client-revoke-nondisclosure-{name}"));
+        let body = serde_urlencoded::to_string([
+            ("token", token.as_str()),
+            ("token_type_hint", "unsupported-token-type"),
+            ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+            ("client_assertion", client_assertion.as_str()),
+            ("client_id", "chat-mcp"),
+        ])
+        .expect("form");
+        let response = post_revoke_form(state.clone(), body).await;
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn rfc7009_revocation_request_validation_and_client_auth() {
+    let (state, _, _, client_signer) = test_state();
+    let no_auth = post_revoke_form(state.clone(), "token=opaque".to_string()).await;
+    assert_eq!(no_auth.status(), StatusCode::UNAUTHORIZED);
+    let no_auth_body = read_json(no_auth).await;
+    assert_eq!(no_auth_body["error"], "invalid_client");
+
+    let bad_auth = post_revoke_form(
+        state.clone(),
+        serde_urlencoded::to_string([
+            ("token", "opaque"),
+            ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+            ("client_assertion", "not-a-jwt"),
+            ("client_id", "chat-mcp"),
+        ])
+        .expect("form"),
+    )
+    .await;
+    assert_eq!(bad_auth.status(), StatusCode::UNAUTHORIZED);
+    let bad_auth_body = read_json(bad_auth).await;
+    assert_eq!(bad_auth_body["error"], "invalid_client");
+
+    let now = unix_now();
+    let client_assertion = signed_assertion(&client_signer, now, "client-revoke-missing-token");
+    let missing_token = post_revoke_form(
+        state.clone(),
+        serde_urlencoded::to_string([
+            ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+            ("client_assertion", client_assertion.as_str()),
+            ("client_id", "chat-mcp"),
+        ])
+        .expect("form"),
+    )
+    .await;
+    assert_eq!(missing_token.status(), StatusCode::BAD_REQUEST);
+    let missing_token_body = read_json(missing_token).await;
+    assert_eq!(missing_token_body["error"], "invalid_request");
+
+    let wrong_content_type =
+        post_raw_to_uri(state, "/revoke", "token=opaque", Some("application/json")).await;
+    assert_eq!(wrong_content_type.status(), StatusCode::BAD_REQUEST);
+    let wrong_content_type_body = read_json(wrong_content_type).await;
+    assert_eq!(wrong_content_type_body["error"], "invalid_request");
+}
+
+#[tokio::test]
 async fn contract_path_bearing_issuer_advertised_endpoints_are_live() {
     let state = path_bearing_state();
     let app = router(state.clone());
@@ -1004,6 +1488,8 @@ async fn contract_path_bearing_issuer_advertised_endpoints_are_live() {
     assert_eq!(metadata["issuer"], "https://sts.example/tenant1");
     assert_eq!(metadata["token_endpoint"], "https://sts.example/tenant1/token");
     assert_eq!(metadata["jwks_uri"], "https://sts.example/tenant1/jwks");
+    assert_eq!(metadata["introspection_endpoint"], "https://sts.example/tenant1/introspect");
+    assert_eq!(metadata["revocation_endpoint"], "https://sts.example/tenant1/revoke");
 
     let jwks_response = app
         .clone()
@@ -1037,6 +1523,38 @@ async fn contract_path_bearing_issuer_advertised_endpoints_are_live() {
     );
     let token_error = read_json(token_response).await;
     assert_eq!(token_error["error"], "unsupported_grant_type");
+
+    let introspect_response =
+        post_form_to_uri(state.clone(), "/tenant1/introspect", "token=x".to_string()).await;
+    assert_ne!(introspect_response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        introspect_response.headers().get(CACHE_CONTROL).and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+
+    let revoke_response =
+        post_form_to_uri(state.clone(), "/tenant1/revoke", "token=x".to_string()).await;
+    assert_ne!(revoke_response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        revoke_response.headers().get(CACHE_CONTROL).and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+
+    let resource_metadata_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/.well-known/oauth-protected-resource/tenant1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resource_metadata_response.status(), StatusCode::OK);
+    let resource_metadata = read_json(resource_metadata_response).await;
+    assert_eq!(resource_metadata["resource"], "https://sts.example/tenant1");
+    assert_eq!(resource_metadata["authorization_servers"], json!(["https://sts.example/tenant1"]));
 
     let root_jwks_response = router(state.clone())
         .oneshot(Request::builder().method(Method::GET).uri("/jwks").body(Body::empty()).unwrap())
