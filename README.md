@@ -17,6 +17,21 @@ Rust-native successor to `sts-delegate`: an RFC 8693 token-exchange STS with OAu
 
 The current Python implementation remains the behavior oracle until the Rust contract tests prove parity. The Rust repo must preserve observable endpoints, claim shapes, and failure classes while keeping the architecture explicit and maintainable.
 
+## Rust docs
+
+- [Rust product surface](docs/reference/product-surface.md) maps endpoints, claims,
+  config, errors, and Python-oracle reference docs to current Rust behavior.
+- [Okta, OBO, and MCP docs plan](docs/explanation/okta-mcp-obo-plan.md) separates
+  OIDC login, Okta-documented OBO, and Rust token exchange.
+- [obo-lab contract coverage plan](docs/requirements/obo-lab-contract-coverage.md)
+  classifies scenario-level lab tests against Rust contract coverage.
+- [Production runbook](docs/operations/production-runbook.md) covers startup checks,
+  alerts, rotation, incident response, and deployment evidence.
+- [Release security](docs/operations/release-security.md) records current checksum
+  verification and the remaining SBOM/provenance/signing work.
+- [Cloud deployment roadmap](docs/operations/cloud-roadmap.md) keeps KMS/HSM, shared
+  replay, and Helm/Terraform work explicit instead of overclaiming it.
+
 ## Runtime bootstrap
 
 `sts-cli` now exposes the Rust HTTP runtime boundary:
@@ -56,6 +71,7 @@ To build an installable local archive without hosted GitHub Actions:
 ```bash
 scripts/package_release.sh
 shasum -a 256 -c dist/SHA256SUMS
+for sbom in dist/sts-cli-*.spdx.json; do python3 -m json.tool "$sbom" >/dev/null; done
 tar -tzf dist/sts-cli-*-*.tar.gz
 ```
 
@@ -80,8 +96,15 @@ release_tag=v0.1.0
 gh release download "$release_tag" \
   --repo paul007ex/sts-delegate-rs \
   --pattern 'sts-cli-*.tar.gz' \
+  --pattern 'sts-cli-*.spdx.json' \
   --pattern SHA256SUMS
 shasum -a 256 -c SHA256SUMS
+gh attestation verify sts-cli-*.tar.gz \
+  --repo paul007ex/sts-delegate-rs \
+  --cert-identity-regex 'https://github.com/paul007ex/sts-delegate-rs/.github/workflows/release.yml@refs/tags/.*'
+gh attestation verify sts-cli-*.spdx.json \
+  --repo paul007ex/sts-delegate-rs \
+  --cert-identity-regex 'https://github.com/paul007ex/sts-delegate-rs/.github/workflows/release.yml@refs/tags/.*'
 ```
 
 Homebrew users can install from the live `paul007ex/sts-delegate-rs` tap. The
@@ -165,7 +188,27 @@ Interactive docs routes such as `/docs` and `/redoc` are not served by default.
 
 Prometheus-style metrics are opt-in with `STS_ENABLE_METRICS=true`; when enabled,
 `/metrics` reports exchange outcomes, denial counts by OAuth error code, and the
-current in-process replay-cache size. When disabled, `/metrics` is absent.
+current replay-cache size. When disabled, `/metrics` is absent.
+
+Replay storage defaults to in-process memory, which is suitable only for local and
+single-replica deployments:
+
+```bash
+STS_REPLAY_BACKEND=memory
+```
+
+For multi-replica deployments, configure a shared file-backed replay directory on a
+POSIX shared volume. The replay crate hashes caller-controlled replay keys before
+using them as filenames and records with atomic create-new semantics:
+
+```bash
+STS_REPLAY_BACKEND=file
+STS_REPLAY_DIR=/var/lib/sts-delegate/replay
+```
+
+If the shared replay directory is unavailable at startup or while serving, replay
+enforcement fails closed with service-unavailable semantics. Do not run more than
+one STS replica on the default in-memory backend.
 
 ## Operator CLI
 

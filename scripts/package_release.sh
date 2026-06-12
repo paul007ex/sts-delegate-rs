@@ -66,11 +66,15 @@ archive="$dist_dir/$archive_base.tar.gz"
 rm -f "$archive"
 tar -C "$dist_dir" -czf "$archive" "$archive_base"
 
+sbom="$dist_dir/$archive_base.spdx.json"
+python3 scripts/generate_release_sbom.py --archive "$archive" --output "$sbom" >/tmp/sts-cli-package-sbom.log
+
 (
   cd "$repo_root"
-  shasum -a 256 "dist/$(basename "$archive")" > "$dist_dir/SHA256SUMS"
+  shasum -a 256 "dist/$(basename "$archive")" "dist/$(basename "$sbom")" > "$dist_dir/SHA256SUMS"
 )
 
 echo "archive=$archive"
+echo "sbom=$sbom"
 echo "checksums=$dist_dir/SHA256SUMS"
 echo "smoke=$smoke_status"
