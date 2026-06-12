@@ -30,4 +30,14 @@ jobs:
         run: cargo test --workspace
 
       - name: Workspace tests with experimental feature gates
-        run: cargo test --workspace --all-features
+        run: |
+          openssl version
+          version="$(openssl version | awk '{print $2}')"
+          major="${version%%.*}"
+          rest="${version#*.}"
+          minor="${rest%%.*}"
+          if [ "$major" -lt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -lt 5 ]; }; then
+            echo "::notice::Skipping pqc-openssl-unstable tests because OpenSSL $version is older than 3.5"
+            exit 0
+          fi
+          cargo test --workspace --all-features
