@@ -38,8 +38,9 @@ use sts_dpop::{
 #[cfg(feature = "pqc-openssl-unstable")]
 use sts_jose::MlDsaJoseSigner;
 use sts_jose::{
-    BackendSelection, JoseError, JoseSigner, JwksDocument, PublicJwk, RsaJoseSigner,
-    rsa_public_key_bits_from_jwk, validate_public_jwk,
+    BackendSelection, ExternalRs256JoseSigner, JoseError, JoseErrorKind, JoseSigner, JwksDocument,
+    MockExternalRs256Provider, PublicJwk, RsaJoseSigner, rsa_public_key_bits_from_jwk,
+    validate_public_jwk,
 };
 use sts_replay::{InMemoryReplayStore, ReplayErrorKind, ReplayPolicy, dpop_replay_key};
 use sts_verify::{
@@ -384,6 +385,17 @@ fn is_loopback_ip(ip: IpAddr) -> bool {
 }
 
 fn load_signer(config: &RuntimeConfig) -> Result<Arc<dyn JoseSigner>, BootstrapError> {
+    match config.sts_signing_provider.as_str() {
+        "" | "file" => load_file_signer(config),
+        "mock-external" => load_mock_external_signer(config),
+        other => Err(BootstrapError::Jose(JoseError::new(
+            JoseErrorKind::UnsupportedAlgorithm,
+            format!("unsupported STS signing provider {other:?}"),
+        ))),
+    }
+}
+
+fn load_file_signer(config: &RuntimeConfig) -> Result<Arc<dyn JoseSigner>, BootstrapError> {
     let raw = read_checked_file(
         &config.obo_sts_key_file,
         "STS signing key",
@@ -402,6 +414,72 @@ fn load_signer(config: &RuntimeConfig) -> Result<Arc<dyn JoseSigner>, BootstrapE
             .map_err(BootstrapError::from)
     }?;
     Ok(Arc::new(signer))
+}
+
+fn load_mock_external_signer(
+    config: &RuntimeConfig,
+) -> Result<Arc<dyn JoseSigner>, BootstrapError> {
+    let selection = BackendSelection::parse(&config.sts_signing_alg);
+    if !matches!(selection, BackendSelection::Classical) {
+        return Err(BootstrapError::Jose(JoseError::new(
+            JoseErrorKind::UnsupportedAlgorithm,
+            "mock-external signing provider currently supports RS256 only",
+        )));
+    }
+    let public_jwks_file = config.sts_signing_public_jwks_file.as_ref().ok_or_else(|| {
+        BootstrapError::Config(ConfigError::new(
+            sts_config::ConfigErrorKind::MissingEnv,
+            Some("STS_SIGNING_PUBLIC_JWKS_FILE".to_string()),
+            "set STS_SIGNING_PUBLIC_JWKS_FILE when STS_SIGNING_PROVIDER=mock-external",
+        ))
+    })?;
+    let mock_key_file = config.mock_external_signer_key_file.as_ref().ok_or_else(|| {
+        BootstrapError::Config(ConfigError::new(
+            sts_config::ConfigErrorKind::MissingEnv,
+            Some("STS_MOCK_EXTERNAL_SIGNER_KEY_FILE".to_string()),
+            "set STS_MOCK_EXTERNAL_SIGNER_KEY_FILE when STS_SIGNING_PROVIDER=mock-external",
+        ))
+    })?;
+    let public_jwks = load_public_jwks_file(
+        public_jwks_file,
+        "STS signing public JWKS",
+        config.allow_insecure_jwks,
+    )?;
+    let public_jwk =
+        public_jwks.keys.iter().find(|key| key.kid == config.our_kid).cloned().ok_or_else(
+            || BootstrapError::InvalidJwks {
+                label: "STS signing public JWKS".to_string(),
+                message: format!("no public key found for configured kid {}", config.our_kid),
+            },
+        )?;
+    let raw = read_checked_file(
+        mock_key_file,
+        "mock external signing key",
+        config.allow_insecure_key_file,
+    )?;
+    let provider = MockExternalRs256Provider::from_private_jwk_for_backend(&selection, raw)
+        .map_err(BootstrapError::from)?;
+    let signer =
+        ExternalRs256JoseSigner::new(config.our_kid.clone(), public_jwk, Arc::new(provider))
+            .map_err(BootstrapError::from)?;
+    verify_external_signer_at_bootstrap(&signer)?;
+    Ok(Arc::new(signer))
+}
+
+fn verify_external_signer_at_bootstrap(signer: &dyn JoseSigner) -> Result<(), BootstrapError> {
+    let claims = sts_core::MintedClaims::new(
+        "bootstrap-self-check",
+        "bootstrap-subject",
+        "bootstrap-audience",
+        "bootstrap.scope",
+        1,
+        2,
+        "bootstrap-jti",
+        "bootstrap-actor",
+    );
+    let token = signer.sign_claims(&claims).map_err(BootstrapError::from)?;
+    signer.verify_claims(&token).map_err(BootstrapError::from)?;
+    Ok(())
 }
 
 #[cfg(feature = "pqc-openssl-unstable")]
@@ -1744,6 +1822,22 @@ mod tests {
         ])
     }
 
+    fn bootstrap_pairs_without_signing_key(base: &ConfigSource) -> Vec<(String, String)> {
+        [
+            "IDP_ISSUER",
+            "EXPECTED_SUBJECT_AUD",
+            "ACTOR_IDS",
+            "OBO_STS_ISSUER",
+            "IDP_JWKS_FILE",
+            "ACTOR_JWKS_FILE",
+            "CLIENT_JWKS_FILE",
+            "TARGET_POLICY_JSON",
+        ]
+        .into_iter()
+        .map(|key| (key.to_string(), base.get(key).expect("source key").to_string()))
+        .collect()
+    }
+
     #[tokio::test]
     async fn bootstrap_builds_complete_state_from_safe_files() {
         let dir = temp_bootstrap_dir("accepted");
@@ -1781,6 +1875,105 @@ mod tests {
         };
         assert!(matches!(err, BootstrapError::InvalidJwks { .. }));
         assert!(err.to_string().contains("private JWK member"));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_loads_mock_external_signer_without_file_key_fallback() {
+        let dir = temp_bootstrap_dir("mock-external");
+        let base = bootstrap_source(&dir);
+        let generated = RsaJoseSigner::generate_private_jwk().expect("generated key");
+        let public_jwks_file = dir.join("external-public-jwks.json");
+        let mock_key_file = dir.join("mock-external-private.json");
+        write_file(
+            &public_jwks_file,
+            &serde_json::to_string(&sts_jose::JwksDocument::new(vec![
+                generated.public_jwk.clone(),
+            ]))
+            .expect("public jwks"),
+        );
+        write_file(&mock_key_file, &generated.private_jwk_json);
+
+        let mut pairs = bootstrap_pairs_without_signing_key(&base);
+        pairs.push((
+            "OBO_STS_KEY_FILE".to_string(),
+            dir.join("missing-local-key.pem").display().to_string(),
+        ));
+        pairs.push(("STS_SIGNING_PROVIDER".to_string(), "mock-external".to_string()));
+        pairs.push(("STS_SIGNING_KID".to_string(), generated.public_jwk.kid.clone()));
+        pairs.push((
+            "STS_SIGNING_PUBLIC_JWKS_FILE".to_string(),
+            public_jwks_file.display().to_string(),
+        ));
+        pairs.push((
+            "STS_MOCK_EXTERNAL_SIGNER_KEY_FILE".to_string(),
+            mock_key_file.display().to_string(),
+        ));
+        let state =
+            build_state_from_source(&ConfigSource::from_pairs(pairs)).await.expect("bootstrap");
+        assert_eq!(state.signer.alg(), "RS256");
+        assert_eq!(state.published_jwks.keys, vec![generated.public_jwk]);
+        let jwks_json = serde_json::to_value(&state.published_jwks).expect("jwks");
+        assert!(jwks_json["keys"][0].get("d").is_none());
+        assert!(jwks_json["keys"][0].get("p").is_none());
+        assert!(jwks_json["keys"][0].get("q").is_none());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_mock_external_public_key_mismatch_without_fallback() {
+        let dir = temp_bootstrap_dir("mock-external-mismatch");
+        let base = bootstrap_source(&dir);
+        let public_key = RsaJoseSigner::generate_private_jwk().expect("public key");
+        let private_key = RsaJoseSigner::generate_private_jwk().expect("private key");
+        let local_fallback_key = RsaJoseSigner::generate_private_jwk().expect("fallback key");
+        let public_jwks_file = dir.join("external-public-jwks.json");
+        let mock_key_file = dir.join("mock-external-private.json");
+        let local_key_file = dir.join("local-fallback-private.json");
+        write_file(
+            &public_jwks_file,
+            &serde_json::to_string(&sts_jose::JwksDocument::new(vec![
+                public_key.public_jwk.clone(),
+            ]))
+            .expect("public jwks"),
+        );
+        write_file(&mock_key_file, &private_key.private_jwk_json);
+        write_file(&local_key_file, &local_fallback_key.private_jwk_json);
+
+        let mut pairs = bootstrap_pairs_without_signing_key(&base);
+        pairs.push(("OBO_STS_KEY_FILE".to_string(), local_key_file.display().to_string()));
+        pairs.push(("STS_SIGNING_PROVIDER".to_string(), "mock-external".to_string()));
+        pairs.push(("STS_SIGNING_KID".to_string(), public_key.public_jwk.kid.clone()));
+        pairs.push((
+            "STS_SIGNING_PUBLIC_JWKS_FILE".to_string(),
+            public_jwks_file.display().to_string(),
+        ));
+        pairs.push((
+            "STS_MOCK_EXTERNAL_SIGNER_KEY_FILE".to_string(),
+            mock_key_file.display().to_string(),
+        ));
+        let err = match build_state_from_source(&ConfigSource::from_pairs(pairs)).await {
+            Ok(_) => panic!("mismatched external public key must fail bootstrap"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, BootstrapError::Jose(_)));
+        assert!(err.to_string().contains("verification") || err.to_string().contains("signature"));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_unknown_signing_provider() {
+        let dir = temp_bootstrap_dir("unknown-signing-provider");
+        let base = bootstrap_source(&dir);
+        let mut pairs = bootstrap_pairs_without_signing_key(&base);
+        pairs.push((
+            "OBO_STS_KEY_FILE".to_string(),
+            dir.join("sts-private.pem").display().to_string(),
+        ));
+        pairs.push(("STS_SIGNING_PROVIDER".to_string(), "aws-kms".to_string()));
+        let err = match build_state_from_source(&ConfigSource::from_pairs(pairs)).await {
+            Ok(_) => panic!("unsupported provider must fail closed"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, BootstrapError::Jose(_)));
+        assert!(err.to_string().contains("unsupported STS signing provider"));
     }
 
     #[cfg(feature = "pqc-openssl-unstable")]

@@ -134,6 +134,30 @@ with matching public material. The published JWKS contains only public `AKP`
 members (`kty`, `kid`, `use`, `alg`, `pub`) and never `priv`. This path uses
 OpenSSL 3.5+ ML-DSA through `openssl-rs` and is not a FIPS-validation claim.
 
+External signing uses an explicit provider selection. The default remains the
+file-backed signer:
+
+```bash
+STS_SIGNING_PROVIDER=file
+OBO_STS_KEY_FILE=/run/secrets/sts/obo_sts_private_key.json
+```
+
+`mock-external` is available for CI and local provider-boundary proof. It loads
+public key metadata from a public-only JWKS file and signs through the
+JOSE-level external-provider trait; it must not be used as a cloud KMS/HSM
+claim:
+
+```bash
+STS_SIGNING_PROVIDER=mock-external
+STS_SIGNING_ALG=RS256
+STS_SIGNING_KID=<public-key-id>
+STS_SIGNING_PUBLIC_JWKS_FILE=/run/secrets/sts/signing-public-jwks.json
+STS_MOCK_EXTERNAL_SIGNER_KEY_FILE=/run/secrets/sts/mock-external-private.json
+```
+
+Unsupported providers such as `aws-kms`, `gcp-kms`, and `pkcs11` fail closed
+until concrete providers are implemented and tested.
+
 ## HTTP Ops
 
 The Rust HTTP runtime serves a curated OpenAPI artifact at `/openapi.json`.

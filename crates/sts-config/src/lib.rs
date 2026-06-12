@@ -194,6 +194,8 @@ pub struct RuntimeConfig {
     pub target_policy: TargetPolicy,
     pub sts_signing_alg: String,
     pub sts_signing_provider: String,
+    pub sts_signing_public_jwks_file: Option<PathBuf>,
+    pub mock_external_signer_key_file: Option<PathBuf>,
     pub clock_skew_leeway: i64,
     pub scoped_token_ttl: i64,
     pub jwks_cache_max_age: i64,
@@ -296,7 +298,12 @@ impl RuntimeConfig {
                 source.get("OBO_STS_ISSUER").unwrap_or(DEFAULT_ISSUER),
                 "OBO_STS_ISSUER",
             )?,
-            our_kid: DEFAULT_KID.to_string(),
+            our_kid: source
+                .get("STS_SIGNING_KID")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(DEFAULT_KID)
+                .to_string(),
             sts_secrets_dir,
             obo_sts_key_file,
             idp_jwks_file,
@@ -317,6 +324,16 @@ impl RuntimeConfig {
                 .unwrap_or("file")
                 .trim()
                 .to_ascii_lowercase(),
+            sts_signing_public_jwks_file: source
+                .get("STS_SIGNING_PUBLIC_JWKS_FILE")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+            mock_external_signer_key_file: source
+                .get("STS_MOCK_EXTERNAL_SIGNER_KEY_FILE")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
             clock_skew_leeway: parse_env_int(
                 source,
                 "CLOCK_SKEW_LEEWAY",
@@ -875,6 +892,34 @@ mod tests {
         assert_eq!(cfg.actor_id, "chat-mcp");
         assert_eq!(cfg.target_policy.targets.len(), 1);
         assert_eq!(cfg.client_ids.len(), 1);
+        assert_eq!(cfg.our_kid, DEFAULT_KID);
+        assert_eq!(cfg.sts_signing_provider, "file");
+        assert!(cfg.sts_signing_public_jwks_file.is_none());
+        assert!(cfg.mock_external_signer_key_file.is_none());
+    }
+
+    #[test]
+    fn runtime_config_parses_external_signing_metadata() {
+        let source = ConfigSource::from_pairs([
+            ("IDP_ISSUER", "https://issuer.example/oauth2/default"),
+            ("EXPECTED_SUBJECT_AUD", "api://obo"),
+            ("ACTOR_IDS", "chat-mcp"),
+            ("STS_SIGNING_PROVIDER", "mock-external"),
+            ("STS_SIGNING_KID", "external-kid-1"),
+            ("STS_SIGNING_PUBLIC_JWKS_FILE", "/run/sts/signing-public.json"),
+            ("STS_MOCK_EXTERNAL_SIGNER_KEY_FILE", "/run/sts/mock-private.json"),
+        ]);
+        let cfg = RuntimeConfig::from_source(&source).expect("config");
+        assert_eq!(cfg.sts_signing_provider, "mock-external");
+        assert_eq!(cfg.our_kid, "external-kid-1");
+        assert_eq!(
+            cfg.sts_signing_public_jwks_file,
+            Some(PathBuf::from("/run/sts/signing-public.json"))
+        );
+        assert_eq!(
+            cfg.mock_external_signer_key_file,
+            Some(PathBuf::from("/run/sts/mock-private.json"))
+        );
     }
 
     fn minimal_source_with_sts_issuer(issuer: &str) -> ConfigSource {
