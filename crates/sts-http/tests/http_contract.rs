@@ -773,6 +773,33 @@ async fn contract_unknown_extension_params_are_ignored() {
 }
 
 #[tokio::test]
+async fn rfc_oauth21_duplicate_unknown_parameters_are_ignored() {
+    let (state, subject_signer, actor_signer, _) = test_state();
+    let now = unix_now();
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let actor_token = signed_assertion(&actor_signer, now, "actor-duplicate-unknown-extension");
+    let body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", actor_token.as_str()),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+        ("unknown_extension", "ignored"),
+        ("unknown_extension", "still-ignored"),
+    ])
+    .expect("form");
+
+    let response = post_token_form(state, body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["issued_token_type"], ACCESS_TOKEN_TYPE);
+    assert_eq!(body["token_type"], "Bearer");
+    assert_eq!(body["scope"], "chat.read");
+}
+
+#[tokio::test]
 async fn contract_actor_token_type_without_actor_token_is_rejected() {
     let (state, _, _, _) = test_state();
     let body = serde_urlencoded::to_string([

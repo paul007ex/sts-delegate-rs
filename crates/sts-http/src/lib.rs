@@ -954,6 +954,9 @@ fn parse_token_form(headers: &HeaderMap, body: &[u8]) -> Result<TokenForm, HttpE
     let mut seen = BTreeSet::new();
     let mut form = TokenForm::default();
     for (key, value) in pairs {
+        if !is_recognized_token_form_key(&key) {
+            continue;
+        }
         if !seen.insert(key.clone()) {
             if matches!(key.as_str(), "audience" | "resource") {
                 return Err(HttpError::invalid_target(format!(
@@ -967,6 +970,24 @@ fn parse_token_form(headers: &HeaderMap, body: &[u8]) -> Result<TokenForm, HttpE
         assign_token_form_value(&mut form, &key, value);
     }
     Ok(form)
+}
+
+fn is_recognized_token_form_key(key: &str) -> bool {
+    matches!(
+        key,
+        "grant_type"
+            | "subject_token"
+            | "subject_token_type"
+            | "actor_token"
+            | "actor_token_type"
+            | "audience"
+            | "resource"
+            | "scope"
+            | "requested_token_type"
+            | "client_id"
+            | "client_assertion"
+            | "client_assertion_type"
+    )
 }
 
 fn require_form_urlencoded(headers: &HeaderMap) -> Result<(), HttpError> {
