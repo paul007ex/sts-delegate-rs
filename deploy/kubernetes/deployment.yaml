@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sts-delegate-rs
+  namespace: sts-delegate-rs
+  labels:
+    app.kubernetes.io/name: sts-delegate-rs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sts-delegate-rs
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sts-delegate-rs
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: sts
+          image: sts-delegate-rs:local
+          imagePullPolicy: IfNotPresent
+          args: ["serve"]
+          ports:
+            - name: http
+              containerPort: 8888
+          envFrom:
+            - configMapRef:
+                name: sts-delegate-rs-config
+          env:
+            - name: OBO_STS_KEY_FILE
+              value: /run/secrets/sts/obo_sts_private_key.json
+            - name: ACTOR_JWKS_FILE
+              value: /run/secrets/sts/actor_jwks.json
+            - name: CLIENT_JWKS_FILE
+              value: /run/secrets/sts/client_jwks.json
+            - name: IDP_JWKS_FILE
+              value: /run/secrets/sts/idp_jwks.json
+          volumeMounts:
+            - name: sts-secrets
+              mountPath: /run/secrets/sts
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /.well-known/oauth-authorization-server
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /jwks
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+      volumes:
+        - name: sts-secrets
+          secret:
+            secretName: sts-delegate-rs-secrets
+            defaultMode: 0400

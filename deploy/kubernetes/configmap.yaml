@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sts-delegate-rs-config
+  namespace: sts-delegate-rs
+  labels:
+    app.kubernetes.io/name: sts-delegate-rs
+data:
+  IDP_ISSUER: "https://idp.invalid/"
+  EXPECTED_SUBJECT_AUD: "api://chat-mcp"
+  OBO_STS_ISSUER: "https://sts-delegate.invalid"
+  ACTOR_IDS: "chat-mcp"
+  STS_TOKEN_EXCHANGE_MODE: "delegation"
+  STS_HTTP_ADDR: "0.0.0.0:8888"
+  ALLOW_INSECURE_HTTP_BIND: "true"
+  STS_ENABLE_METRICS: "true"
+  LOG_FORMAT: "json"
+  TARGET_POLICY_JSON: |
+    {
+      "api://databricks-mcp": ["databricks.read"],
+      "api://servicenow-mcp": ["servicenow.read"]
+    }
