@@ -1,0 +1,166 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Existing release tag, for example v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: package ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            runner: ubuntu-latest
+          - name: macos
+            runner: macos-latest
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref }}
+
+      - name: Install stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag_name }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+
+          version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"
+          expected_tag="v${version}"
+          if [[ "$tag" != "$expected_tag" && "$tag" != "$expected_tag"-* ]]; then
+            echo "release tag '$tag' does not match workspace version '$expected_tag' or '$expected_tag-*'" >&2
+            exit 1
+          fi
+
+          if ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "release tag '$tag' is not present in the checkout" >&2
+            exit 1
+          fi
+
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Package sts-cli
+        run: scripts/package_release.sh
+
+      - name: Stage release assets
+        shell: bash
+        run: |
+          mkdir -p release-upload
+          cp dist/sts-cli-*.tar.gz release-upload/
+          cp dist/SHA256SUMS "release-upload/SHA256SUMS.${{ matrix.name }}"
+          shasum -a 256 -c dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sts-cli-${{ matrix.name }}
+          path: release-upload/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: publish GitHub release
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: release-assets
+
+      - name: Resolve release tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag_name }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+
+          version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"
+          expected_tag="v${version}"
+          if [[ "$tag" != "$expected_tag" && "$tag" != "$expected_tag"-* ]]; then
+            echo "release tag '$tag' does not match workspace version '$expected_tag' or '$expected_tag-*'" >&2
+            exit 1
+          fi
+
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Verify downloaded assets
+        shell: bash
+        run: |
+          mkdir -p release-upload
+          find release-assets -type f -name 'sts-cli-*.tar.gz' -exec cp {} release-upload/ \;
+
+          checksum_files="$(find release-assets -type f -name 'SHA256SUMS.*' -print | sort)"
+          if [[ -z "$checksum_files" ]]; then
+            echo "no checksum files were downloaded" >&2
+            exit 1
+          fi
+          while IFS= read -r checksum_file; do
+            cat "$checksum_file"
+          done <<<"$checksum_files" > release-upload/SHA256SUMS
+
+          archive_count="$(find release-upload -maxdepth 1 -type f -name 'sts-cli-*.tar.gz' | wc -l | tr -d ' ')"
+          if [[ "$archive_count" -lt 1 ]]; then
+            echo "no release archives were downloaded" >&2
+            exit 1
+          fi
+
+          cd release-upload
+          shasum -a 256 -c SHA256SUMS
+          ls -1
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          cat > release-notes.md <<EOF
+          Prebuilt sts-cli archives for ${RELEASE_TAG}.
+
+          Verify downloads with:
+
+          shasum -a 256 -c SHA256SUMS
+          EOF
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-upload/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release-upload/* \
+              --verify-tag \
+              --title "$RELEASE_TAG" \
+              --notes-file release-notes.md
+          fi

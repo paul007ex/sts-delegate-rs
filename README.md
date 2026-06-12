@@ -72,10 +72,22 @@ The local archive contains the `sts-cli` binary plus public README/LICENSE mater
 when present. It does not include generated keys, tokens, environment files, or
 runtime policy files. `dist/` is ignored by git.
 
-Hosted release binaries, published GHCR images, Homebrew formulas,
-`cargo-binstall`, and crates.io publication are not shipped in this phase. Track
-those as separate release follow-ups instead of treating local archives or local
-Docker builds as hosted distribution.
+Tagged releases publish hosted `sts-cli` archives to GitHub Releases after the
+release workflow succeeds. Verify downloaded archives before installing:
+
+```bash
+release_tag=v0.1.0
+gh release download "$release_tag" \
+  --repo paul007ex/sts-delegate-rs \
+  --pattern 'sts-cli-*.tar.gz' \
+  --pattern SHA256SUMS
+shasum -a 256 -c SHA256SUMS
+```
+
+Published GHCR images, Homebrew formulas, `cargo-binstall`, and crates.io
+publication are not shipped in this phase. Track those as separate release
+follow-ups instead of treating local archives, hosted CLI archives, or local
+Docker builds as those distribution channels.
 
 To build a local Docker image:
 
@@ -167,12 +179,12 @@ separate future work.
 
 ## Release shape
 
-Current releases are source releases from GitHub tags, plus locally reproducible
-`sts-cli` archives from `scripts/package_release.sh`. Hosted GitHub release
-automation is intentionally separate so account/billing limits do not block local
-packaging. Workspace crates inherit `publish = false`; crates.io publication is
-intentionally out of scope until the internal crate graph, package names, and public
-API stability are ready for an explicit publishing milestone.
+Current releases use GitHub tag source archives, tag-driven hosted `sts-cli`
+archives when `.github/workflows/release.yml` succeeds, plus locally
+reproducible archives from `scripts/package_release.sh`. Workspace crates
+inherit `publish = false`; crates.io publication is intentionally out of scope
+until the internal crate graph, package names, and public API stability are ready
+for an explicit publishing milestone.
 
 Release validation currently uses:
 
@@ -187,11 +199,12 @@ docker build -t sts-delegate-rs:local .
 scripts/docker_smoke.sh sts-delegate-rs:local
 ```
 
-GitHub tag source archives and local `dist/` archives are the release artifacts for
-this phase. `cargo package --workspace` expects internal workspace crates such as
-`sts-core` to exist in the crates.io index after Cargo prepares local `path`
-dependencies for publication. That is not the current release model and remains out
-of scope until a crates.io publishing milestone is opened.
+GitHub tag source archives, hosted release archives attached by successful
+release workflow runs, and local `dist/` archives are the CLI release artifacts
+for this phase. `cargo package --workspace` expects internal workspace crates
+such as `sts-core` to exist in the crates.io index after Cargo prepares local
+`path` dependencies for publication. That is not the current release model and
+remains out of scope until a crates.io publishing milestone is opened.
 
 When real Okta inputs are configured locally, the live Rust process canary proves
 the customer flow without printing tokens:
