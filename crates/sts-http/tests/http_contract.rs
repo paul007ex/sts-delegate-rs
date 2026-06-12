@@ -783,7 +783,7 @@ async fn contract_discovery_and_jwks_match_python_oracle_shape() {
     assert_eq!(metadata["issuer"], "https://sts.example");
     assert_eq!(metadata["token_endpoint"], "https://sts.example/token");
     assert_eq!(metadata["jwks_uri"], "https://sts.example/jwks");
-    assert_eq!(metadata["response_types_supported"], json!([]));
+    assert!(metadata.get("response_types_supported").is_none());
     assert_eq!(metadata["grant_types_supported"], json!([TOKEN_EXCHANGE_GRANT_TYPE]));
     assert_eq!(metadata["token_endpoint_auth_methods_supported"], json!(["private_key_jwt"]));
     assert_eq!(metadata["token_endpoint_auth_signing_alg_values_supported"], json!(["RS256"]));
@@ -814,6 +814,27 @@ async fn contract_discovery_and_jwks_match_python_oracle_shape() {
     for private_member in ["d", "p", "q", "dp", "dq", "qi"] {
         assert!(key.get(private_member).is_none(), "JWKS leaked {private_member}");
     }
+}
+
+#[tokio::test]
+async fn rfc8414_omits_zero_element_metadata_arrays() {
+    let (state, _, _, _) = test_state();
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/.well-known/oauth-authorization-server")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let metadata = read_json(response).await;
+    assert!(
+        metadata.get("response_types_supported").is_none(),
+        "zero-element metadata arrays must be omitted, got {metadata:?}"
+    );
 }
 
 #[tokio::test]

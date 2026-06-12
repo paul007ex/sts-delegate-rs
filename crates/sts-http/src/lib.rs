@@ -590,6 +590,7 @@ pub struct AuthorizationServerMetadata {
     pub issuer: String,
     pub token_endpoint: String,
     pub jwks_uri: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub response_types_supported: Vec<String>,
     pub grant_types_supported: Vec<String>,
     pub token_endpoint_auth_methods_supported: Vec<String>,
@@ -1980,7 +1981,7 @@ mod tests {
         assert_eq!(body["issuer"], "https://sts.example");
         assert_eq!(body["token_endpoint"], "https://sts.example/token");
         assert_eq!(body["jwks_uri"], "https://sts.example/jwks");
-        assert_eq!(body["response_types_supported"], Value::Array(vec![]));
+        assert!(body.get("response_types_supported").is_none());
     }
 
     #[tokio::test]

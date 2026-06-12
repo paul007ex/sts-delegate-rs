@@ -1,6 +1,6 @@
 # sts-delegate-rs v2 Contract Requirements Ledger
 
-Generated: 2026-06-11
+Generated: 2026-06-12
 
 This ledger is the canonical alpha contract-freeze artifact for issue #2. It maps the
 Python `sts-delegate` oracle, Rust implementation, contract tests, issue trail, and
@@ -22,7 +22,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
   `sts_delegate/application/replay_records.py`
 - Rust issues: #1 through #31, with #2 as the contract-freeze tracker
 - Primary specs: RFC 6749, RFC 7523, RFC 7519, RFC 8414, RFC 8693, RFC 9068,
-  RFC 9449
+  RFC 9110, RFC 9449
 
 ## Master Requirements Ledger
 
@@ -59,10 +59,12 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-029 | Metadata must advertise only `private_key_jwt` for token endpoint client auth. | policy | implemented | http/client-auth | Python `client_auth.py:1`; `crates/sts-http/src/lib.rs:306` | metadata contract test | Basic/Bearer header auth rejected. |
 | R-030 | Metadata must advertise only assertion signing algorithms actually enforced. | must | implemented | http/verify | Python `client_auth.py:12`; `crates/sts-http/src/lib.rs`; `crates/sts-verify/src/lib.rs` | metadata contract test; JOSE allowlist test | Token endpoint client-auth metadata is sourced from the RS256-pinned inbound verifier allowlist, independent of the STS outbound signing backend. |
 | R-031 | Metadata must advertise only DPoP algorithms the verifier accepts. | must | implemented | dpop/http | RFC 9449; `crates/sts-dpop/src/lib.rs:19` | metadata contract test | HS256 and none must not appear. |
+| R-031A | Metadata must not emit `response_types_supported` as an empty array when no authorization endpoint response types are supported. | must | implemented | http | RFC 8414 Section 2; issue #52; `crates/sts-http/src/lib.rs:590` | `contract_discovery_and_jwks_match_python_oracle_shape` | The member is omitted until a real authorization endpoint response type is supported. |
 | R-032 | `/jwks` must publish public STS signing keys only. | must | implemented | jose/http | `crates/sts-http/src/lib.rs:295`; `crates/sts-jose/src/lib.rs:282` | JWKS contract test | Private JWK members must not leak. |
 | R-033 | `/jwks` responses must be public cacheable with max-age. | policy | implemented | http | Python `tests/test_integration.py:612`; `crates/sts-http/src/lib.rs:295` | `contract_discovery_and_jwks_match_python_oracle_shape` | Token responses use no-store instead. |
 | R-034 | `/token` must accept only `application/x-www-form-urlencoded`. | must | implemented | http | RFC 8693 Section 2.1; `crates/sts-http/src/lib.rs:316` | `contract_token_rejects_wrong_content_type_and_duplicate_form_params` | JSON/multipart fail 4xx, not 500. |
 | R-035 | `/token` must reject duplicate recognized form parameters. | must | implemented | http | RFC 6749 Section 3.1; `crates/sts-http/src/lib.rs:320` | duplicate form test | Duplicate target parameters map to invalid_target. |
+| R-035A | Optional `/token` form parameters with empty string values are normalized as omitted after duplicate detection, except required fields still fail required-field validation. | must | implemented | http | RFC 6749 Section 3.1; RFC 8693 Section 2.1; issues #47/#48/#49/#53 | `contract_token_treats_empty_form_values_as_omitted` | `grant_type=` remains invalid; empty `actor_token=` keeps a fail-closed delegation dispatch guard. |
 | R-036 | Unknown extension request parameters must be ignored unless a recognized gate fails. | policy | implemented | http/core | Python `tests/test_integration.py:206`; issue #17 | `contract_unknown_extension_params_are_ignored` | Fresh actor assertion required when testing around replay. |
 | R-037 | `/token` must reject Authorization header client auth and direct callers to private_key_jwt. | policy | implemented | http/client-auth | `crates/sts-http/src/lib.rs:350`; issue #4 | `contract_authorization_header_client_auth_is_rejected` | Preserve WWW-Authenticate scheme. |
 | R-038 | `/token` responses and errors must include `Cache-Control: no-store` and `Pragma: no-cache`. | must | implemented | http | RFC 6749 Section 5.1; Python `tests/test_integration.py:550`; `crates/sts-http/src/lib.rs:267` | token/error contract tests | Metadata/JWKS are public-cacheable. |
@@ -75,13 +77,13 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-045 | Token exchange grant type must be exactly `urn:ietf:params:oauth:grant-type:token-exchange`. | must | implemented | core/http | RFC 8693 Section 2.1; `crates/sts-core/src/lib.rs:12` | HTTP contract tests | Bad grant returns unsupported_grant_type. |
 | R-046 | `subject_token` is required and must not exceed configured max token length. | must | implemented | http/verify | RFC 8693 Section 2.1; `crates/sts-http/src/lib.rs:388` | HTTP unit tests | Oversized input fails before crypto. |
 | R-047 | `subject_token_type` is required and only access_token or jwt are accepted for inbound subject tokens. | policy | implemented | http/verify | `crates/sts-http/src/lib.rs:28`; issue #11 | HTTP contract tests | Unsupported type is invalid_request. |
-| R-048 | `actor_token_type` is required when `actor_token` is present. | must | implemented | http | RFC 8693 Section 2.1; Python `tests/test_integration.py:220` | HTTP tests | Empty actor token remains present and malformed. |
+| R-048 | `actor_token_type` is required when a non-empty `actor_token` is present. | must | implemented | http | RFC 8693 Section 2.1; Python `tests/test_integration.py:220`; issue #53 | HTTP tests; `contract_token_treats_empty_form_values_as_omitted` | Empty `actor_token_type=` is omitted, then rejected when a non-empty actor token is supplied. |
 | R-049 | `actor_token_type` must not be accepted without actor token. | must | implemented | http | RFC 8693 Section 2.1; issue #17 | `contract_actor_token_type_without_actor_token_is_rejected` | Rejected before subject-token verification. |
-| R-050 | `requested_token_type` absent means the STS mints its default access_token type. | policy | implemented | core/http | RFC 8693 Section 2.1; issue #11 | requested-token contract test | Default issued_token_type is access_token. |
+| R-050 | `requested_token_type` absent or empty means the STS mints its default access_token type. | policy | implemented | core/http | RFC 8693 Section 2.1; issues #11/#47 | requested-token contract test; `contract_token_treats_empty_form_values_as_omitted` | Default issued_token_type is access_token. |
 | R-051 | `requested_token_type=access_token` is accepted. | must | implemented | http | issue #11; Python `tests/test_integration.py:178` | requested-token contract test | Response still JWT-formatted at+jwt token. |
 | R-052 | `requested_token_type=jwt` is rejected to avoid acknowledging one type while reporting access_token. | policy | implemented | http | issue #11; Python `tests/test_integration.py:178` | requested-token contract test | Intentional Python parity choice. |
 | R-053 | Unsupported requested token types return `invalid_request`. | must | implemented | http | RFC 8693 Section 2.2.2; `crates/sts-http/tests/http_contract.rs:615` | requested-token contract test | SAML2 currently unsupported. |
-| R-054 | Exactly one target must be resolved from `audience` and/or `resource`. | policy | implemented | core/http | RFC 8693 Section 2.1.1; `crates/sts-core/src/lib.rs:155` | core tests | Both present must agree. |
+| R-054 | Exactly one target must be resolved from non-empty `audience` and/or `resource`. | policy | implemented | core/http | RFC 8693 Section 2.1.1; issues #48/#53; `crates/sts-core/src/lib.rs:155` | core tests; `contract_token_treats_empty_form_values_as_omitted` | Both present must agree; empty `audience=` does not block a valid `resource`. |
 | R-055 | `resource` values must be absolute URIs and must not contain fragments. | must | implemented | core | RFC 8693 Section 2.1; `crates/sts-core/src/lib.rs:283` | core tests | Relative resource rejected. |
 | R-056 | Unknown targets are denied by default with `invalid_target`. | must | implemented | core/http/config | Python `tests/test_integration.py:170`; `crates/sts-config/src/lib.rs:576` | HTTP/core tests | Empty target policy denies every target. |
 | R-057 | Scopes must be downscoped against target allowed scopes. | must | implemented | core | Python `tests/test_integration.py:162`; `crates/sts-core/src/lib.rs:183` | core tests | No remaining scope returns invalid_scope. |
@@ -113,7 +115,7 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-083 | Client assertion auth uses `private_key_jwt` assertion type. | must | implemented | http/verify | RFC 7523; `crates/sts-http/src/lib.rs:42` | HTTP tests | Wrong/missing assertion type rejected. |
 | R-084 | Client assertion `iss` and `sub` must match. | must | implemented | verify | RFC 7523; `crates/sts-verify/src/lib.rs:328` | verify/http tests | Prevent confused identities. |
 | R-085 | `client_id` form value must match authenticated client assertion subject. | must | implemented | http | issue #7; `crates/sts-http/tests/http_contract.rs:1337` | client mismatch test | Error is invalid_client. |
-| R-086 | Client assertion audience must identify this STS issuer or token endpoint. | must | implemented | verify/http | RFC 7523; `crates/sts-verify/src/lib.rs:334` | verify/http tests | Path-bearing issuer endpoints included. |
+| R-086 | Client and actor assertion audience must identify this STS issuer or token endpoint. | must | implemented | verify/http | RFC 7523; issue #55; `crates/sts-verify/src/lib.rs:393` | verify/http tests; `rfc7523_assertion_audience_is_always_validated` | Audience is always checked; `iss` equal to the STS issuer does not bypass `aud`. |
 | R-087 | Client assertion lifetime must not exceed configured max TTL plus skew. | must | implemented | verify | `crates/sts-verify/src/lib.rs:414` | verify tests | Missing iat uses now-based span. |
 | R-088 | Client assertion signing key `kid` must belong to the claimed client identity. | must | implemented | verify/http | issue #7; `crates/sts-verify/src/lib.rs:371` | cross-client-key tests | Longest registered prefix wins. |
 | R-089 | Actor assertion signing key `kid` must belong to the claimed actor identity. | must | implemented | verify/http | issue #10; `crates/sts-http/tests/http_contract.rs:1408` | cross-domain actor key test | Uses actor/client registry. |
@@ -122,9 +124,9 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-092 | `may_act` authorizes delegation, not impersonation. | must | implemented | core/http | RFC 8693 Section 4.4; Python `tests/test_impersonation.py:414`; issue #25 | `contract_may_act_allows_matching_actor_and_does_not_burn_replay_on_failure`; `contract_impersonation_ignores_subject_may_act_claim` | Delegation enforces `may_act`; impersonation policy remains separate and does not consult `may_act`. |
 | R-093 | Delegation mode requires actor token. | must | implemented | http | Python `tests/test_impersonation.py:284`; `crates/sts-http/src/lib.rs:426` | HTTP tests | If client auth present, error is invalid_request. |
 | R-094 | Impersonation mode requires private_key_jwt client auth. | must | implemented | http | Python `tests/test_impersonation.py:395`; issue #12 | impersonation tests | Actor-token-only cannot impersonate. |
-| R-095 | `both` mode dispatches to delegation when actor_token is present. | policy | implemented | http/config | Python `tests/test_impersonation.py:434`; `crates/sts-config/src/lib.rs:75` | HTTP tests | Empty actor_token is present malformed. |
+| R-095 | `both` mode dispatches to delegation when a non-empty actor_token is present or an empty actor_token was explicitly supplied. | policy | implemented | http/config | Python `tests/test_impersonation.py:434`; issue #53; `crates/sts-config/src/lib.rs:75` | HTTP tests; `contract_both_mode_dispatches_by_actor_token_presence` | Empty `actor_token=` is normalized for parsing but still guarded from falling into impersonation. |
 | R-096 | `both` mode dispatches to impersonation when actor_token is absent and client assertion exists. | policy | implemented | http/config | Python `tests/test_impersonation.py:444` | HTTP tests | Missing policy still denies. |
-| R-097 | Empty present actor_token must not be treated as absent impersonation. | must-not | implemented | http | Python `tests/test_impersonation.py:458` | `contract_both_mode_dispatches_by_actor_token_presence` | Present-empty remains malformed and mints no token. |
+| R-097 | Empty present actor_token must not be treated as absent impersonation. | must-not | implemented | http | Python `tests/test_impersonation.py:458`; issue #53 | `contract_both_mode_dispatches_by_actor_token_presence` | Empty `actor_token=` is omitted for RFC form parsing but keeps an internal dispatch flag so no impersonation token is minted. |
 | R-098 | Impersonation policy is deny-by-default when no client entry exists. | must | implemented | config/http | issue #12; Python `tests/test_impersonation.py:316` | impersonation tests | Wrong client is invalid_request. |
 | R-099 | Impersonation policy supports per-client target allowlists. | must | implemented | config/http | issue #12; `crates/sts-config/src/lib.rs:114` | impersonation policy tests | Wrong target maps invalid_target. |
 | R-100 | Impersonation policy supports per-client subject allowlists. | must | implemented | config/http | issue #12; `crates/sts-config/src/lib.rs:120` | impersonation policy tests | Wrong subject maps invalid_request. |
@@ -140,8 +142,8 @@ primary RFCs into atomic product requirements for the Rust v2 line.
 | R-110 | DPoP proof header must carry a valid public JWK and no private key material. | must | implemented | dpop | RFC 9449 Section 4.3; `crates/sts-dpop/src/lib.rs:189` | dpop tests | `d`, RSA CRT, and `k` members rejected. |
 | R-111 | DPoP proof signature must verify against the embedded public JWK. | must | implemented | dpop | RFC 9449 Section 4.3; `crates/sts-dpop/src/lib.rs:226` | dpop tests | Embedded key mismatch rejected. |
 | R-112 | DPoP proof requires non-empty string `jti`, `htm`, `htu`, and finite numeric `iat`. | must | implemented | dpop | RFC 9449 Section 4.3; `crates/sts-dpop/src/lib.rs:243` | dpop tests | Non-string fields rejected cleanly. |
-| R-113 | DPoP `htm` comparison is case-insensitive. | policy | implemented | dpop | Python `tests/test_dpop.py:105`; `crates/sts-dpop/src/lib.rs:258` | dpop tests | HTTP method token case ignored. |
-| R-114 | DPoP `htu` comparison strips query and fragment and normalizes scheme/host/default port/trailing slash. | policy | implemented | dpop | Python `dpop.py:56`; `crates/sts-dpop/src/lib.rs:265` | dpop tests | Path remains case-sensitive. |
+| R-113 | DPoP `htm` comparison is exact and case-sensitive. | must | implemented | dpop | RFC 9449 Section 4.3; RFC 9110 Section 9.1; issue #50; `crates/sts-dpop/src/lib.rs:457` | `rfc9449_dpop_htm_matches_http_method_case_sensitively` | `htm=post` does not match an actual `POST` token request. |
+| R-114 | DPoP `htu` comparison strips query and fragment and normalizes scheme, host, and default port, while preserving path significance including trailing slash. | must | implemented | dpop | RFC 9449 Section 4.3; issue #54; `crates/sts-dpop/src/lib.rs:509` | `rfc9449_dpop_htu_keeps_path_trailing_slash_significant`; dpop tests | `/token/` does not match `/token`; path remains case-sensitive. |
 | R-115 | DPoP `iat` must be within clock skew leeway. | must | implemented | dpop | RFC 9449 Section 4.3; `crates/sts-dpop/src/lib.rs:276` | dpop tests | Future and stale outside window reject. |
 | R-116 | DPoP replay retention expires at proof `iat + leeway`, not observation time + leeway. | must | implemented | dpop/replay | Python `tests/test_integration.py:289`; `crates/sts-dpop/src/lib.rs:120` | dpop/replay tests | Future-skew proof stays protected. |
 | R-117 | DPoP-bound minted tokens must include `cnf: {"jkt": ...}` and return `token_type=DPoP`. | must | implemented | core/http | RFC 9449 Section 6; Python `tests/test_integration.py:256`; `crates/sts-core/src/lib.rs:66` | DPoP contract tests | No top-level `cnf_jkt`. |
@@ -249,7 +251,7 @@ focused issue against the affected lane rather than using R-003 as a catch-all.
 | --- | --- | --- | --- | --- |
 | E-01 | Path-bearing issuer with trailing slash | strip trailing slash for route derivation | RFC 8414 Section 3.1; Rust HTTP | R-024 |
 | E-02 | Metadata queried with Authorization header | still public OK | Rust HTTP contract | R-025 |
-| E-03 | `response_types_supported` has no values | current Rust returns empty array | Rust HTTP metadata | R-026 |
+| E-03 | `response_types_supported` has no values | omit the metadata member instead of emitting a zero-element array | RFC 8414; Rust HTTP metadata; issue #52 | R-031A |
 | E-04 | Unknown extension form param | ignore | Python integration | R-036 |
 | E-05 | `resource` relative URI | reject invalid_target | Rust core test | R-055 |
 | E-06 | `resource` has fragment | reject invalid_target | RFC 8693; Rust core | R-055 |
@@ -259,14 +261,14 @@ focused issue against the affected lane rather than using R-003 as a catch-all.
 | E-10 | Actor/client registry has overlapping prefixes | longest identity prefix wins | Rust verify test | R-088, R-089 |
 | E-11 | Missing impersonation policy selector field | empty set, deny | Rust config | R-098 |
 | E-12 | Impersonation selector `"*"` | any for that selector | Rust/Python config tests | R-101 |
-| E-13 | Empty present actor_token in both mode | malformed, not impersonation | Python impersonation; Rust HTTP contract | R-097 |
+| E-13 | Empty present actor_token in both mode | omit empty value for parsing, retain dispatch guard, reject as delegation-shaped request rather than impersonating | Python impersonation; Rust HTTP contract; issue #53 | R-097 |
 | E-14 | Auth-context absent | omit `auth_time`, `acr`, `amr` | Python integration; Rust HTTP contract | R-073 |
 | E-15 | Subject expires before default TTL | cap minted exp and expires_in | Python integration | R-075, R-077 |
 | E-16 | Actor expires before default TTL | cap minted exp | Python integration | R-076 |
-| E-17 | DPoP htm lower-case `post` | accept | Rust/Python DPoP | R-113 |
+| E-17 | DPoP htm lower-case `post` for actual `POST` | reject | RFC 9449; RFC 9110; issue #50 | R-113 |
 | E-18 | DPoP htu with query/fragment | ignore query/fragment | Python DPoP | R-114 |
 | E-19 | DPoP htu with default port | normalize | Rust/Python DPoP | R-114 |
-| E-20 | DPoP htu trailing slash | normalize | issue #2 comment; Python DPoP | R-114 |
+| E-20 | DPoP htu trailing slash | preserve as path-significant and reject mismatch | RFC 9449; issue #54 | R-114 |
 | E-21 | DPoP non-string htm/htu from transport | clean invalid_dpop_proof | Python DPoP | R-112 |
 | E-22 | DPoP oversized compact proof | reject before signature | Rust/Python DPoP | R-107 |
 | E-23 | DPoP maximum-length jti | accept exactly max | Python DPoP | R-112 |
@@ -291,7 +293,7 @@ focused issue against the affected lane rather than using R-003 as a catch-all.
 | Actor/client assertion verification | `verification/*`, `client_auth.py` | `sts-verify`, `sts-http` | keep private_key_jwt policy | kid binding, subject binding, replay order | #7/#10 tests plus oracle smoke | Revert assertion auth slice |
 | JOSE signing and JWKS | `signer.py`, `keys.py` | `sts-jose` | keep RS256 default; opt-in ML-DSA feature | Key custody/JWKS private leak | JOSE tests, JWKS black-box tests | Revert signer backend change |
 | PQC backend | preview/planned Python work | `sts-jose` feature gate | opt-in, no fallback | Claiming stable/FIPS PQC from unstable API | native sign/verify/JWKS/downstream verification tests | Disable PQC feature; classical default |
-| DPoP stateless proof validation | `dpop.py` | `sts-dpop` | keep local canonicalization | htu normalization and alg drift | DPoP unit and HTTP contract tests | Feature flag disable DPoP endpoint branch |
+| DPoP stateless proof validation | `dpop.py` | `sts-dpop` | keep local canonicalization, except Rust intentionally follows RFC 9449/RFC 9110 exact method and path-significant URI comparison | htu normalization and alg drift | DPoP unit and HTTP contract tests | Feature flag disable DPoP endpoint branch |
 | Replay storage | `replay.py`, `application/replay_records.py` | `sts-replay` | keep semantics; store backend can change | late jti preburn, multi-worker | replay tests plus oracle late-failure tests | In-memory store only |
 | HTTP routes and errors | `transport.py`, response modules | `sts-http` | keep endpoints; no `/exchange` | status/error/header drift | HTTP contract suite | Route traffic to Python service |
 | Runtime config | `config*` modules | `sts-config` | keep env names where stable | startup drift, defaults | config tests and smoke startup | Pin old config values in compatibility adapter |
@@ -333,10 +335,19 @@ focused issue against the affected lane rather than using R-003 as a catch-all.
 | #29 | jose/pqc/security | PQC backend drift from Python intent is resolved by replacing direct AWS-LC ML-DSA with OpenSSL 3.5+ `openssl-rs` ML-DSA | JOSE/PQC | closed | Keep OpenSSL ML-DSA feature tests, supply-chain exemptions, and no-FIPS docs green. |
 | #30 | tests/architecture | Residual broad Python-oracle parity marker R-003 is closed by the lane-by-lane parity inventory | Parity inventory | closed | Future parity drift must open a focused issue against the affected lane. |
 | #31 | core/tests | Nested incoming `act` chain verification coverage caveat for R-070 is closed with Python-oracle-backed HTTP contract tests and replay-order fix | Delegation act chain | closed | Keep prior-act preserve/sanitize/reject/no-preburn contract tests in release gates. |
+| #47 | http/rfc | Empty `requested_token_type=` was treated as an unsupported explicit token type instead of omitted | Token request parsing | fixed on main | Keep empty-form contract test in release gate. |
+| #48 | http/rfc | Empty `audience=` blocked a valid `resource=api://chat-mcp` target | Target resolution | fixed on main | Keep empty-form contract test in release gate. |
+| #49 | http/rfc | Empty `client_id=` activated client-auth handling and returned invalid_client | Client auth dispatch | fixed on main | Keep empty-form contract test in release gate. |
+| #50 | dpop/rfc | DPoP accepted `htm=post` for an actual `POST` request | DPoP proof validation | fixed on main; ledger aligned in this branch | Keep lowercase-method rejection test in release gate. |
+| #51 | docs/rfc | Ledger overclaimed stale empty-value, metadata, and DPoP behavior | Requirements ledger | fixed in this branch | Keep ledger rows tied to tests and issue IDs. |
+| #52 | metadata/rfc | Metadata emitted `response_types_supported: []` even though no authorization endpoint response types are supported | Authorization server metadata | fixed in this branch | Keep metadata contract expecting omission. |
+| #53 | http/rfc/security | Empty actor-token fields needed OAuth empty-value normalization without weakening fail-closed both-mode dispatch | Delegation dispatch and actor auth | fixed on main | Keep both-mode and empty-form contracts in release gate. |
+| #54 | dpop/rfc | DPoP `htu` comparison treated `/token/` as equivalent to `/token` | DPoP proof validation | fixed on main; ledger aligned in this branch | Keep trailing-slash mismatch test in release gate. |
+| #55 | verify/rfc/security | Assertion audience validation could be skipped when assertion `iss` equaled the STS issuer | Client/actor assertion validation | fixed on main | Keep assertion audience bypass regression test. |
 | Python #210 | bug/parity | Scoped token cannot outlive subject | Token lifetime | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
 | Python #280 | bug/parity | Scoped token cannot outlive actor | Token lifetime | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
 | Python #279 | bug/parity | `expires_in` must reflect capped lifetime | Token response | implemented in Rust contract | Keep #14 lifetime cap test in release gate. |
-| Python #580 | bug/parity | Empty actor_token is present malformed | Mode dispatch | implemented in Rust contract | Keep #15 both-mode dispatch test in release gate. |
+| Python #580 | bug/parity | Empty actor_token must not mint an impersonation token | Mode dispatch | implemented in Rust contract | Keep #15 both-mode dispatch test and #53 empty-form guard in release gate. |
 | Python #602 | bug/parity | DPoP jti/proof anti-DoS and replay key bounds | DPoP/replay | implemented in Rust | Keep DPoP tests. |
 
 ## Current Alpha Boundaries
