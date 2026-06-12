@@ -71,6 +71,7 @@ To build an installable local archive without hosted GitHub Actions:
 ```bash
 scripts/package_release.sh
 shasum -a 256 -c dist/SHA256SUMS
+for sbom in dist/sts-cli-*.spdx.json; do python3 -m json.tool "$sbom" >/dev/null; done
 tar -tzf dist/sts-cli-*-*.tar.gz
 ```
 
@@ -95,8 +96,15 @@ release_tag=v0.1.0
 gh release download "$release_tag" \
   --repo paul007ex/sts-delegate-rs \
   --pattern 'sts-cli-*.tar.gz' \
+  --pattern 'sts-cli-*.spdx.json' \
   --pattern SHA256SUMS
 shasum -a 256 -c SHA256SUMS
+gh attestation verify sts-cli-*.tar.gz \
+  --repo paul007ex/sts-delegate-rs \
+  --cert-identity-regex 'https://github.com/paul007ex/sts-delegate-rs/.github/workflows/release.yml@refs/tags/.*'
+gh attestation verify sts-cli-*.spdx.json \
+  --repo paul007ex/sts-delegate-rs \
+  --cert-identity-regex 'https://github.com/paul007ex/sts-delegate-rs/.github/workflows/release.yml@refs/tags/.*'
 ```
 
 Homebrew users can install from the live `paul007ex/sts-delegate-rs` tap. The
