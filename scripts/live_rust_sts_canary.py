@@ -231,6 +231,19 @@ def self_test_redaction() -> None:
         != "sts-issued-token"
     ):
         raise CanaryError("MCP STS-issued token source self-test failed")
+    successes, unauthorized, unexpected = mcp_unauthorized_failures(
+        {
+            "chat-mcp": {
+                "ok": False,
+                "error_type": "HTTPStatusError",
+                "message": "Client error '401 Unauthorized' for url 'http://localhost:3000/chat/mcp'",
+            },
+            "databricks-mcp": {"ok": True},
+            "servicenow-mcp": {"ok": False, "error_type": "TimeoutError", "message": "timeout"},
+        }
+    )
+    if successes != ["databricks-mcp"] or unauthorized != ["chat-mcp"] or unexpected != ["servicenow-mcp:TimeoutError"]:
+        raise CanaryError("MCP expected-reject classifier self-test failed")
 
 
 def select_mcp_inbound_token(token_source: str, *, subject_token: str, minted_token: str) -> str:
@@ -627,6 +640,22 @@ def fastmcp_call_servers(
     return {str(name): result for name, result in parsed.items() if isinstance(result, dict)}
 
 
+def mcp_unauthorized_failures(results: dict[str, dict[str, Any]]) -> tuple[list[str], list[str], list[str]]:
+    successes: list[str] = []
+    unauthorized: list[str] = []
+    unexpected: list[str] = []
+    for name, result in sorted(results.items()):
+        if result.get("ok"):
+            successes.append(name)
+            continue
+        message = str(result.get("message", ""))
+        if result.get("error_type") == "HTTPStatusError" and "401 Unauthorized" in message:
+            unauthorized.append(name)
+        else:
+            unexpected.append(f"{name}:{result.get('error_type', 'error')}")
+    return successes, unauthorized, unexpected
+
+
 def mcp_servers_from_config(config_path: Path) -> dict[str, str]:
     if not config_path.exists():
         raise CanaryError(f"MCP config missing: {config_path}")
@@ -654,6 +683,7 @@ def run_fastmcp_proof(
     subject_token: str,
     mcp_token_source: str,
     require_mcp: bool,
+    expect_mcp_reject: bool,
 ) -> None:
     if not mcp_config.exists():
         log("mcp_not_configured", config=str(mcp_config), missing=["mcp config"])
@@ -699,6 +729,15 @@ def run_fastmcp_proof(
         servers=server_log,
         results=results,
     )
+    if expect_mcp_reject:
+        successes, unauthorized, unexpected = mcp_unauthorized_failures(results)
+        if successes or unexpected:
+            raise CanaryError(
+                "MCP expected-reject proof did not get only 401 rejects: "
+                f"successes={successes} unexpected={unexpected}"
+            )
+        log("mcp_fastmcp_expected_reject", rejected_servers=unauthorized, expected_status=401)
+        return
     if require_mcp and failures:
         raise CanaryError(f"MCP proof failed: {', '.join(failures)}")
 
@@ -1227,6 +1266,7 @@ def run_live(args: argparse.Namespace) -> bool:
                     subject_token=subject_token,
                     mcp_token_source=args.mcp_token_source,
                     require_mcp=args.require_mcp,
+                    expect_mcp_reject=args.expect_mcp_reject,
                 )
             log("live_rust_sts_canary_result", result="pass")
             return True
@@ -1271,8 +1311,19 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--require-mcp", action="store_true", help="fail if configured MCP calls do not pass")
+    parser.add_argument(
+        "--expect-mcp-reject",
+        action="store_true",
+        help=(
+            "quarantined negative proof for #127: require configured MCP gateway calls to reject "
+            "STS-issued inbound tokens with 401 instead of treating that known gap as a harness failure"
+        ),
+    )
     parser.add_argument("--self-test-redaction", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.expect_mcp_reject and args.mcp_token_source != "sts-issued":
+        parser.error("--expect-mcp-reject requires --mcp-token-source sts-issued")
+    return args
 
 
 def main() -> int:
