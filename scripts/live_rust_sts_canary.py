@@ -50,6 +50,7 @@ MCP_TOOL_PROBES = {
     "databricks-mcp": ("run_sql_query", {"sql": "SELECT 1"}),
     "servicenow-mcp": ("list_incidents", {}),
 }
+MCP_INBOUND_TOKEN_SOURCES = ("subject", "sts-issued")
 
 TOKEN_FIELD_NAMES = {
     "access_token",
@@ -212,6 +213,32 @@ def self_test_redaction() -> None:
     forbidden = [synthetic_jwt, "raw-jti", "private-value", "Bearer header", "access_token=header"]
     if any(value in rendered for value in forbidden):
         raise CanaryError("redaction self-test failed")
+    if (
+        select_mcp_inbound_token(
+            "subject",
+            subject_token="subject-token",
+            minted_token="sts-issued-token",
+        )
+        != "subject-token"
+    ):
+        raise CanaryError("MCP subject-token source self-test failed")
+    if (
+        select_mcp_inbound_token(
+            "sts-issued",
+            subject_token="subject-token",
+            minted_token="sts-issued-token",
+        )
+        != "sts-issued-token"
+    ):
+        raise CanaryError("MCP STS-issued token source self-test failed")
+
+
+def select_mcp_inbound_token(token_source: str, *, subject_token: str, minted_token: str) -> str:
+    if token_source == "subject":
+        return subject_token
+    if token_source == "sts-issued":
+        return minted_token
+    raise CanaryError(f"unsupported MCP token source: {token_source}")
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -626,6 +653,8 @@ def run_fastmcp_proof(
     mcp_config: Path,
     fastmcp_python: Path,
     minted_tokens: dict[str, str],
+    subject_token: str,
+    mcp_token_source: str,
     require_mcp: bool,
 ) -> None:
     if not mcp_config.exists():
@@ -635,16 +664,28 @@ def run_fastmcp_proof(
         return
     urls = mcp_servers_from_config(mcp_config)
     servers: dict[str, dict[str, Any]] = {}
-    for name, token in sorted(minted_tokens.items()):
+    server_log: dict[str, dict[str, str]] = {}
+    for name, minted_token in sorted(minted_tokens.items()):
         url = urls.get(name)
         if not url:
             continue
         tool_name, tool_args = MCP_TOOL_PROBES.get(name, (None, {}))
+        inbound_token = select_mcp_inbound_token(
+            mcp_token_source,
+            subject_token=subject_token,
+            minted_token=minted_token,
+        )
         servers[name] = {
             "url": url,
-            "headers": {"Authorization": f"Bearer {token}"},
+            "headers": {"Authorization": f"Bearer {inbound_token}"},
             "tool": tool_name,
             "args": tool_args,
+        }
+        server_log[name] = {
+            "url": url,
+            "mcp_token_source": mcp_token_source,
+            "inbound_token_sha256_prefix": sha256_prefix(inbound_token),
+            "minted_token_sha256_prefix": sha256_prefix(minted_token),
         }
     if not servers:
         log("mcp_not_configured", config=str(mcp_config), missing=["matching configured MCP server URLs"])
@@ -656,7 +697,8 @@ def run_fastmcp_proof(
     log(
         "mcp_fastmcp_calls_checked",
         config=str(mcp_config),
-        servers={name: {"url": servers[name]["url"], "token_sha256_prefix": sha256_prefix(minted_tokens[name])} for name in servers},
+        mcp_token_source=mcp_token_source,
+        servers=server_log,
         results=results,
     )
     if require_mcp and failures:
@@ -1176,6 +1218,8 @@ def run_live(args: argparse.Namespace) -> bool:
                     mcp_config=args.mcp_config,
                     fastmcp_python=args.fastmcp_python,
                     minted_tokens=mcp_tokens,
+                    subject_token=subject_token,
+                    mcp_token_source=args.mcp_token_source,
                     require_mcp=args.require_mcp,
                 )
             log("live_rust_sts_canary_result", result="pass")
@@ -1203,9 +1247,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--require-live", action="store_true", help="fail instead of reporting not_configured")
     parser.add_argument("--skip-build", action="store_true", help="reuse existing target/debug/sts-cli")
     parser.add_argument("--pqc", action="store_true", help="run the live canary with ML-DSA STS signing")
-    parser.add_argument("--prove-mcp", action="store_true", help="mint per-MCP-server tokens and call configured MCP servers")
+    parser.add_argument(
+        "--prove-mcp",
+        action="store_true",
+        help="mint per-MCP-server tokens, verify them, and call configured MCP servers",
+    )
     parser.add_argument("--mcp-config", type=Path, default=DEFAULT_MCP_CONFIG)
     parser.add_argument("--fastmcp-python", type=Path, default=DEFAULT_FASTMCP_PYTHON)
+    parser.add_argument(
+        "--mcp-token-source",
+        choices=MCP_INBOUND_TOKEN_SOURCES,
+        default="subject",
+        help=(
+            "inbound bearer token used for FastMCP calls: subject uses the original Okta user token for "
+            "the current gateway/backend contract; sts-issued sends the freshly minted delegated token "
+            "for explicit interop or negative testing"
+        ),
+    )
     parser.add_argument("--require-mcp", action="store_true", help="fail if configured MCP calls do not pass")
     parser.add_argument("--self-test-redaction", action="store_true")
     return parser.parse_args()

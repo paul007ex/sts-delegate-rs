@@ -368,6 +368,10 @@ Bearer and DPoP token exchange, verifies minted JWTs against the Rust `/jwks`,
 and confirms DPoP replay rejection. In `--pqc` mode it generates a temporary
 ML-DSA STS signing key, starts the server with `STS_PQC_PREFERRED=true` and
 `STS_ALLOW_NON_PQC=false`, and requires `signing_alg_selected=ML-DSA-65` with
-`pqc_fallback=false`. `--prove-mcp --require-mcp` additionally mints one token
-per configured MCP server and calls the FastMCP tools with those STS-issued
-tokens.
+`pqc_fallback=false`. `--prove-mcp --require-mcp` additionally mints and
+verifies one token per configured MCP server, then calls the FastMCP tools. By
+default the MCP inbound call uses the original Okta subject token, which matches
+the current configured gateway/backend contract. Use
+`--mcp-token-source sts-issued` only for explicit interop or negative testing
+against a resource server that is expected to accept STS-issued delegated tokens
+at its own edge.
