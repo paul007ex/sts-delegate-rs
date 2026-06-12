@@ -7,10 +7,18 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use clap::{Args, Parser, Subcommand};
-use sts_jose::{JoseSigner, JwksDocument, PublicJwk, RsaJoseSigner, rsa_public_key_bits_from_jwk};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use sha2::{Digest, Sha256};
+use sts_jose::{
+    JoseSigner, JwksDocument, PublicJwk, RsaJoseSigner, rsa_public_key_bits_from_jwk,
+    verify_claims_against_jwks_with_header,
+};
 
 const PRIVATE_JWK_MEMBERS: &[&str] = &["d", "p", "q", "dp", "dq", "qi", "oth", "k", "priv"];
+const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
+const JWT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:jwt";
+const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 
 /// Operator/runtime CLI for `sts-delegate-rs`.
 #[derive(Debug, Parser)]
@@ -44,6 +52,8 @@ enum Command {
         #[command(subcommand)]
         command: KeyCommand,
     },
+    /// Call the STS token endpoint with a redacted RFC 8693 token exchange request.
+    Exchange(Box<ExchangeArgs>),
 }
 
 #[derive(Debug, Args)]
@@ -91,6 +101,71 @@ struct RotateArgs {
     /// Validate the rotation plan without writing files or generating replacement key material.
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct ExchangeArgs {
+    /// STS issuer/base URL; the token endpoint is derived by appending /token.
+    #[arg(long, value_name = "URL", conflicts_with = "token_endpoint")]
+    sts_url: Option<String>,
+    /// Exact token endpoint URL to call instead of deriving from --sts-url.
+    #[arg(long, value_name = "URL", conflicts_with = "sts_url")]
+    token_endpoint: Option<String>,
+    /// File containing the subject token. The token is never printed by default.
+    #[arg(long, value_name = "PATH")]
+    subject_token_file: PathBuf,
+    /// Subject token type URN.
+    #[arg(long, default_value = ACCESS_TOKEN_TYPE)]
+    subject_token_type: String,
+    /// File containing the actor token for delegation mode.
+    #[arg(long, value_name = "PATH")]
+    actor_token_file: Option<PathBuf>,
+    /// Actor token type URN. Sent only when --actor-token-file is present.
+    #[arg(long, default_value = JWT_TOKEN_TYPE)]
+    actor_token_type: String,
+    /// File containing a private_key_jwt client assertion.
+    #[arg(long, value_name = "PATH")]
+    client_assertion_file: Option<PathBuf>,
+    /// Client assertion type URN. Sent only when --client-assertion-file is present.
+    #[arg(long, default_value = CLIENT_ASSERTION_TYPE)]
+    client_assertion_type: String,
+    /// Optional OAuth client_id to send alongside a client assertion.
+    #[arg(long)]
+    client_id: Option<String>,
+    /// Target audience. May be repeated.
+    #[arg(long, value_name = "AUDIENCE")]
+    audience: Vec<String>,
+    /// Target resource URI. May be repeated.
+    #[arg(long, value_name = "URI")]
+    resource: Vec<String>,
+    /// Requested downscoped scope string.
+    #[arg(long)]
+    scope: Option<String>,
+    /// Requested token type URN.
+    #[arg(long)]
+    requested_token_type: Option<String>,
+    /// File containing a precomputed DPoP proof JWT to send in the DPoP header.
+    #[arg(long, value_name = "PATH")]
+    dpop_proof_file: Option<PathBuf>,
+    /// Public JWKS file used to verify the minted JWT before printing claims.
+    #[arg(long, value_name = "PATH", conflicts_with = "jwks_url")]
+    jwks_file: Option<PathBuf>,
+    /// Public JWKS URL used to verify the minted JWT before printing claims.
+    #[arg(long, value_name = "URL", conflicts_with = "jwks_file")]
+    jwks_url: Option<String>,
+    /// Output style. All styles redact submitted tokens by default.
+    #[arg(long, value_enum, default_value = "redacted")]
+    output: ExchangeOutputFormat,
+    /// Print the minted access token. This is intentionally off by default.
+    #[arg(long)]
+    print_token: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ExchangeOutputFormat {
+    Redacted,
+    Claims,
+    Json,
 }
 
 #[derive(Debug)]
@@ -156,6 +231,7 @@ async fn run(cli: Cli) -> Result<String, CliError> {
             KeyCommand::Inspect(args) => inspect_file(&args.file, InspectMode::SingleKey),
             KeyCommand::Rotate(args) => rotate_signing_key(args),
         },
+        Command::Exchange(args) => run_exchange(*args).await,
     }
 }
 
@@ -168,6 +244,514 @@ async fn run_smoke(args: SmokeArgs) -> Result<String, CliError> {
     sts_http::bootstrap_check_from_env().await?;
     let network = if args.allow_network { "allowed" } else { "disabled" };
     Ok(format!("smoke_status=ok\nnetwork={network}\n"))
+}
+
+struct ExchangeHttpRequest {
+    token_endpoint: String,
+    body: String,
+    dpop_proof: Option<String>,
+}
+
+async fn run_exchange(args: ExchangeArgs) -> Result<String, CliError> {
+    let request = build_exchange_http_request(&args)?;
+    let client = reqwest::Client::new();
+    let mut builder = client
+        .post(&request.token_endpoint)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded; charset=utf-8")
+        .body(request.body);
+    if let Some(proof) = &request.dpop_proof {
+        builder = builder.header("DPoP", proof);
+    }
+
+    let response = builder.send().await.map_err(|err| {
+        CliError::runtime(format!(
+            "exchange request failed: {}",
+            sanitize_oauth_text(&err.to_string())
+        ))
+    })?;
+    let status = response.status();
+    let response_text = response.text().await.map_err(|err| {
+        CliError::runtime(format!(
+            "failed to read exchange response body: {}",
+            sanitize_oauth_text(&err.to_string())
+        ))
+    })?;
+    let response_body: serde_json::Value = serde_json::from_str(&response_text).map_err(|err| {
+        CliError::runtime(format!(
+            "exchange response was not JSON\nhttp_status={}\nparse_error={}",
+            status.as_u16(),
+            sanitize_oauth_text(&err.to_string())
+        ))
+    })?;
+
+    if !status.is_success() {
+        return Err(CliError::runtime(render_exchange_error(
+            &args,
+            status.as_u16(),
+            &response_body,
+        )));
+    }
+
+    render_exchange_success(&args, status.as_u16(), response_body, &client).await
+}
+
+fn build_exchange_http_request(args: &ExchangeArgs) -> Result<ExchangeHttpRequest, CliError> {
+    let token_endpoint = resolve_token_endpoint(args)?;
+    let subject_token = read_secret_file(&args.subject_token_file, "subject token")?;
+    let actor_token = args
+        .actor_token_file
+        .as_deref()
+        .map(|path| read_secret_file(path, "actor token"))
+        .transpose()?;
+    let client_assertion = args
+        .client_assertion_file
+        .as_deref()
+        .map(|path| read_secret_file(path, "client assertion"))
+        .transpose()?;
+    let dpop_proof = args
+        .dpop_proof_file
+        .as_deref()
+        .map(|path| read_secret_file(path, "DPoP proof"))
+        .transpose()?;
+
+    let mut form = Vec::new();
+    push_form_param(&mut form, "grant_type", TOKEN_EXCHANGE_GRANT_TYPE)?;
+    push_form_param(&mut form, "subject_token", &subject_token)?;
+    push_form_param(&mut form, "subject_token_type", &args.subject_token_type)?;
+    if let Some(actor_token) = actor_token {
+        push_form_param(&mut form, "actor_token", &actor_token)?;
+        push_form_param(&mut form, "actor_token_type", &args.actor_token_type)?;
+    }
+    if let Some(client_assertion) = client_assertion {
+        push_form_param(&mut form, "client_assertion", &client_assertion)?;
+        push_form_param(&mut form, "client_assertion_type", &args.client_assertion_type)?;
+    }
+    if let Some(client_id) = &args.client_id {
+        push_form_param(&mut form, "client_id", client_id)?;
+    }
+    for audience in &args.audience {
+        push_form_param(&mut form, "audience", audience)?;
+    }
+    for resource in &args.resource {
+        push_form_param(&mut form, "resource", resource)?;
+    }
+    if let Some(scope) = &args.scope {
+        push_form_param(&mut form, "scope", scope)?;
+    }
+    if let Some(requested_token_type) = &args.requested_token_type {
+        push_form_param(&mut form, "requested_token_type", requested_token_type)?;
+    }
+
+    let body = serde_urlencoded::to_string(&form)
+        .map_err(|err| CliError::runtime(format!("failed to encode exchange form: {err}")))?;
+    Ok(ExchangeHttpRequest { token_endpoint, body, dpop_proof })
+}
+
+fn resolve_token_endpoint(args: &ExchangeArgs) -> Result<String, CliError> {
+    let endpoint = if let Some(token_endpoint) = &args.token_endpoint {
+        token_endpoint.trim().to_string()
+    } else if let Some(sts_url) = &args.sts_url {
+        format!("{}/token", sts_url.trim().trim_end_matches('/'))
+    } else {
+        return Err(CliError::usage("exchange requires --sts-url or --token-endpoint"));
+    };
+    if endpoint.is_empty() {
+        return Err(CliError::usage("exchange token endpoint must not be empty"));
+    }
+    if !endpoint.starts_with("https://") && !endpoint.starts_with("http://") {
+        return Err(CliError::usage("exchange token endpoint must be an http or https URL"));
+    }
+    Ok(endpoint)
+}
+
+fn read_secret_file(path: &Path, label: &str) -> Result<String, CliError> {
+    let raw = fs::read_to_string(path).map_err(|err| {
+        CliError::runtime(format!("failed to read {label} file {}: {err}", sanitize_path(path)))
+    })?;
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(CliError::usage(format!("{label} file {} is empty", sanitize_path(path))));
+    }
+    Ok(value.to_string())
+}
+
+fn push_form_param(
+    form: &mut Vec<(String, String)>,
+    name: &str,
+    value: &str,
+) -> Result<(), CliError> {
+    if value.trim().is_empty() {
+        return Err(CliError::usage(format!("exchange parameter {name} must not be empty")));
+    }
+    form.push((name.to_string(), value.to_string()));
+    Ok(())
+}
+
+fn render_exchange_error(
+    args: &ExchangeArgs,
+    http_status: u16,
+    body: &serde_json::Value,
+) -> String {
+    let oauth_error = body
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(sanitize_oauth_text)
+        .unwrap_or_else(|| "oauth_error".to_string());
+    let description =
+        body.get("error_description").and_then(serde_json::Value::as_str).map(sanitize_oauth_text);
+
+    let mut safe = serde_json::Map::new();
+    safe.insert("exchange_status".to_string(), serde_json::json!("error"));
+    safe.insert("http_status".to_string(), serde_json::json!(http_status));
+    safe.insert("error".to_string(), serde_json::json!(oauth_error));
+    if let Some(description) = description {
+        safe.insert("error_description".to_string(), serde_json::json!(description));
+    }
+
+    match args.output {
+        ExchangeOutputFormat::Redacted => render_exchange_map_lines(&safe, None),
+        ExchangeOutputFormat::Claims | ExchangeOutputFormat::Json => {
+            let mut output = serde_json::to_string_pretty(&serde_json::Value::Object(safe))
+                .unwrap_or_else(|_| "{\"exchange_status\":\"error\"}".to_string());
+            output.push('\n');
+            output
+        }
+    }
+}
+
+async fn render_exchange_success(
+    args: &ExchangeArgs,
+    http_status: u16,
+    body: serde_json::Value,
+    client: &reqwest::Client,
+) -> Result<String, CliError> {
+    let access_token =
+        body.get("access_token").and_then(serde_json::Value::as_str).ok_or_else(|| {
+            CliError::runtime("exchange response missing access_token; refusing to print raw body")
+        })?;
+    let token_type = body
+        .get("token_type")
+        .and_then(serde_json::Value::as_str)
+        .map(sanitize)
+        .unwrap_or_else(|| "(absent)".to_string());
+    let issued_token_type = body
+        .get("issued_token_type")
+        .and_then(serde_json::Value::as_str)
+        .map(sanitize)
+        .unwrap_or_else(|| "(absent)".to_string());
+
+    let decoded = decode_compact_jwt(access_token)?;
+    let jwks = load_exchange_jwks(args, client).await?;
+    let (claims, verified_alg, verified_kid, verification_source) =
+        if let Some((jwks, source)) = jwks {
+            let verified =
+                verify_claims_against_jwks_with_header::<serde_json::Value>(access_token, &jwks)
+                    .map_err(|err| {
+                        CliError::runtime(format!(
+                            "minted token verification failed: {}",
+                            sanitize_oauth_text(&err.to_string())
+                        ))
+                    })?;
+            (Some(verified.claims), Some(verified.alg), Some(verified.kid), source)
+        } else {
+            let claims = decoded.as_ref().map(|(_, payload)| payload.clone());
+            (claims, None, None, "none".to_string())
+        };
+
+    let mut safe = serde_json::Map::new();
+    safe.insert("exchange_status".to_string(), serde_json::json!("ok"));
+    safe.insert("http_status".to_string(), serde_json::json!(http_status));
+    safe.insert("token_type".to_string(), serde_json::json!(token_type));
+    safe.insert("issued_token_type".to_string(), serde_json::json!(issued_token_type));
+    safe.insert(
+        "access_token_sha256_prefix".to_string(),
+        serde_json::json!(sha256_hex_prefix(access_token)),
+    );
+    if let Some(scope) = body.get("scope").and_then(serde_json::Value::as_str) {
+        safe.insert("scope".to_string(), serde_json::json!(sanitize(scope)));
+    }
+    if let Some(expires_in) = body.get("expires_in").and_then(serde_json::Value::as_i64) {
+        safe.insert("expires_in".to_string(), serde_json::json!(expires_in));
+    }
+
+    let signature_verified = verification_source != "none";
+    safe.insert("jwt_signature_verified".to_string(), serde_json::json!(signature_verified));
+    safe.insert("jwt_verification_source".to_string(), serde_json::json!(verification_source));
+
+    if let Some((header, _)) = &decoded {
+        if verified_alg.is_none()
+            && let Some(alg) = header.get("alg").and_then(serde_json::Value::as_str)
+        {
+            safe.insert("jwt_header_alg".to_string(), serde_json::json!(sanitize(alg)));
+        }
+        if verified_kid.is_none()
+            && let Some(kid) = header.get("kid").and_then(serde_json::Value::as_str)
+        {
+            safe.insert("jwt_header_kid".to_string(), serde_json::json!(sanitize(kid)));
+        }
+        if let Some(typ) = header.get("typ").and_then(serde_json::Value::as_str) {
+            safe.insert("jwt_header_typ".to_string(), serde_json::json!(sanitize(typ)));
+        }
+    }
+    if let Some(alg) = verified_alg {
+        safe.insert("jwt_header_alg".to_string(), serde_json::json!(sanitize(&alg)));
+    }
+    if let Some(kid) = verified_kid {
+        safe.insert("jwt_header_kid".to_string(), serde_json::json!(sanitize(&kid)));
+    }
+    if let Some(claims) = claims {
+        safe.insert("claims".to_string(), safe_claims_summary(&claims));
+    }
+
+    match args.output {
+        ExchangeOutputFormat::Redacted => {
+            let raw_token = args.print_token.then_some(access_token);
+            Ok(render_exchange_map_lines(&safe, raw_token))
+        }
+        ExchangeOutputFormat::Claims => {
+            if args.print_token {
+                safe.insert("access_token".to_string(), serde_json::json!(access_token));
+            }
+            let fallback = serde_json::Value::Object(safe.clone());
+            let mut output = serde_json::to_string_pretty(safe.get("claims").unwrap_or(&fallback))
+                .unwrap_or_else(|_| "{}".to_string());
+            output.push('\n');
+            Ok(output)
+        }
+        ExchangeOutputFormat::Json => {
+            if args.print_token {
+                safe.insert("access_token".to_string(), serde_json::json!(access_token));
+            }
+            let mut output = serde_json::to_string_pretty(&serde_json::Value::Object(safe))
+                .unwrap_or_else(|_| "{}".to_string());
+            output.push('\n');
+            Ok(output)
+        }
+    }
+}
+
+async fn load_exchange_jwks(
+    args: &ExchangeArgs,
+    client: &reqwest::Client,
+) -> Result<Option<(JwksDocument, String)>, CliError> {
+    if let Some(path) = &args.jwks_file {
+        let raw = fs::read_to_string(path).map_err(|err| {
+            CliError::runtime(format!("failed to read JWKS file {}: {err}", sanitize_path(path)))
+        })?;
+        return parse_exchange_jwks_document(&raw, "JWKS file")
+            .map(|jwks| Some((jwks, "file".to_string())));
+    }
+    if let Some(url) = &args.jwks_url {
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            return Err(CliError::usage("JWKS URL must be an http or https URL"));
+        }
+        let response = client.get(url).send().await.map_err(|err| {
+            CliError::runtime(format!(
+                "failed to fetch JWKS URL: {}",
+                sanitize_oauth_text(&err.to_string())
+            ))
+        })?;
+        let status = response.status();
+        let raw = response.text().await.map_err(|err| {
+            CliError::runtime(format!(
+                "failed to read JWKS response body: {}",
+                sanitize_oauth_text(&err.to_string())
+            ))
+        })?;
+        if !status.is_success() {
+            return Err(CliError::runtime(format!(
+                "JWKS URL fetch failed\nhttp_status={}",
+                status.as_u16()
+            )));
+        }
+        return parse_exchange_jwks_document(&raw, "JWKS URL")
+            .map(|jwks| Some((jwks, "url".to_string())));
+    }
+    Ok(None)
+}
+
+fn parse_exchange_jwks_document(raw: &str, label: &str) -> Result<JwksDocument, CliError> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|err| CliError::usage(format!("{label} is invalid JSON: {err}")))?;
+    let keys = normalize_jwks_value(&value)?;
+    inspect_public_keys(&keys)?;
+
+    let mut public_keys = Vec::with_capacity(keys.len());
+    for (index, key) in keys.into_iter().enumerate() {
+        let jwk: PublicJwk = serde_json::from_value(serde_json::Value::Object(key.clone()))
+            .map_err(|err| {
+                CliError::usage(format!("{label} key[{index}] is not a public JWK: {err}"))
+            })?;
+        if jwk.kid.is_empty() {
+            return Err(CliError::usage(format!(
+                "{label} key[{index}] missing required member kid"
+            )));
+        }
+        public_keys.push(jwk);
+    }
+    Ok(JwksDocument::new(public_keys))
+}
+
+fn decode_compact_jwt(
+    token: &str,
+) -> Result<Option<(serde_json::Value, serde_json::Value)>, CliError> {
+    let parts = token.split('.').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Ok(None);
+    }
+    let header = decode_compact_jwt_json_part(parts[0], "JWT header")?;
+    let payload = decode_compact_jwt_json_part(parts[1], "JWT payload")?;
+    Ok(Some((header, payload)))
+}
+
+fn decode_compact_jwt_json_part(part: &str, label: &str) -> Result<serde_json::Value, CliError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(part)
+        .map_err(|_| CliError::runtime(format!("minted {label} is not valid base64url")))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|err| CliError::runtime(format!("minted {label} is not JSON: {err}")))
+}
+
+fn safe_claims_summary(claims: &serde_json::Value) -> serde_json::Value {
+    let mut safe = serde_json::Map::new();
+    insert_safe_string_claim(&mut safe, claims, "iss");
+    insert_safe_audience_claim(&mut safe, claims);
+    insert_safe_string_claim(&mut safe, claims, "scope");
+    insert_safe_string_claim(&mut safe, claims, "client_id");
+    if let Some(sub) = claims.get("sub").and_then(serde_json::Value::as_str) {
+        safe.insert("sub_sha256_prefix".to_string(), serde_json::json!(sha256_hex_prefix(sub)));
+    }
+    if let Some(jti) = claims.get("jti").and_then(serde_json::Value::as_str) {
+        safe.insert("jti_sha256_prefix".to_string(), serde_json::json!(sha256_hex_prefix(jti)));
+    }
+    if let Some(act_sub) =
+        claims.get("act").and_then(|act| act.get("sub")).and_then(serde_json::Value::as_str)
+    {
+        safe.insert("act_sub".to_string(), serde_json::json!(sanitize(act_sub)));
+    }
+    if let Some(jkt) =
+        claims.get("cnf").and_then(|cnf| cnf.get("jkt")).and_then(serde_json::Value::as_str)
+    {
+        safe.insert("cnf_jkt_sha256_prefix".to_string(), serde_json::json!(sha256_hex_prefix(jkt)));
+    }
+    for name in ["iat", "exp"] {
+        if let Some(value) = claims.get(name).and_then(serde_json::Value::as_i64) {
+            safe.insert(name.to_string(), serde_json::json!(value));
+        }
+    }
+    serde_json::Value::Object(safe)
+}
+
+fn insert_safe_string_claim(
+    safe: &mut serde_json::Map<String, serde_json::Value>,
+    claims: &serde_json::Value,
+    name: &str,
+) {
+    if let Some(value) = claims.get(name).and_then(serde_json::Value::as_str) {
+        safe.insert(name.to_string(), serde_json::json!(sanitize(value)));
+    }
+}
+
+fn insert_safe_audience_claim(
+    safe: &mut serde_json::Map<String, serde_json::Value>,
+    claims: &serde_json::Value,
+) {
+    match claims.get("aud") {
+        Some(serde_json::Value::String(value)) => {
+            safe.insert("aud".to_string(), serde_json::json!(sanitize(value)));
+        }
+        Some(serde_json::Value::Array(values)) => {
+            let audiences = values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(sanitize)
+                .collect::<Vec<_>>();
+            safe.insert("aud".to_string(), serde_json::json!(audiences));
+        }
+        _ => {}
+    }
+}
+
+fn render_exchange_map_lines(
+    safe: &serde_json::Map<String, serde_json::Value>,
+    raw_access_token: Option<&str>,
+) -> String {
+    let mut output = String::new();
+    for name in [
+        "exchange_status",
+        "http_status",
+        "error",
+        "error_description",
+        "token_type",
+        "issued_token_type",
+        "scope",
+        "expires_in",
+        "access_token_sha256_prefix",
+        "jwt_signature_verified",
+        "jwt_verification_source",
+        "jwt_header_alg",
+        "jwt_header_kid",
+        "jwt_header_typ",
+    ] {
+        if let Some(value) = safe.get(name) {
+            output.push_str(&format!("{name}={}\n", display_json_scalar(value)));
+        }
+    }
+    if let Some(serde_json::Value::Object(claims)) = safe.get("claims") {
+        for name in [
+            "iss",
+            "aud",
+            "scope",
+            "client_id",
+            "sub_sha256_prefix",
+            "jti_sha256_prefix",
+            "act_sub",
+            "cnf_jkt_sha256_prefix",
+            "iat",
+            "exp",
+        ] {
+            if let Some(value) = claims.get(name) {
+                output.push_str(&format!("claims.{name}={}\n", display_json_scalar(value)));
+            }
+        }
+    }
+    if let Some(token) = raw_access_token {
+        output.push_str(&format!("access_token={token}\n"));
+    }
+    output
+}
+
+fn display_json_scalar(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => sanitize(value),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => serde_json::to_string(value)
+            .map(|value| sanitize(&value))
+            .unwrap_or_else(|_| "(unrenderable)".to_string()),
+        serde_json::Value::Null => "(absent)".to_string(),
+    }
+}
+
+fn sha256_hex_prefix(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    digest.iter().take(8).map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn sanitize_oauth_text(value: &str) -> String {
+    sanitize(value)
+        .split_whitespace()
+        .map(|part| if looks_like_compact_jwt(part) { "[redacted]" } else { part })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn looks_like_compact_jwt(value: &str) -> bool {
+    let trimmed = value.trim_matches(|ch: char| {
+        !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
+    });
+    trimmed.len() > 40 && trimmed.matches('.').count() == 2
 }
 
 fn render_canary_config_status_from_env() -> String {
@@ -638,7 +1222,7 @@ fn sanitize(value: &str) -> String {
     const MAX_FIELD_LEN: usize = 120;
     let mut sanitized = String::new();
     for ch in value.chars().take(MAX_FIELD_LEN) {
-        if ch.is_ascii_graphic() {
+        if ch.is_ascii_graphic() || ch == ' ' {
             sanitized.push(ch);
         } else {
             sanitized.push('?');
@@ -658,6 +1242,11 @@ fn sanitize_path(path: &Path) -> String {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn parser_accepts_explicit_jwks_inspect_command() {
@@ -694,6 +1283,186 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parser_accepts_exchange_command() {
+        let cli = Cli::try_parse_from([
+            "sts-cli",
+            "exchange",
+            "--sts-url",
+            "http://127.0.0.1:8888/tenant1",
+            "--subject-token-file",
+            "subject.txt",
+            "--actor-token-file",
+            "actor.jwt",
+            "--audience",
+            "api://chat-mcp",
+            "--resource",
+            "https://chat.example/resource",
+            "--scope",
+            "chat.read",
+            "--jwks-file",
+            "jwks.json",
+        ])
+        .expect("parse exchange");
+
+        match cli.command {
+            Command::Exchange(args) => {
+                assert_eq!(args.sts_url.as_deref(), Some("http://127.0.0.1:8888/tenant1"));
+                assert_eq!(args.subject_token_file, PathBuf::from("subject.txt"));
+                assert_eq!(args.actor_token_file, Some(PathBuf::from("actor.jwt")));
+                assert_eq!(args.subject_token_type, ACCESS_TOKEN_TYPE);
+                assert_eq!(args.actor_token_type, JWT_TOKEN_TYPE);
+                assert_eq!(args.audience, vec!["api://chat-mcp"]);
+                assert_eq!(args.resource, vec!["https://chat.example/resource"]);
+                assert_eq!(args.scope.as_deref(), Some("chat.read"));
+                assert_eq!(args.jwks_file, Some(PathBuf::from("jwks.json")));
+                assert_eq!(args.output, ExchangeOutputFormat::Redacted);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exchange_endpoint_derives_token_path_from_path_bearing_issuer() {
+        let args = exchange_args(
+            Some("http://127.0.0.1:8888/tenant1/".to_string()),
+            None,
+            PathBuf::from("subject.txt"),
+            None,
+        );
+
+        assert_eq!(
+            resolve_token_endpoint(&args).expect("endpoint"),
+            "http://127.0.0.1:8888/tenant1/token"
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_posts_form_and_prints_verified_redacted_claims() {
+        let dir = unique_temp_dir("sts-cli-exchange-success");
+        let subject_file = dir.join("subject.txt");
+        let actor_file = dir.join("actor.jwt");
+        let dpop_file = dir.join("dpop.jwt");
+        let jwks_file = dir.join("jwks.json");
+        fs::write(&subject_file, "subject-token-secret\n").expect("write subject");
+        fs::write(&actor_file, "actor-token-secret\n").expect("write actor");
+        fs::write(&dpop_file, "dpop.proof.secret\n").expect("write dpop");
+
+        let signer = RsaJoseSigner::generate_for_tests("sts-kid").expect("signer");
+        write_jwks(&jwks_file, signer.public_jwks().keys);
+        let minted_token = signer
+            .sign_json_claims(&serde_json::json!({
+                "iss": "http://127.0.0.1:8888/tenant1",
+                "sub": "user@example.com",
+                "aud": "api://chat-mcp",
+                "scope": "chat.read",
+                "act": {"sub": "chat-mcp"},
+                "client_id": "chat-client",
+                "iat": 1_000,
+                "exp": 2_000,
+                "jti": "minted-jti-secret"
+            }))
+            .expect("sign minted token");
+        let (sts_url, captured, handle) = spawn_exchange_server(
+            200,
+            serde_json::json!({
+                "access_token": minted_token,
+                "issued_token_type": ACCESS_TOKEN_TYPE,
+                "token_type": "Bearer",
+                "expires_in": 300,
+                "scope": "chat.read"
+            })
+            .to_string(),
+        );
+
+        let mut args = exchange_args(Some(sts_url), None, subject_file.clone(), Some(actor_file));
+        args.audience = vec!["api://chat-mcp".to_string()];
+        args.scope = Some("chat.read".to_string());
+        args.dpop_proof_file = Some(dpop_file);
+        args.jwks_file = Some(jwks_file);
+
+        let output =
+            run(Cli { command: Command::Exchange(Box::new(args)) }).await.expect("exchange");
+        let request = captured.recv_timeout(Duration::from_secs(3)).expect("captured request");
+        handle.join().expect("server joined");
+
+        assert!(request.request_line.starts_with("POST /token HTTP/1.1"));
+        assert!(
+            request
+                .headers
+                .to_ascii_lowercase()
+                .contains("content-type: application/x-www-form-urlencoded")
+        );
+        assert!(request.headers.to_ascii_lowercase().contains("dpop: dpop.proof.secret"));
+
+        let form = serde_urlencoded::from_bytes::<Vec<(String, String)>>(request.body.as_bytes())
+            .expect("decode form");
+        assert_eq!(form_value(&form, "grant_type"), Some(TOKEN_EXCHANGE_GRANT_TYPE));
+        assert_eq!(form_value(&form, "subject_token"), Some("subject-token-secret"));
+        assert_eq!(form_value(&form, "subject_token_type"), Some(ACCESS_TOKEN_TYPE));
+        assert_eq!(form_value(&form, "actor_token"), Some("actor-token-secret"));
+        assert_eq!(form_value(&form, "actor_token_type"), Some(JWT_TOKEN_TYPE));
+        assert_eq!(form_value(&form, "audience"), Some("api://chat-mcp"));
+        assert_eq!(form_value(&form, "scope"), Some("chat.read"));
+
+        assert!(output.contains("exchange_status=ok"));
+        assert!(output.contains("http_status=200"));
+        assert!(output.contains("token_type=Bearer"));
+        assert!(output.contains("jwt_signature_verified=true"));
+        assert!(output.contains("jwt_verification_source=file"));
+        assert!(output.contains("jwt_header_alg=RS256"));
+        assert!(output.contains("jwt_header_kid=sts-kid"));
+        assert!(output.contains("claims.iss=http://127.0.0.1:8888/tenant1"));
+        assert!(output.contains("claims.aud=api://chat-mcp"));
+        assert!(output.contains("claims.act_sub=chat-mcp"));
+        assert!(output.contains("claims.sub_sha256_prefix="));
+        assert!(output.contains("claims.jti_sha256_prefix="));
+        assert!(output.contains("access_token_sha256_prefix="));
+        assert!(!output.contains("subject-token-secret"));
+        assert!(!output.contains("actor-token-secret"));
+        assert!(!output.contains("dpop.proof.secret"));
+        assert!(!output.contains("minted-jti-secret"));
+        assert!(!output.contains("user@example.com"));
+        assert!(!output.contains("eyJ"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn exchange_oauth_error_is_redacted_and_returns_runtime_error() {
+        let dir = unique_temp_dir("sts-cli-exchange-error");
+        let subject_file = dir.join("subject.txt");
+        let actor_file = dir.join("actor.jwt");
+        fs::write(&subject_file, "subject-token-secret\n").expect("write subject");
+        fs::write(&actor_file, "actor-token-secret\n").expect("write actor");
+
+        let (sts_url, captured, handle) = spawn_exchange_server(
+            400,
+            serde_json::json!({
+                "error": "invalid_target",
+                "error_description": "audience is not allowed"
+            })
+            .to_string(),
+        );
+        let mut args = exchange_args(Some(sts_url), None, subject_file, Some(actor_file));
+        args.audience = vec!["api://denied".to_string()];
+
+        let err = run(Cli { command: Command::Exchange(Box::new(args)) })
+            .await
+            .expect_err("invalid target must fail");
+        let request = captured.recv_timeout(Duration::from_secs(3)).expect("captured request");
+        handle.join().expect("server joined");
+
+        assert_eq!(err.code, 1);
+        assert!(err.message.contains("exchange_status=error"));
+        assert!(err.message.contains("http_status=400"));
+        assert!(err.message.contains("error=invalid_target"));
+        assert!(err.message.contains("error_description=audience is not allowed"));
+        assert!(!err.message.contains("subject-token-secret"));
+        assert!(!err.message.contains("actor-token-secret"));
+        assert!(request.body.contains("audience=api%3A%2F%2Fdenied"));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -967,6 +1736,109 @@ mod tests {
 
     fn read_jwks(path: &Path) -> JwksDocument {
         serde_json::from_str(&fs::read_to_string(path).expect("read jwks")).expect("jwks")
+    }
+
+    #[derive(Debug)]
+    struct CapturedRequest {
+        request_line: String,
+        headers: String,
+        body: String,
+    }
+
+    fn spawn_exchange_server(
+        status: u16,
+        body: String,
+    ) -> (String, mpsc::Receiver<CapturedRequest>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
+        let addr = listener.local_addr().expect("local addr");
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let captured = read_http_request(&mut stream);
+            sender.send(captured).expect("send captured request");
+            let reason = if status < 400 { "OK" } else { "Bad Request" };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).expect("write response");
+        });
+        (format!("http://{addr}"), receiver, handle)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> CapturedRequest {
+        stream.set_read_timeout(Some(Duration::from_secs(3))).expect("read timeout");
+        let mut buffer = Vec::new();
+        let mut temp = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut temp).expect("read request");
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&temp[..read]);
+            if let Some(header_end) = find_header_end(&buffer) {
+                let headers = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+                let content_length = content_length(&headers);
+                let body_start = header_end + 4;
+                if buffer.len() >= body_start + content_length {
+                    break;
+                }
+            }
+        }
+        let header_end = find_header_end(&buffer).expect("header end");
+        let headers = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+        let body_start = header_end + 4;
+        let body_len = content_length(&headers);
+        let body = String::from_utf8_lossy(&buffer[body_start..body_start + body_len]).to_string();
+        let request_line = headers.lines().next().unwrap_or_default().to_string();
+        CapturedRequest { request_line, headers, body }
+    }
+
+    fn find_header_end(buffer: &[u8]) -> Option<usize> {
+        buffer.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    fn content_length(headers: &str) -> usize {
+        headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().expect("content length"))
+            })
+            .unwrap_or(0)
+    }
+
+    fn form_value<'a>(form: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        form.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
+    }
+
+    fn exchange_args(
+        sts_url: Option<String>,
+        token_endpoint: Option<String>,
+        subject_token_file: PathBuf,
+        actor_token_file: Option<PathBuf>,
+    ) -> ExchangeArgs {
+        ExchangeArgs {
+            sts_url,
+            token_endpoint,
+            subject_token_file,
+            subject_token_type: ACCESS_TOKEN_TYPE.to_string(),
+            actor_token_file,
+            actor_token_type: JWT_TOKEN_TYPE.to_string(),
+            client_assertion_file: None,
+            client_assertion_type: CLIENT_ASSERTION_TYPE.to_string(),
+            client_id: None,
+            audience: Vec::new(),
+            resource: Vec::new(),
+            scope: None,
+            requested_token_type: None,
+            dpop_proof_file: None,
+            jwks_file: None,
+            jwks_url: None,
+            output: ExchangeOutputFormat::Redacted,
+            print_token: false,
+        }
     }
 
     fn unique_temp_dir(name: &str) -> PathBuf {

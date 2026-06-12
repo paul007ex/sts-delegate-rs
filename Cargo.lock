@@ -1563,7 +1563,10 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "clap",
+ "reqwest",
  "serde_json",
+ "serde_urlencoded",
+ "sha2",
  "sts-http",
  "sts-jose",
  "tokio",

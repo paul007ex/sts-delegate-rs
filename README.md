@@ -69,6 +69,13 @@ cargo run -p sts-cli -- key rotate --dry-run \
 cargo run -p sts-cli -- key rotate \
   --key-file secrets/obo_sts_private_key.json \
   --extra-jwks-file secrets/obo_sts_retiring_jwks.json
+cargo run -p sts-cli -- exchange \
+  --sts-url http://127.0.0.1:8888/tenant1 \
+  --subject-token-file user_access_token.txt \
+  --actor-token-file chat-mcp.jwt \
+  --audience api://databricks-mcp \
+  --scope databricks.read \
+  --jwks-url http://127.0.0.1:8888/tenant1/jwks
 ```
 
 `smoke` runs the same startup bootstrap path as the server, but defaults to
@@ -76,6 +83,16 @@ offline mode and requires `IDP_JWKS_FILE`; pass `--allow-network` only when live
 IdP JWKS retrieval is intentional. `canary check-config` reports only missing
 `CANARY_*` names. Key and JWKS inspection print public metadata only and refuse
 private or symmetric JWK input.
+
+`exchange` is a safe RFC 8693 token-exchange client for the Rust STS. It posts
+`application/x-www-form-urlencoded` to `/token`, reads subject, actor, and
+client assertion values from files, and prints response metadata plus decoded
+safe claims by default. Submitted tokens, client assertions, DPoP proofs, raw
+JWT IDs, and the minted access token are not printed unless `--print-token` is
+set explicitly. Pass `--jwks-file` or `--jwks-url` to verify the minted JWT
+before claims are rendered. `--dpop-proof-file` can forward a precomputed DPoP
+proof in the `DPoP` header; CLI-managed holder-key custody and proof generation
+are tracked separately in issue #40.
 
 `key rotate` is the file-backed RSA private JWK rotation workflow. It validates
 the current private JWK and existing public overlap JWKS, stages the old public

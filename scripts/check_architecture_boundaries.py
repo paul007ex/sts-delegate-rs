@@ -36,7 +36,7 @@ ALLOWED_NORMAL_WORKSPACE_DEPS = {
 }
 
 TRANSPORT_ONLY_NORMAL_DEPS = {"axum", "http", "http-body-util", "tower"}
-VERIFY_ONLY_NORMAL_DEPS = {"reqwest"}
+NETWORK_CLIENT_NORMAL_DEPS = {"reqwest"}
 ASYNC_RUNTIME_NORMAL_DEPS = {"tokio"}
 
 
@@ -124,10 +124,12 @@ def main() -> int:
             transport_deps = direct_deps & TRANSPORT_ONLY_NORMAL_DEPS
             if transport_deps:
                 errors.append(f"{crate_name} depends on transport-only crates: {sorted(transport_deps)}")
-        if crate_name != "sts-verify":
-            verify_deps = direct_deps & VERIFY_ONLY_NORMAL_DEPS
-            if verify_deps:
-                errors.append(f"{crate_name} depends on verify-only network crates: {sorted(verify_deps)}")
+        if crate_name not in {"sts-cli", "sts-verify"}:
+            network_deps = direct_deps & NETWORK_CLIENT_NORMAL_DEPS
+            if network_deps:
+                errors.append(
+                    f"{crate_name} depends on network-client crates: {sorted(network_deps)}"
+                )
         if crate_name not in {"sts-cli", "sts-http", "sts-verify"}:
             async_deps = direct_deps & ASYNC_RUNTIME_NORMAL_DEPS
             if async_deps:
