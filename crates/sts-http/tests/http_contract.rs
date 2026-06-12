@@ -8,6 +8,7 @@ use p256::ecdsa::SigningKey;
 use p256::pkcs8::EncodePrivateKey;
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use sts_config::{
     ConfigSource, ImpersonationPolicyEntry, ImpersonationSelector, RuntimeConfig, TokenExchangeMode,
@@ -378,6 +379,90 @@ async fn contract_metrics_record_token_success_and_denial_without_changing_error
     assert!(body.contains("sts_exchanges_total{result=\"minted\"} 1"));
     assert!(body.contains("sts_exchanges_total{result=\"denied\"} 1"));
     assert!(body.contains("sts_denials_total{error=\"invalid_request\"} 1"));
+}
+
+fn set_chat_target_signing_policy(
+    state: &mut HttpState,
+    accepted_token_signing_algs: &[&str],
+    pqc_required: bool,
+) {
+    let entry =
+        state.config.target_policy.targets.get_mut("api://chat-mcp").expect("chat target policy");
+    entry.accepted_token_signing_algs =
+        BTreeSet::from_iter(accepted_token_signing_algs.iter().map(|alg| (*alg).to_string()));
+    entry.pqc_required = pqc_required;
+}
+
+#[tokio::test]
+async fn contract_pqc_preferred_without_fallback_rejects_rs256_without_consuming_replay() {
+    let (mut state, subject_signer, actor_signer, _) = test_state();
+    state.config.pqc_preferred = true;
+    state.config.allow_non_pqc = false;
+    set_chat_target_signing_policy(&mut state, &["ML-DSA-65", "RS256"], false);
+    let now = unix_now();
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let actor_token = signed_assertion(&actor_signer, now, "actor-pqc-fail-closed");
+    let body = delegation_form(&subject_token, &actor_token);
+
+    let rejected = post_token_form(state.clone(), body.clone()).await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let rejected_body = read_json(rejected).await;
+    assert_eq!(rejected_body["error"], "invalid_target");
+    assert!(
+        rejected_body["error_description"].as_str().unwrap_or("").contains("fallback is disabled")
+    );
+
+    let mut fallback_state = state;
+    fallback_state.config.allow_non_pqc = true;
+    let accepted = post_token_form(fallback_state, body).await;
+    assert_eq!(accepted.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn contract_pqc_preferred_explicit_fallback_mints_rs256_with_safe_evidence() {
+    let (mut state, subject_signer, actor_signer, _) = test_state();
+    state.config.enable_metrics = true;
+    state.config.pqc_preferred = true;
+    state.config.allow_non_pqc = true;
+    set_chat_target_signing_policy(&mut state, &["ML-DSA-65", "RS256"], false);
+    let now = unix_now();
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let actor_token = signed_assertion(&actor_signer, now, "actor-pqc-explicit-fallback");
+
+    let response =
+        post_token_form(state.clone(), delegation_form(&subject_token, &actor_token)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["signing_alg_selected"], "RS256");
+    assert_eq!(body["pqc_fallback"], true);
+    assert_eq!(body["pqc_fallback_reason"], "pqc_signer_not_selected");
+    let token = body["access_token"].as_str().expect("access token");
+    assert_eq!(jwt_segment(token, 0)["alg"], "RS256");
+
+    let metrics = get_path(state, "/metrics").await;
+    assert_eq!(metrics.status(), StatusCode::OK);
+    let metrics_body = metrics.into_body().collect().await.expect("body").to_bytes();
+    let metrics_body = std::str::from_utf8(&metrics_body).expect("utf8 metrics");
+    assert!(
+        metrics_body.contains("sts_token_signing_alg_total{alg=\"RS256\",pqc_fallback=\"true\"} 1")
+    );
+}
+
+#[tokio::test]
+async fn contract_target_pqc_required_rejects_rs256_even_when_fallback_is_allowed() {
+    let (mut state, subject_signer, actor_signer, _) = test_state();
+    state.config.pqc_preferred = true;
+    state.config.allow_non_pqc = true;
+    set_chat_target_signing_policy(&mut state, &["ML-DSA-65", "RS256"], true);
+    let now = unix_now();
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let actor_token = signed_assertion(&actor_signer, now, "actor-pqc-required");
+
+    let response = post_token_form(state, delegation_form(&subject_token, &actor_token)).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_target");
+    assert!(body["error_description"].as_str().unwrap_or("").contains("requires PQC"));
 }
 
 #[tokio::test]

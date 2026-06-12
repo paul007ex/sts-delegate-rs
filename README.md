@@ -161,6 +161,45 @@ with matching public material. The published JWKS contains only public `AKP`
 members (`kty`, `kid`, `use`, `alg`, `pub`) and never `priv`. This path uses
 OpenSSL 3.5+ ML-DSA through `openssl-rs` and is not a FIPS-validation claim.
 
+PQC preference is STS/resource-server policy, not OAuth-standard client
+negotiation. Token requests must not contain a caller-selected minted-token
+signing algorithm. Operators can make PQC preferred and disable silent downgrade:
+
+```bash
+STS_PQC_PREFERRED=true
+STS_ALLOW_NON_PQC=false
+STS_PQC_PREFERRED_ALGS=ML-DSA-65,ML-DSA-87,ML-DSA-44
+STS_SIGNING_ALG=ML-DSA-65
+```
+
+Target policy can express downstream verification capability:
+
+```json
+{
+  "api://pqc-vpn": {
+    "scopes": ["vpn.connect"],
+    "accepted_token_signing_algs": ["ML-DSA-65", "RS256"],
+    "pqc_required": true
+  }
+}
+```
+
+When `STS_PQC_PREFERRED=true`, `STS_ALLOW_NON_PQC` defaults to false. If a target
+requires PQC, a non-PQC runtime signer fails closed even when non-PQC fallback is
+otherwise allowed. If explicit fallback is allowed and RS256 is minted under a
+PQC-preferred profile, the token response and metrics include safe evidence such
+as `signing_alg_selected`, `pqc_fallback`, and a sanitized fallback reason.
+
+Check compiled PQC/OpenSSL readiness without loading deployment keys:
+
+```bash
+cargo run -p sts-cli --features pqc-openssl-unstable -- pqc preflight
+```
+
+Current PQC support is limited to ML-DSA JWS signing, public AKP JWKS
+publication, and downstream verification. JWE, ML-KEM, encrypt/decrypt
+endpoints, KMS/HSM providers, and PQC key rotation are not shipped here.
+
 External signing uses an explicit provider selection. The default remains the
 file-backed signer:
 

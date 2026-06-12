@@ -28,3 +28,9 @@ jobs:
 
       - name: Workspace tests
         run: cargo test --workspace
+
+      - name: Workspace all-features tests
+        run: cargo test --workspace --all-features
+
+      - name: Workspace all-features clippy
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings

@@ -25,6 +25,7 @@ const DEFAULT_JWKS_CACHE_MAX_AGE: i64 = 300;
 const DEFAULT_ASSERTION_MAX_TTL: i64 = 300;
 const DEFAULT_MAX_SEEN_JTI: usize = 100_000;
 const DEFAULT_MAX_TOKEN_LEN: usize = 8_192;
+const DEFAULT_PQC_PREFERRED_ALGS: &str = "ML-DSA-65,ML-DSA-87,ML-DSA-44";
 
 /// Stable configuration failure categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,8 +101,14 @@ pub enum ReplayBackend {
 /// Policy rows for a single target audience.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetPolicyEntry {
+    /// Scopes this target can receive after downscoping.
     pub allowed_scopes: BTreeSet<String>,
+    /// Default scopes used when the exchange request omits `scope`.
     pub default_scopes: BTreeSet<String>,
+    /// Minted access-token JWS algorithms this downstream target can verify.
+    pub accepted_token_signing_algs: BTreeSet<String>,
+    /// Require a PQC minted-token signing algorithm for this target.
+    pub pqc_required: bool,
 }
 
 /// Deny-by-default target policy.
@@ -200,6 +207,12 @@ pub struct RuntimeConfig {
     pub impersonation_policy: ImpersonationPolicy,
     pub target_policy: TargetPolicy,
     pub sts_signing_alg: String,
+    /// Prefer PQC token signing when target policy and runtime signer allow it.
+    pub pqc_preferred: bool,
+    /// Permit explicit non-PQC fallback under a PQC-preferred profile.
+    pub allow_non_pqc: bool,
+    /// PQC algorithms allowed by this STS profile, in preference order.
+    pub pqc_preferred_algs: Vec<String>,
     pub sts_signing_provider: String,
     pub sts_signing_public_jwks_file: Option<PathBuf>,
     pub mock_external_signer_key_file: Option<PathBuf>,
@@ -327,6 +340,9 @@ impl RuntimeConfig {
             impersonation_policy: parse_impersonation_policy(source)?,
             target_policy: load_target_policy_from_source(source)?,
             sts_signing_alg: source.get("STS_SIGNING_ALG").unwrap_or("").trim().to_string(),
+            pqc_preferred: parse_bool(source, "STS_PQC_PREFERRED", false),
+            allow_non_pqc: parse_allow_non_pqc(source),
+            pqc_preferred_algs: parse_pqc_preferred_algs(source)?,
             sts_signing_provider: source
                 .get("STS_SIGNING_PROVIDER")
                 .unwrap_or("file")
@@ -618,6 +634,24 @@ fn parse_bool(source: &ConfigSource, key: &str, default: bool) -> bool {
     source.get(key).map(|value| value.trim().eq_ignore_ascii_case("true")).unwrap_or(default)
 }
 
+fn parse_allow_non_pqc(source: &ConfigSource) -> bool {
+    let pqc_preferred = parse_bool(source, "STS_PQC_PREFERRED", false);
+    parse_bool(source, "STS_ALLOW_NON_PQC", !pqc_preferred)
+}
+
+fn parse_pqc_preferred_algs(source: &ConfigSource) -> Result<Vec<String>, ConfigError> {
+    let raw = source.get("STS_PQC_PREFERRED_ALGS").unwrap_or(DEFAULT_PQC_PREFERRED_ALGS);
+    let algs = split_csv_vec(raw);
+    if algs.is_empty() {
+        return Err(ConfigError::new(
+            ConfigErrorKind::InvalidValue,
+            Some("STS_PQC_PREFERRED_ALGS".to_string()),
+            "STS_PQC_PREFERRED_ALGS must contain at least one algorithm",
+        ));
+    }
+    Ok(algs)
+}
+
 fn parse_bool_with_fallback(
     source: &ConfigSource,
     key: &str,
@@ -684,6 +718,10 @@ fn parse_env_usize(
 }
 
 fn split_csv_set(raw: &str) -> BTreeSet<String> {
+    split_csv_vec(raw).into_iter().collect()
+}
+
+fn split_csv_vec(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -740,9 +778,27 @@ fn normalize_target_policy(data: &serde_json::Value) -> Result<TargetPolicy, Con
                 "target policy entry must be an object",
             ));
         };
-        let allowed_scopes = parse_scopes(aud, "allowed_scopes", entry.get("allowed_scopes"))?;
+        let allowed_scopes = parse_scopes(
+            aud,
+            "allowed_scopes",
+            entry.get("allowed_scopes").or_else(|| entry.get("scopes")),
+        )?;
         let default_scopes = parse_scopes(aud, "default_scopes", entry.get("default_scopes"))?;
-        targets.insert(aud.to_string(), TargetPolicyEntry { allowed_scopes, default_scopes });
+        let accepted_token_signing_algs = parse_string_set(
+            aud,
+            "accepted_token_signing_algs",
+            entry.get("accepted_token_signing_algs"),
+        )?;
+        let pqc_required = parse_policy_bool(aud, "pqc_required", entry.get("pqc_required"))?;
+        targets.insert(
+            aud.to_string(),
+            TargetPolicyEntry {
+                allowed_scopes,
+                default_scopes,
+                accepted_token_signing_algs,
+                pqc_required,
+            },
+        );
     }
 
     Ok(TargetPolicy { targets })
@@ -836,6 +892,60 @@ fn parse_scopes(
     Ok(scopes)
 }
 
+fn parse_string_set(
+    aud: &str,
+    key: &str,
+    value: Option<&serde_json::Value>,
+) -> Result<BTreeSet<String>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(BTreeSet::new());
+    };
+    let Some(arr) = value.as_array() else {
+        return Err(ConfigError::new(
+            ConfigErrorKind::InvalidPolicy,
+            Some(aud.to_string()),
+            format!("{key} must be a JSON array of strings"),
+        ));
+    };
+    let mut values = BTreeSet::new();
+    for item in arr {
+        let Some(item) = item.as_str() else {
+            return Err(ConfigError::new(
+                ConfigErrorKind::InvalidPolicy,
+                Some(aud.to_string()),
+                format!("{key} must contain only strings"),
+            ));
+        };
+        let item = item.trim();
+        if item.is_empty() {
+            return Err(ConfigError::new(
+                ConfigErrorKind::InvalidPolicy,
+                Some(aud.to_string()),
+                format!("{key} must not contain empty strings"),
+            ));
+        }
+        values.insert(item.to_string());
+    }
+    Ok(values)
+}
+
+fn parse_policy_bool(
+    aud: &str,
+    key: &str,
+    value: Option<&serde_json::Value>,
+) -> Result<bool, ConfigError> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    value.as_bool().ok_or_else(|| {
+        ConfigError::new(
+            ConfigErrorKind::InvalidPolicy,
+            Some(aud.to_string()),
+            format!("{key} must be a boolean"),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -872,6 +982,30 @@ mod tests {
                 r#"{"api://chat-mcp":{"allowed_scopes":"oops","default_scopes":[]}}"#,
             ),
         ]);
+        let err = load_target_policy_from_source(&source).unwrap_err();
+        assert_eq!(err.kind, ConfigErrorKind::InvalidPolicy);
+    }
+
+    #[test]
+    fn target_policy_parses_pqc_signing_capabilities() {
+        let source = ConfigSource::from_pairs([(
+            "TARGET_POLICY_JSON",
+            r#"{"api://pqc-vpn":{"scopes":["vpn.connect"],"accepted_token_signing_algs":["ML-DSA-65","RS256"],"pqc_required":true}}"#,
+        )]);
+        let policy = load_target_policy_from_source(&source).expect("policy");
+        let entry = policy.get("api://pqc-vpn").expect("target");
+        assert!(entry.allowed_scopes.contains("vpn.connect"));
+        assert!(entry.accepted_token_signing_algs.contains("ML-DSA-65"));
+        assert!(entry.accepted_token_signing_algs.contains("RS256"));
+        assert!(entry.pqc_required);
+    }
+
+    #[test]
+    fn target_policy_rejects_invalid_pqc_signing_capabilities() {
+        let source = ConfigSource::from_pairs([(
+            "TARGET_POLICY_JSON",
+            r#"{"api://pqc-vpn":{"allowed_scopes":["vpn.connect"],"accepted_token_signing_algs":[""]}}"#,
+        )]);
         let err = load_target_policy_from_source(&source).unwrap_err();
         assert_eq!(err.kind, ConfigErrorKind::InvalidPolicy);
     }
@@ -929,9 +1063,41 @@ mod tests {
         assert_eq!(cfg.client_ids.len(), 1);
         assert_eq!(cfg.our_kid, DEFAULT_KID);
         assert_eq!(cfg.sts_signing_provider, "file");
+        assert!(!cfg.pqc_preferred);
+        assert!(cfg.allow_non_pqc);
+        assert_eq!(cfg.pqc_preferred_algs, vec!["ML-DSA-65", "ML-DSA-87", "ML-DSA-44"]);
         assert!(cfg.sts_signing_public_jwks_file.is_none());
         assert!(cfg.mock_external_signer_key_file.is_none());
         assert_eq!(cfg.replay_backend, ReplayBackend::Memory);
+    }
+
+    #[test]
+    fn runtime_config_pqc_preferred_defaults_to_no_non_pqc_downgrade() {
+        let source = ConfigSource::from_pairs([
+            ("IDP_ISSUER", "https://issuer.example/oauth2/default"),
+            ("EXPECTED_SUBJECT_AUD", "api://obo"),
+            ("ACTOR_IDS", "chat-mcp"),
+            ("STS_PQC_PREFERRED", "true"),
+            ("STS_PQC_PREFERRED_ALGS", "ML-DSA-87,ML-DSA-65"),
+        ]);
+        let cfg = RuntimeConfig::from_source(&source).expect("config");
+        assert!(cfg.pqc_preferred);
+        assert!(!cfg.allow_non_pqc);
+        assert_eq!(cfg.pqc_preferred_algs, vec!["ML-DSA-87", "ML-DSA-65"]);
+    }
+
+    #[test]
+    fn runtime_config_can_explicitly_allow_non_pqc_fallback() {
+        let source = ConfigSource::from_pairs([
+            ("IDP_ISSUER", "https://issuer.example/oauth2/default"),
+            ("EXPECTED_SUBJECT_AUD", "api://obo"),
+            ("ACTOR_IDS", "chat-mcp"),
+            ("STS_PQC_PREFERRED", "true"),
+            ("STS_ALLOW_NON_PQC", "true"),
+        ]);
+        let cfg = RuntimeConfig::from_source(&source).expect("config");
+        assert!(cfg.pqc_preferred);
+        assert!(cfg.allow_non_pqc);
     }
 
     #[test]

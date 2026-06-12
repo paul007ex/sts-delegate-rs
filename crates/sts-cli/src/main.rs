@@ -58,6 +58,11 @@ enum Command {
         #[command(subcommand)]
         command: DpopCommand,
     },
+    /// Inspect PQC backend readiness without printing key or token material.
+    Pqc {
+        #[command(subcommand)]
+        command: PqcCommand,
+    },
     /// Call the STS token endpoint with a redacted RFC 8693 token exchange request.
     Exchange(Box<ExchangeArgs>),
 }
@@ -102,6 +107,12 @@ enum DpopCommand {
 enum DpopKeyCommand {
     /// Generate a private P-256 DPoP holder JWK without printing private material.
     Generate(DpopKeyGenerateArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum PqcCommand {
+    /// Check compiled feature status and ML-DSA sign/verify availability.
+    Preflight,
 }
 
 #[derive(Debug, Args)]
@@ -267,6 +278,9 @@ async fn run(cli: Cli) -> Result<String, CliError> {
                 DpopKeyCommand::Generate(args) => generate_dpop_key(args),
             },
         },
+        Command::Pqc { command } => match command {
+            PqcCommand::Preflight => run_pqc_preflight(),
+        },
         Command::Exchange(args) => run_exchange(*args).await,
     }
 }
@@ -291,6 +305,78 @@ fn generate_dpop_key(args: DpopKeyGenerateArgs) -> Result<String, CliError> {
         sanitize_path(&args.out),
         sha256_hex_prefix(&generated.public_jkt),
     ))
+}
+
+fn run_pqc_preflight() -> Result<String, CliError> {
+    let selected_alg = std::env::var("STS_SIGNING_ALG")
+        .ok()
+        .map(|value| sanitize(value.trim()))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "RS256(default)".to_string());
+    let mut lines = vec![
+        "pqc_preflight_status=ok".to_string(),
+        format!("selected_sts_signing_alg={selected_alg}"),
+    ];
+
+    match sts_jose::openssl_version_text() {
+        Some(version) => {
+            lines.push("pqc_openssl_feature_enabled=true".to_string());
+            lines.push(format!("openssl_version={}", sanitize(&version)));
+        }
+        None => {
+            lines.push("pqc_openssl_feature_enabled=false".to_string());
+            lines.push("openssl_version=not_compiled".to_string());
+            lines.push("mldsa_sign_verify=not_compiled".to_string());
+            lines.push(String::new());
+            return Ok(lines.join("\n"));
+        }
+    }
+
+    #[cfg(feature = "pqc-openssl-unstable")]
+    {
+        for (algorithm, seed) in [
+            (sts_jose::MlDsaAlgorithm::MlDsa44, [44_u8; 32]),
+            (sts_jose::MlDsaAlgorithm::MlDsa65, [65_u8; 32]),
+            (sts_jose::MlDsaAlgorithm::MlDsa87, [87_u8; 32]),
+        ] {
+            let result = (|| -> Result<(), String> {
+                let signer = sts_jose::MlDsaJoseSigner::from_seed_for_tests(
+                    algorithm,
+                    seed,
+                    "pqc-preflight",
+                )
+                .map_err(|err| sanitize_oauth_text(&err.to_string()))?;
+                let token = signer
+                    .sign_json_claims(&serde_json::json!({
+                        "iss": "urn:sts-delegate-rs:pqc-preflight",
+                        "sub": "preflight",
+                        "aud": "urn:sts-delegate-rs:pqc-preflight",
+                        "iat": 1,
+                        "exp": 2
+                    }))
+                    .map_err(|err| sanitize_oauth_text(&err.to_string()))?;
+                verify_claims_against_jwks_with_header::<serde_json::Value>(
+                    &token,
+                    &signer.public_jwks(),
+                )
+                .map_err(|err| sanitize_oauth_text(&err.to_string()))?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => lines.push(format!("{}_sign_verify=ok", algorithm.jose_alg())),
+                Err(err) => {
+                    lines.push(format!("{}_sign_verify=fail", algorithm.jose_alg()));
+                    return Err(CliError::runtime(format!(
+                        "PQC preflight failed for {}: {err}",
+                        algorithm.jose_alg()
+                    )));
+                }
+            }
+        }
+    }
+
+    lines.push(String::new());
+    Ok(lines.join("\n"))
 }
 
 struct ExchangeHttpRequest {
@@ -1440,6 +1526,44 @@ mod tests {
     }
 
     #[test]
+    fn parser_accepts_pqc_preflight_command() {
+        let cli =
+            Cli::try_parse_from(["sts-cli", "pqc", "preflight"]).expect("parse pqc preflight");
+        match cli.command {
+            Command::Pqc { command: PqcCommand::Preflight } => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[cfg(not(feature = "pqc-openssl-unstable"))]
+    #[tokio::test]
+    async fn pqc_preflight_reports_not_compiled_without_feature() {
+        let output = run(Cli { command: Command::Pqc { command: PqcCommand::Preflight } })
+            .await
+            .expect("preflight");
+        assert!(output.contains("pqc_preflight_status=ok"));
+        assert!(output.contains("pqc_openssl_feature_enabled=false"));
+        assert!(output.contains("openssl_version=not_compiled"));
+        assert!(output.contains("mldsa_sign_verify=not_compiled"));
+    }
+
+    #[cfg(feature = "pqc-openssl-unstable")]
+    #[tokio::test]
+    async fn pqc_preflight_reports_openssl_mldsa_readiness() {
+        let output = run(Cli { command: Command::Pqc { command: PqcCommand::Preflight } })
+            .await
+            .expect("preflight");
+        assert!(output.contains("pqc_preflight_status=ok"));
+        assert!(output.contains("pqc_openssl_feature_enabled=true"));
+        assert!(output.contains("openssl_version=OpenSSL"));
+        assert!(output.contains("ML-DSA-44_sign_verify=ok"));
+        assert!(output.contains("ML-DSA-65_sign_verify=ok"));
+        assert!(output.contains("ML-DSA-87_sign_verify=ok"));
+        assert!(!output.contains("eyJ"));
+        assert!(!output.contains("priv"));
+    }
+
+    #[test]
     fn parser_accepts_exchange_command() {
         let cli = Cli::try_parse_from([
             "sts-cli",
@@ -1583,6 +1707,136 @@ mod tests {
         assert!(!output.contains("minted-jti-secret"));
         assert!(!output.contains("user@example.com"));
         assert!(!output.contains("eyJ"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "pqc-openssl-unstable")]
+    #[tokio::test]
+    async fn exchange_verifies_mldsa_akp_jwks_and_redacts_token() {
+        let dir = unique_temp_dir("sts-cli-exchange-mldsa-success");
+        let subject_file = dir.join("subject.txt");
+        let actor_file = dir.join("actor.jwt");
+        let jwks_file = dir.join("jwks.json");
+        fs::write(&subject_file, "subject-token-secret\n").expect("write subject");
+        fs::write(&actor_file, "actor-token-secret\n").expect("write actor");
+
+        let signer = sts_jose::MlDsaJoseSigner::from_seed_for_tests(
+            sts_jose::MlDsaAlgorithm::MlDsa65,
+            [65_u8; 32],
+            "sts-mldsa-kid",
+        )
+        .expect("mldsa signer");
+        write_jwks(&jwks_file, signer.public_jwks().keys);
+        let minted_token = signer
+            .sign_json_claims(&serde_json::json!({
+                "iss": "http://127.0.0.1:8888/tenant1",
+                "sub": "user@example.com",
+                "aud": "api://pqc-vpn",
+                "scope": "vpn.connect",
+                "act": {"sub": "pqc-vpn-client"},
+                "client_id": "pqc-vpn-client",
+                "iat": 1_000,
+                "exp": 2_000,
+                "jti": "minted-pqc-jti-secret"
+            }))
+            .expect("sign minted token");
+        let (sts_url, _captured, handle) = spawn_exchange_server(
+            200,
+            serde_json::json!({
+                "access_token": minted_token,
+                "issued_token_type": ACCESS_TOKEN_TYPE,
+                "token_type": "Bearer",
+                "expires_in": 300,
+                "scope": "vpn.connect"
+            })
+            .to_string(),
+        );
+
+        let mut args = exchange_args(Some(sts_url), None, subject_file.clone(), Some(actor_file));
+        args.audience = vec!["api://pqc-vpn".to_string()];
+        args.scope = Some("vpn.connect".to_string());
+        args.jwks_file = Some(jwks_file);
+
+        let output =
+            run(Cli { command: Command::Exchange(Box::new(args)) }).await.expect("exchange");
+        handle.join().expect("server joined");
+
+        assert!(output.contains("exchange_status=ok"));
+        assert!(output.contains("jwt_signature_verified=true"));
+        assert!(output.contains("jwt_verification_source=file"));
+        assert!(output.contains("jwt_header_alg=ML-DSA-65"));
+        assert!(output.contains("jwt_header_kid=sts-mldsa-kid"));
+        assert!(output.contains("claims.aud=api://pqc-vpn"));
+        assert!(output.contains("claims.act_sub=pqc-vpn-client"));
+        assert!(output.contains("access_token_sha256_prefix="));
+        assert!(!output.contains("subject-token-secret"));
+        assert!(!output.contains("actor-token-secret"));
+        assert!(!output.contains("minted-pqc-jti-secret"));
+        assert!(!output.contains("user@example.com"));
+        assert!(!output.contains("eyJ"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "pqc-openssl-unstable")]
+    #[tokio::test]
+    async fn exchange_rejects_wrong_mldsa_akp_jwks_without_printing_token() {
+        let dir = unique_temp_dir("sts-cli-exchange-mldsa-wrong-jwks");
+        let subject_file = dir.join("subject.txt");
+        let actor_file = dir.join("actor.jwt");
+        let jwks_file = dir.join("jwks.json");
+        fs::write(&subject_file, "subject-token-secret\n").expect("write subject");
+        fs::write(&actor_file, "actor-token-secret\n").expect("write actor");
+
+        let signer = sts_jose::MlDsaJoseSigner::from_seed_for_tests(
+            sts_jose::MlDsaAlgorithm::MlDsa65,
+            [66_u8; 32],
+            "sts-mldsa-kid",
+        )
+        .expect("mldsa signer");
+        let wrong_signer = sts_jose::MlDsaJoseSigner::from_seed_for_tests(
+            sts_jose::MlDsaAlgorithm::MlDsa65,
+            [67_u8; 32],
+            "sts-mldsa-kid",
+        )
+        .expect("wrong mldsa signer");
+        write_jwks(&jwks_file, wrong_signer.public_jwks().keys);
+        let minted_token = signer
+            .sign_json_claims(&serde_json::json!({
+                "iss": "http://127.0.0.1:8888/tenant1",
+                "sub": "user@example.com",
+                "aud": "api://pqc-vpn",
+                "scope": "vpn.connect",
+                "act": {"sub": "pqc-vpn-client"},
+                "client_id": "pqc-vpn-client",
+                "iat": 1_000,
+                "exp": 2_000,
+                "jti": "minted-pqc-jti-secret"
+            }))
+            .expect("sign minted token");
+        let (sts_url, _captured, handle) = spawn_exchange_server(
+            200,
+            serde_json::json!({
+                "access_token": minted_token,
+                "issued_token_type": ACCESS_TOKEN_TYPE,
+                "token_type": "Bearer",
+                "expires_in": 300,
+                "scope": "vpn.connect"
+            })
+            .to_string(),
+        );
+
+        let mut args = exchange_args(Some(sts_url), None, subject_file.clone(), Some(actor_file));
+        args.audience = vec!["api://pqc-vpn".to_string()];
+        args.scope = Some("vpn.connect".to_string());
+        args.jwks_file = Some(jwks_file);
+
+        let err = run(Cli { command: Command::Exchange(Box::new(args)) })
+            .await
+            .expect_err("wrong AKP JWKS must fail verification");
+        handle.join().expect("server joined");
+        assert!(err.message.contains("minted token verification failed"));
+        assert!(!err.message.contains("eyJ"));
+        assert!(!err.message.contains("minted-pqc-jti-secret"));
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -41,8 +41,8 @@ use sts_dpop::{
 use sts_jose::MlDsaJoseSigner;
 use sts_jose::{
     BackendSelection, ExternalRs256JoseSigner, JoseError, JoseErrorKind, JoseSigner, JwksDocument,
-    MockExternalRs256Provider, PublicJwk, RsaJoseSigner, rsa_public_key_bits_from_jwk,
-    validate_public_jwk,
+    MockExternalRs256Provider, PublicJwk, RsaJoseSigner, is_pqc_jws_alg,
+    rsa_public_key_bits_from_jwk, validate_public_jwk,
 };
 use sts_replay::{
     FileReplayStore, InMemoryReplayStore, ReplayError, ReplayErrorKind, ReplayPolicy,
@@ -74,6 +74,13 @@ struct VerifiedExchange {
     scope: String,
     client_claims: Option<AssertionClaims>,
     dpop_binding: Option<DpopBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SigningDecision {
+    alg: String,
+    pqc_fallback: bool,
+    pqc_fallback_reason: Option<&'static str>,
 }
 
 /// Shared HTTP runtime state.
@@ -177,6 +184,7 @@ struct MetricsState {
     exchanges_minted: AtomicU64,
     exchanges_denied: AtomicU64,
     denials: Mutex<std::collections::BTreeMap<&'static str, u64>>,
+    signing_algs: Mutex<std::collections::BTreeMap<(String, bool), u64>>,
 }
 
 impl MetricsState {
@@ -196,10 +204,18 @@ impl MetricsState {
         }
     }
 
+    fn record_signing(&self, decision: &SigningDecision) {
+        if let Ok(mut signing_algs) = self.signing_algs.lock() {
+            *signing_algs.entry((decision.alg.clone(), decision.pqc_fallback)).or_insert(0) += 1;
+        }
+    }
+
     fn render(&self, replay_cache_size: usize) -> String {
         let minted = self.exchanges_minted.load(Ordering::Relaxed);
         let denied = self.exchanges_denied.load(Ordering::Relaxed);
         let denials = self.denials.lock().map(|denials| denials.clone()).unwrap_or_default();
+        let signing_algs =
+            self.signing_algs.lock().map(|signing_algs| signing_algs.clone()).unwrap_or_default();
         let mut output = String::new();
         output.push_str(
             "# HELP sts_exchanges_total Total token exchange outcomes (minted = success, denied = any OAuth error)\n",
@@ -215,6 +231,17 @@ impl MetricsState {
             output.push_str(&format!(
                 "sts_denials_total{{error=\"{}\"}} {count}\n",
                 escape_prometheus_label(error)
+            ));
+        }
+        output.push_str(
+            "# HELP sts_token_signing_alg_total Minted token signing algorithms selected by STS policy\n",
+        );
+        output.push_str("# TYPE sts_token_signing_alg_total counter\n");
+        for ((alg, pqc_fallback), count) in signing_algs {
+            output.push_str(&format!(
+                "sts_token_signing_alg_total{{alg=\"{}\",pqc_fallback=\"{}\"}} {count}\n",
+                escape_prometheus_label(&alg),
+                pqc_fallback
             ));
         }
         output.push_str(
@@ -708,6 +735,15 @@ pub struct TokenResponse {
     pub token_type: String,
     pub expires_in: i64,
     pub scope: String,
+    /// Safe STS-selected minted-token signing algorithm; not caller-controlled.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signing_alg_selected: String,
+    /// True only when explicit policy allowed non-PQC fallback under PQC preference.
+    #[serde(default)]
+    pub pqc_fallback: bool,
+    /// Sanitized fallback reason suitable for logs, metrics, and canaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pqc_fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1062,6 +1098,7 @@ fn exchange_delegation(
     let actor_claims = verify_actor_token(&state, actor_token, &request.subject_token)?;
     validate_actor_identity(&state, &actor_claims)?;
     gate_may_act(&exchange.subject_claims, &actor_claims)?;
+    let signing_decision = signing_decision_for_target(&state, &exchange.target)?;
 
     let now = unix_now();
     let prior_act = exchange.subject_claims.act.as_ref().map(act_claim_from_value).transpose()?;
@@ -1105,6 +1142,7 @@ fn exchange_delegation(
         .signer
         .sign_claims(&payload)
         .map_err(|_| HttpError::server_error("internal error"))?;
+    state.metrics.record_signing(&signing_decision);
 
     Ok((
         token_headers(),
@@ -1114,6 +1152,9 @@ fn exchange_delegation(
             token_type: token_type_for_sender(&exchange.dpop_binding).to_string(),
             expires_in: (exp - now).max(0),
             scope: exchange.scope,
+            signing_alg_selected: signing_decision.alg,
+            pqc_fallback: signing_decision.pqc_fallback,
+            pqc_fallback_reason: signing_decision.pqc_fallback_reason.map(ToString::to_string),
         }),
     ))
 }
@@ -1150,6 +1191,7 @@ fn exchange_impersonation(
             exchange.subject_sub, client_claims.sub
         )));
     }
+    let signing_decision = signing_decision_for_target(&state, &exchange.target)?;
 
     let now = unix_now();
     record_client_assertion_replay(&state, &client_claims, now)?;
@@ -1180,6 +1222,7 @@ fn exchange_impersonation(
         .signer
         .sign_claims(&payload)
         .map_err(|_| HttpError::server_error("internal error"))?;
+    state.metrics.record_signing(&signing_decision);
 
     Ok((
         token_headers(),
@@ -1189,6 +1232,9 @@ fn exchange_impersonation(
             token_type: token_type_for_sender(&exchange.dpop_binding).to_string(),
             expires_in: (exp - now).max(0),
             scope: exchange.scope,
+            signing_alg_selected: signing_decision.alg,
+            pqc_fallback: signing_decision.pqc_fallback,
+            pqc_fallback_reason: signing_decision.pqc_fallback_reason.map(ToString::to_string),
         }),
     ))
 }
@@ -1534,6 +1580,57 @@ fn resolve_target_for_request(
     Ok(target)
 }
 
+fn signing_decision_for_target(
+    state: &HttpState,
+    target: &str,
+) -> Result<SigningDecision, HttpError> {
+    // The minted-token signing algorithm is selected only from deployment-owned
+    // STS/target policy. RFC 8693 form inputs do not negotiate or override it.
+    let policy =
+        state.config.target_policy.get(target).ok_or_else(|| {
+            HttpError::invalid_target(format!("unknown/forbidden target {target:?}"))
+        })?;
+    let alg = state.signer.alg().to_string();
+    let alg_is_pqc = is_pqc_jws_alg(&alg);
+
+    if !policy.accepted_token_signing_algs.is_empty()
+        && !policy.accepted_token_signing_algs.contains(&alg)
+    {
+        return Err(HttpError::invalid_target(
+            "target does not accept the configured token signing algorithm",
+        ));
+    }
+
+    if policy.pqc_required && !alg_is_pqc {
+        return Err(HttpError::invalid_target(
+            "target requires PQC token signing but the runtime signer is non-PQC",
+        ));
+    }
+
+    if state.config.pqc_preferred && alg_is_pqc && !state.config.pqc_preferred_algs.contains(&alg) {
+        return Err(HttpError::invalid_target(
+            "configured PQC token signing algorithm is not allowed by STS_PQC_PREFERRED_ALGS",
+        ));
+    }
+
+    if state.config.pqc_preferred && !alg_is_pqc {
+        if !state.config.allow_non_pqc {
+            return Err(HttpError::invalid_target(
+                "PQC token signing is preferred and non-PQC fallback is disabled",
+            ));
+        }
+        // Non-PQC issuance under a PQC-preferred profile is observable by design;
+        // this keeps fallback explicit and audit-visible instead of silent.
+        return Ok(SigningDecision {
+            alg,
+            pqc_fallback: true,
+            pqc_fallback_reason: Some("pqc_signer_not_selected"),
+        });
+    }
+
+    Ok(SigningDecision { alg, pqc_fallback: false, pqc_fallback_reason: None })
+}
+
 fn resolve_scope_for_request(
     request: &ExchangeRequest,
     state: &HttpState,
@@ -1743,6 +1840,8 @@ mod tests {
         exp: i64,
         iat: i64,
         jti: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sub_tok_hash: Option<String>,
     }
 
     fn signer(_seed: u64, kid: &str) -> RsaJoseSigner {
@@ -1813,7 +1912,15 @@ mod tests {
         }
     }
 
-    fn bootstrap_source(dir: &Path) -> ConfigSource {
+    struct BootstrapFixture {
+        source: ConfigSource,
+        #[cfg(feature = "pqc-openssl-unstable")]
+        subject_signer: RsaJoseSigner,
+        #[cfg(feature = "pqc-openssl-unstable")]
+        actor_signer: RsaJoseSigner,
+    }
+
+    fn bootstrap_fixture(dir: &Path) -> BootstrapFixture {
         let sts_key_file = dir.join("sts-private.pem");
         write_file(&sts_key_file, &private_key_pem(10));
 
@@ -1830,20 +1937,31 @@ mod tests {
             &serde_json::to_string(&actor_signer.public_jwks()).expect("actor jwks"),
         );
 
-        ConfigSource::from_pairs([
-            ("IDP_ISSUER", "https://issuer.example/oauth2/default".to_string()),
-            ("EXPECTED_SUBJECT_AUD", "api://obo".to_string()),
-            ("ACTOR_IDS", "chat-mcp".to_string()),
-            ("OBO_STS_ISSUER", "http://localhost:8888".to_string()),
-            ("OBO_STS_KEY_FILE", sts_key_file.display().to_string()),
+        let source = ConfigSource::from_pairs([
+	            ("IDP_ISSUER", "https://issuer.example/oauth2/default".to_string()),
+	            ("EXPECTED_SUBJECT_AUD", "api://obo".to_string()),
+	            ("ACTOR_IDS", "chat-mcp".to_string()),
+	            ("OBO_STS_ISSUER", "http://localhost:8888".to_string()),
+	            ("OBO_STS_KEY_FILE", sts_key_file.display().to_string()),
             ("IDP_JWKS_FILE", idp_jwks_file.display().to_string()),
             ("ACTOR_JWKS_FILE", actor_jwks_file.display().to_string()),
             ("CLIENT_JWKS_FILE", actor_jwks_file.display().to_string()),
             (
                 "TARGET_POLICY_JSON",
-                r#"{"api://chat-mcp":{"allowed_scopes":["chat.read"],"default_scopes":["chat.read"]}}"#.to_string(),
-            ),
-        ])
+	                r#"{"api://chat-mcp":{"allowed_scopes":["chat.read"],"default_scopes":["chat.read"]}}"#.to_string(),
+	            ),
+	        ]);
+        BootstrapFixture {
+            source,
+            #[cfg(feature = "pqc-openssl-unstable")]
+            subject_signer,
+            #[cfg(feature = "pqc-openssl-unstable")]
+            actor_signer,
+        }
+    }
+
+    fn bootstrap_source(dir: &Path) -> ConfigSource {
+        bootstrap_fixture(dir).source
     }
 
     fn bootstrap_pairs_without_signing_key(base: &ConfigSource) -> Vec<(String, String)> {
@@ -2004,7 +2122,7 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_loads_feature_gated_mldsa_signer() {
         let dir = temp_bootstrap_dir("mldsa-key");
-        let base = bootstrap_source(&dir);
+        let fixture = bootstrap_fixture(&dir);
         let mldsa_key_file = dir.join("sts-mldsa-private.json");
         write_file(&mldsa_key_file, &mldsa_private_jwk([44_u8; 32], "sts-mldsa-kid"));
 
@@ -2017,12 +2135,17 @@ mod tests {
             "IDP_JWKS_FILE",
             "ACTOR_JWKS_FILE",
             "CLIENT_JWKS_FILE",
-            "TARGET_POLICY_JSON",
         ] {
-            pairs.push((key.to_string(), base.get(key).expect("source key").to_string()));
+            pairs.push((key.to_string(), fixture.source.get(key).expect("source key").to_string()));
         }
+        pairs.push((
+	            "TARGET_POLICY_JSON".to_string(),
+	            r#"{"api://chat-mcp":{"allowed_scopes":["chat.read"],"default_scopes":["chat.read"],"accepted_token_signing_algs":["ML-DSA-65","RS256"],"pqc_required":true}}"#
+	                .to_string(),
+	        ));
         pairs.push(("OBO_STS_KEY_FILE".to_string(), mldsa_key_file.display().to_string()));
         pairs.push(("STS_SIGNING_ALG".to_string(), "ML-DSA-65".to_string()));
+        pairs.push(("STS_PQC_PREFERRED".to_string(), "true".to_string()));
         let source = ConfigSource::from_pairs(pairs);
 
         let state = build_state_from_source(&source).await.expect("bootstrap");
@@ -2048,6 +2171,53 @@ mod tests {
                 .expect("verify mldsa token");
         assert_eq!(verified.sub, "user@example.com");
         assert_eq!(verified.aud, "api://chat-mcp");
+
+        let now = unix_now();
+        let subject_token = signed_subject_token(&fixture.subject_signer, now);
+        let actor_token = signed_assertion_bound_to_subject(
+            &fixture.actor_signer,
+            now,
+            "actor-mldsa-http-route",
+            "http://localhost:8888",
+            &subject_token,
+        );
+        let body = serde_urlencoded::to_string([
+            ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+            ("subject_token", subject_token.as_str()),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("actor_token", actor_token.as_str()),
+            ("actor_token_type", JWT_TOKEN_TYPE),
+            ("audience", "api://chat-mcp"),
+            ("scope", "chat.read"),
+        ])
+        .expect("form");
+        let response = post_token_form(state.clone(), body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = read_json(response).await;
+        assert_eq!(response_body["signing_alg_selected"], "ML-DSA-65");
+        assert_eq!(response_body["pqc_fallback"], false);
+        assert!(response_body.get("pqc_fallback_reason").is_none());
+        let token = response_body["access_token"].as_str().expect("access token");
+        let verified: sts_jose::VerifiedJws<sts_core::MintedClaims> =
+            sts_jose::verify_claims_against_jwks_with_header(token, &state.published_jwks)
+                .expect("verify minted mldsa token");
+        assert_eq!(verified.alg, "ML-DSA-65");
+        assert_eq!(verified.claims.sub, "user@example.com");
+        assert_eq!(verified.claims.aud, "api://chat-mcp");
+        assert_eq!(verified.claims.scope, "chat.read");
+        assert_eq!(verified.claims.act.expect("act").sub, "chat-mcp");
+
+        let jwks_response = router(state)
+            .oneshot(
+                Request::builder().method(Method::GET).uri("/jwks").body(Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(jwks_response.status(), StatusCode::OK);
+        let jwks_body = read_json(jwks_response).await;
+        assert_eq!(jwks_body["keys"][0]["kty"], "AKP");
+        assert_eq!(jwks_body["keys"][0]["alg"], "ML-DSA-65");
+        assert!(jwks_body["keys"][0].get("priv").is_none());
     }
 
     #[cfg(unix)]
@@ -2150,14 +2320,46 @@ mod tests {
     }
 
     fn signed_assertion(signer: &RsaJoseSigner, now: i64, jti: &str) -> String {
+        signed_assertion_with_audience(signer, now, jti, "https://sts.example")
+    }
+
+    fn signed_assertion_with_audience(
+        signer: &RsaJoseSigner,
+        now: i64,
+        jti: &str,
+        aud: &str,
+    ) -> String {
         signer
             .sign_json_claims(&AssertionWireClaims {
                 iss: "chat-mcp".to_string(),
                 sub: "chat-mcp".to_string(),
-                aud: "https://sts.example".to_string(),
+                aud: aud.to_string(),
                 exp: now + 300,
                 iat: now,
                 jti: jti.to_string(),
+                sub_tok_hash: None,
+            })
+            .expect("assertion")
+    }
+
+    #[cfg(feature = "pqc-openssl-unstable")]
+    fn signed_assertion_bound_to_subject(
+        signer: &RsaJoseSigner,
+        now: i64,
+        jti: &str,
+        aud: &str,
+        subject_token: &str,
+    ) -> String {
+        let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, subject_token.as_bytes());
+        signer
+            .sign_json_claims(&AssertionWireClaims {
+                iss: "chat-mcp".to_string(),
+                sub: "chat-mcp".to_string(),
+                aud: aud.to_string(),
+                exp: now + 300,
+                iat: now,
+                jti: jti.to_string(),
+                sub_tok_hash: Some(URL_SAFE_NO_PAD.encode(hash.as_ref())),
             })
             .expect("assertion")
     }
