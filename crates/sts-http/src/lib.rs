@@ -614,6 +614,7 @@ struct TokenForm {
     subject_token_type: Option<String>,
     actor_token: Option<String>,
     actor_token_type: Option<String>,
+    empty_actor_token_supplied: bool,
     audience: Option<String>,
     resource: Option<String>,
     scope: Option<String>,
@@ -856,20 +857,31 @@ fn reject_authorization_header_client_auth(headers: &HeaderMap) -> Result<(), Ht
 
 fn assign_token_form_value(form: &mut TokenForm, key: &str, value: String) {
     match key {
-        "grant_type" => form.grant_type = Some(value),
-        "subject_token" => form.subject_token = Some(value),
-        "subject_token_type" => form.subject_token_type = Some(value),
-        "actor_token" => form.actor_token = Some(value),
-        "actor_token_type" => form.actor_token_type = Some(value),
-        "audience" => form.audience = Some(value),
-        "resource" => form.resource = Some(value),
-        "scope" => form.scope = Some(value),
-        "requested_token_type" => form.requested_token_type = Some(value),
-        "client_id" => form.client_id = Some(value),
-        "client_assertion" => form.client_assertion = Some(value),
-        "client_assertion_type" => form.client_assertion_type = Some(value),
+        "grant_type" => form.grant_type = non_empty_form_value(value),
+        "subject_token" => form.subject_token = non_empty_form_value(value),
+        "subject_token_type" => form.subject_token_type = non_empty_form_value(value),
+        "actor_token" => {
+            if value.is_empty() {
+                form.empty_actor_token_supplied = true;
+                form.actor_token = None;
+            } else {
+                form.actor_token = Some(value);
+            }
+        }
+        "actor_token_type" => form.actor_token_type = non_empty_form_value(value),
+        "audience" => form.audience = non_empty_form_value(value),
+        "resource" => form.resource = non_empty_form_value(value),
+        "scope" => form.scope = non_empty_form_value(value),
+        "requested_token_type" => form.requested_token_type = non_empty_form_value(value),
+        "client_id" => form.client_id = non_empty_form_value(value),
+        "client_assertion" => form.client_assertion = non_empty_form_value(value),
+        "client_assertion_type" => form.client_assertion_type = non_empty_form_value(value),
         _ => {}
     }
+}
+
+fn non_empty_form_value(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
 }
 
 async fn token(
@@ -889,9 +901,10 @@ async fn token_inner(
     body: Bytes,
 ) -> Result<(HeaderMap, Json<TokenResponse>), HttpError> {
     let form = parse_token_form(&headers, &body)?;
+    let empty_actor_token_supplied = form.empty_actor_token_supplied;
     let request = form.into_exchange_request();
     validate_request_params(&request, state.config.max_token_len)?;
-    let mode = effective_exchange_mode(&state.config, &request);
+    let mode = effective_exchange_mode(&state.config, &request, empty_actor_token_supplied);
     let client_claims = authenticate_client_if_present(&state, &request, mode)?;
     let dpop_binding = validate_dpop_header(&headers, &state, unix_now())?;
 
@@ -1125,12 +1138,13 @@ fn token_type_for_sender(binding: &Option<DpopBinding>) -> &'static str {
 fn effective_exchange_mode(
     config: &RuntimeConfig,
     request: &ExchangeRequest,
+    empty_actor_token_supplied: bool,
 ) -> EffectiveExchangeMode {
     match config.token_exchange_mode {
         TokenExchangeMode::Delegation => EffectiveExchangeMode::Delegation,
         TokenExchangeMode::Impersonation => EffectiveExchangeMode::Impersonation,
         TokenExchangeMode::Both => {
-            if request.actor_token.is_some() {
+            if request.actor_token.is_some() || empty_actor_token_supplied {
                 EffectiveExchangeMode::Delegation
             } else {
                 EffectiveExchangeMode::Impersonation
@@ -1252,6 +1266,9 @@ fn validate_request_params(
     request: &ExchangeRequest,
     max_token_len: usize,
 ) -> Result<(), HttpError> {
+    if request.grant_type.is_empty() {
+        return Err(HttpError::invalid_request("grant_type is required"));
+    }
     if request.grant_type != TOKEN_EXCHANGE_GRANT_TYPE {
         return Err(HttpError::unsupported_grant_type(format!(
             "grant_type must be {TOKEN_EXCHANGE_GRANT_TYPE}"

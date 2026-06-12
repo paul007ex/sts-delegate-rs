@@ -416,6 +416,196 @@ async fn contract_token_rejects_wrong_content_type_and_duplicate_form_params() {
 }
 
 #[tokio::test]
+async fn rfc_oauth21_empty_grant_type_is_missing_not_unsupported() {
+    let (state, _, _, _) = test_state();
+    let body = serde_urlencoded::to_string([("grant_type", "")]).expect("form");
+    let response = post_token_form(state, body).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_request");
+}
+
+#[tokio::test]
+async fn rfc_oauth21_empty_requested_token_type_defaults_to_access_token() {
+    let (state, subject_signer, actor_signer, _) = test_state();
+    let now = unix_now();
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let actor_token = signed_assertion(&actor_signer, now, "actor-empty-requested-token-type");
+    let body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", actor_token.as_str()),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+        ("requested_token_type", ""),
+    ])
+    .expect("form");
+
+    let response = post_token_form(state, body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["issued_token_type"], ACCESS_TOKEN_TYPE);
+}
+
+#[tokio::test]
+async fn rfc_oauth21_empty_audience_is_omitted_when_resource_is_present() {
+    let (state, subject_signer, actor_signer, _) = test_state();
+    let now = unix_now();
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let actor_token = signed_assertion(&actor_signer, now, "actor-empty-audience");
+    let body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", actor_token.as_str()),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", ""),
+        ("resource", "api://chat-mcp"),
+        ("scope", "chat.read"),
+    ])
+    .expect("form");
+
+    let response = post_token_form(state, body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["scope"], "chat.read");
+}
+
+#[tokio::test]
+async fn rfc_oauth21_empty_resource_is_omitted_when_audience_is_present() {
+    let (state, subject_signer, actor_signer, _) = test_state();
+    let now = unix_now();
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let actor_token = signed_assertion(&actor_signer, now, "actor-empty-resource");
+    let body = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", actor_token.as_str()),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("resource", ""),
+        ("scope", "chat.read"),
+    ])
+    .expect("form");
+
+    let response = post_token_form(state, body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["scope"], "chat.read");
+}
+
+#[tokio::test]
+async fn rfc_oauth21_empty_client_auth_fields_are_omitted_for_actor_delegation() {
+    let (state, subject_signer, actor_signer, _) = test_state();
+    let now = unix_now();
+
+    for field in ["client_id", "client_assertion", "client_assertion_type"] {
+        let subject_token = signed_subject_token(&subject_signer, now);
+        let actor_token = signed_assertion(&actor_signer, now, &format!("actor-empty-{field}"));
+        let body = serde_urlencoded::to_string([
+            ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+            ("subject_token", subject_token.as_str()),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("actor_token", actor_token.as_str()),
+            ("actor_token_type", JWT_TOKEN_TYPE),
+            ("audience", "api://chat-mcp"),
+            ("scope", "chat.read"),
+            (field, ""),
+        ])
+        .expect("form");
+
+        let response = post_token_form(state.clone(), body).await;
+        assert_eq!(response.status(), StatusCode::OK, "empty {field} should be omitted");
+        let body = read_json(response).await;
+        assert_eq!(body["token_type"], "Bearer", "{field}");
+    }
+}
+
+#[tokio::test]
+async fn rfc_oauth21_empty_actor_token_fields_keep_both_mode_fail_closed() {
+    let (mut state, subject_signer, actor_signer, client_signer) = test_state();
+    state.config.token_exchange_mode = TokenExchangeMode::Both;
+    allow_impersonation_anywhere(&mut state, "chat-mcp");
+    let now = unix_now();
+
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let actor_token = signed_assertion(&actor_signer, now, "actor-empty-actor-token-type");
+    let empty_actor_type = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", actor_token.as_str()),
+        ("actor_token_type", ""),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+    ])
+    .expect("form");
+    let response = post_token_form(state.clone(), empty_actor_type).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_request");
+    assert_eq!(body["error_description"], "actor_token_type required when actor_token is present");
+    assert!(body.get("access_token").is_none());
+
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let empty_actor_only = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", ""),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+    ])
+    .expect("form");
+    let response = post_token_form(state.clone(), empty_actor_only).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_client");
+    assert!(body.get("access_token").is_none());
+
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let client_assertion = signed_assertion(&client_signer, now, "client-empty-actor-token");
+    let empty_actor_with_client = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+        ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+        ("client_assertion", client_assertion.as_str()),
+        ("client_id", "chat-mcp"),
+        ("actor_token", ""),
+    ])
+    .expect("form");
+    let response = post_token_form(state.clone(), empty_actor_with_client).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_request");
+    assert_eq!(body["error_description"], "actor_token required for delegation");
+    assert!(body.get("access_token").is_none());
+
+    let subject_token = signed_subject_token(&subject_signer, now);
+    let malformed_actor = serde_urlencoded::to_string([
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("subject_token", subject_token.as_str()),
+        ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ("actor_token", "not-a-jwt"),
+        ("actor_token_type", JWT_TOKEN_TYPE),
+        ("audience", "api://chat-mcp"),
+        ("scope", "chat.read"),
+    ])
+    .expect("form");
+    let response = post_token_form(state, malformed_actor).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_client");
+    assert!(body.get("access_token").is_none());
+}
+
+#[tokio::test]
 async fn contract_authorization_header_client_auth_is_rejected() {
     let (state, _, _, _) = test_state();
     let body = serde_urlencoded::to_string([
@@ -1407,7 +1597,7 @@ async fn contract_both_mode_dispatches_by_actor_token_presence() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = read_json(response).await;
     assert_eq!(body["error"], "invalid_request");
-    assert_eq!(body["error_description"], "actor_token must be a non-empty string");
+    assert_eq!(body["error_description"], "actor_token required for delegation");
     assert!(
         body.get("access_token").is_none(),
         "malformed delegation-shaped request must not mint an impersonation token"
