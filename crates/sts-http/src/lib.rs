@@ -22,7 +22,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::header::{
-    AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, HeaderName, HeaderValue, PRAGMA, WWW_AUTHENTICATE,
+    ALLOW, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, HeaderName, HeaderValue, PRAGMA,
+    WWW_AUTHENTICATE,
 };
 use http::{HeaderMap, StatusCode};
 use rand::RngCore;
@@ -264,7 +265,7 @@ fn escape_prometheus_label(value: &str) -> String {
 /// and signing instead of reimplementing those rules in transport.
 pub fn router(state: HttpState) -> Router {
     let mut app = Router::new()
-        .route("/token", post(token))
+        .route("/token", post(token).fallback(token_method_not_allowed))
         .route("/jwks", get(jwks))
         .route("/openapi.json", get(openapi))
         .route("/.well-known/oauth-authorization-server", get(metadata));
@@ -275,7 +276,7 @@ pub fn router(state: HttpState) -> Router {
 
     if let Some(path) = state.issuer_path() {
         app = app
-            .route(&format!("{path}/token"), post(token))
+            .route(&format!("{path}/token"), post(token).fallback(token_method_not_allowed))
             .route(&format!("{path}/jwks"), get(jwks))
             .route(&format!("/.well-known/oauth-authorization-server{path}"), get(metadata));
     }
@@ -945,6 +946,12 @@ async fn metadata(State(state): State<HttpState>) -> impl IntoResponse {
             .collect(),
     };
     (public_cache_headers(state.config.jwks_cache_max_age), Json(document))
+}
+
+async fn token_method_not_allowed() -> impl IntoResponse {
+    let mut headers = token_headers();
+    headers.insert(ALLOW, HeaderValue::from_static("POST"));
+    (StatusCode::METHOD_NOT_ALLOWED, headers)
 }
 
 fn parse_token_form(headers: &HeaderMap, body: &[u8]) -> Result<TokenForm, HttpError> {

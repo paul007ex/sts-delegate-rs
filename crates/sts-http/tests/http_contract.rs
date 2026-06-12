@@ -1,6 +1,6 @@
 use axum::body::Body;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, PRAGMA, WWW_AUTHENTICATE};
+use http::header::{ALLOW, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, PRAGMA, WWW_AUTHENTICATE};
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -502,6 +502,36 @@ async fn contract_token_rejects_wrong_content_type_and_duplicate_form_params() {
     let body = read_json(response).await;
     assert_eq!(body["error"], "invalid_target");
     assert!(body["error_description"].as_str().unwrap_or("").contains("multiple audience"));
+}
+
+#[tokio::test]
+async fn token_method_not_allowed_is_hardened() {
+    let (state, _, _, _) = test_state();
+
+    for method in [Method::GET, Method::PUT] {
+        let response = router(state.clone())
+            .oneshot(Request::builder().method(method).uri("/token").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response.headers().get(ALLOW).and_then(|value| value.to_str().ok()),
+            Some("POST")
+        );
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(
+            response.headers().get(PRAGMA).and_then(|value| value.to_str().ok()),
+            Some("no-cache")
+        );
+        assert_eq!(
+            response.headers().get("x-content-type-options").and_then(|value| value.to_str().ok()),
+            Some("nosniff")
+        );
+    }
 }
 
 #[tokio::test]
