@@ -1,55 +1,58 @@
 # Release Security
 
-This page records the current release-trust state and the work needed to complete
-issue #46. It does not mark SBOM, provenance, or signing complete until those artifacts
-are generated and validated in the release path.
+This page records the current release-trust state for issue #46. Hosted and local
+CLI archives now carry SPDX SBOMs and checksums. Hosted release assets are attested
+by GitHub artifact attestations in the release workflow.
 
 ## Current Release Artifacts
 
 | Artifact | Current state | Verification |
 | --- | --- | --- |
 | GitHub source archive | Shipped by GitHub tag | Verify tag and source review. |
-| Hosted `sts-cli` archive | Shipped by `.github/workflows/release.yml` after tag/workflow run | Download archive and `SHA256SUMS`; run `shasum -a 256 -c SHA256SUMS`. |
-| Local `sts-cli` archive | Built by `scripts/package_release.sh` | Run script and checksum verification locally. |
+| Hosted `sts-cli` archive | Shipped by `.github/workflows/release.yml` after tag/workflow run | Download archive, SPDX SBOM, and `SHA256SUMS`; run checksum and attestation verification. |
+| Local `sts-cli` archive | Built by `scripts/package_release.sh` | Run script and checksum verification locally; inspect generated SPDX SBOM. |
 | Homebrew formula | Downloads hosted archive and verifies checksum | `brew tap`, `brew install`, `brew test`. |
 | Docker image | Local build path only | `docker build` and `scripts/docker_smoke.sh`. No GHCR publication claim. |
 | crates.io packages | Out of scope | Workspace crates are `publish = false`. |
 
-## Required Future Trust Artifacts
+## Release Trust Artifacts
 
-| Requirement | Target implementation | Validation |
+| Requirement | Current implementation | Validation |
 | --- | --- | --- |
-| SBOM for CLI archives | Generate CycloneDX or SPDX SBOM for each hosted archive and upload beside checksums. | Verify SBOM references the release archive/crate graph and contains no secrets. |
-| SBOM for container image | Generate image SBOM after a registry publication path exists. | Verify image digest and SBOM digest together. |
-| Provenance/attestation | Add hosted artifact provenance for release workflow outputs. | Verify attestation against repository, workflow, tag, and commit. |
-| Artifact signing | Sign release archives/checksums with Sigstore or another approved signing path. | Document `cosign verify-blob` or equivalent commands. |
-| Container signing | Sign published image digest once a registry path exists. | Document `cosign verify` against the image digest. |
+| SBOM for CLI archives | `scripts/package_release.sh` calls `scripts/generate_release_sbom.py` and emits `dist/sts-cli-*.spdx.json` beside each archive. | `shasum -a 256 -c dist/SHA256SUMS`; JSON parse/inspection of the SPDX document. |
+| Provenance/attestation | `.github/workflows/release.yml` attests hosted release assets with GitHub artifact attestations. | `gh attestation verify` against the repository and release workflow identity. |
+| Artifact signing | Hosted attestations provide Sigstore-backed artifact identity and provenance for uploaded assets. | Verify attestations after downloading the release assets. |
+| SBOM for container image | Roadmap until a registry publication path exists. | Verify image digest and SBOM digest together after image publication exists. |
+| Container signing | Roadmap until a registry publication path exists. | Document `cosign verify` against the published image digest when GHCR or another registry is added. |
 
 ## Operator Verification Commands
 
-Current checksums:
+Current checksums and SBOMs:
 
 ```bash
 release_tag=v0.1.0
 gh release download "$release_tag" \
   --repo paul007ex/sts-delegate-rs \
   --pattern 'sts-cli-*.tar.gz' \
+  --pattern 'sts-cli-*.spdx.json' \
   --pattern SHA256SUMS
 shasum -a 256 -c SHA256SUMS
+for sbom in sts-cli-*.spdx.json; do python3 -m json.tool "$sbom" >/dev/null; done
 ```
 
-Future signed release shape:
+Hosted artifact attestations:
 
 ```bash
-cosign verify-blob \
-  --certificate-identity-regexp 'https://github.com/paul007ex/sts-delegate-rs/.github/workflows/release.yml@refs/tags/.*' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --signature sts-cli.tar.gz.sig \
-  sts-cli.tar.gz
+gh attestation verify sts-cli-*.tar.gz \
+  --repo paul007ex/sts-delegate-rs \
+  --cert-identity-regex 'https://github.com/paul007ex/sts-delegate-rs/.github/workflows/release.yml@refs/tags/.*'
+gh attestation verify sts-cli-*.spdx.json \
+  --repo paul007ex/sts-delegate-rs \
+  --cert-identity-regex 'https://github.com/paul007ex/sts-delegate-rs/.github/workflows/release.yml@refs/tags/.*'
 ```
 
-The exact signing command remains roadmap until the release workflow produces those
-artifacts.
+Local archives cannot prove hosted workflow identity. Use the checksum and SBOM for
+local artifact integrity, and use hosted attestations for release provenance.
 
 ## Secret-Handling Rules
 
@@ -61,8 +64,8 @@ artifacts.
 - SBOM and provenance files are public artifacts and must contain package/build metadata
   only.
 
-## Open Work For #46
+## Remaining Work
 
-Issue #46 should remain open until at least one implementation PR adds generated SBOMs,
-attestation/provenance, and signing to the release workflow. This document supplies the
-operator-facing plan and verification language; it is not the implementation.
+Container image SBOMs and container signing remain blocked on a real registry
+publication path. The current Dockerfile is still a local build path, not a signed
+published image.
