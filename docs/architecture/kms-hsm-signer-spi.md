@@ -1,12 +1,15 @@
-# KMS/HSM Signer SPI Draft
+# KMS/HSM Signer SPI
 
-This draft supports issue #43. It is not implemented on `main`.
+This page supports issue #43. The current implementation includes the JOSE-level
+external signer provider boundary plus a tested `mock-external` provider for local
+and CI proof. Real AWS KMS, Google Cloud KMS, and PKCS#11/HSM providers remain
+future provider implementations.
 
 ## Current Boundary
 
-`sts-http` loads local private key material from `OBO_STS_KEY_FILE` during
-bootstrap and stores an `Arc<dyn JoseSigner>` in `HttpState`. `sts-jose` owns the
-`JoseSigner` trait:
+The default `file` signing provider loads local private key material from
+`OBO_STS_KEY_FILE` during bootstrap and stores an `Arc<dyn JoseSigner>` in
+`HttpState`. `sts-jose` owns the `JoseSigner` trait:
 
 ```rust
 pub trait JoseSigner: Send + Sync {
@@ -17,26 +20,27 @@ pub trait JoseSigner: Send + Sync {
 }
 ```
 
-That shape works for local RSA and feature-gated ML-DSA signers. A cloud KMS or
-HSM signer should not load private JWK members into `sts-http`, and it should not
-silently fall back to the file signer when provider calls fail.
+That shape works for local RSA, feature-gated ML-DSA signers, and external RS256
+signers. External providers do not move key custody into `sts-http`, and provider
+selection must not silently fall back to the file signer when provider calls fail.
 
-## Provider Direction
+## Implemented Provider Boundary
 
-Add an external-signer provider that keeps JOSE serialization in Rust but delegates
-the private signing operation:
+`sts-jose` includes an external RS256 provider boundary that keeps JOSE
+serialization in Rust but delegates the private signing operation:
 
 - `alg`: initially `RS256`;
 - `kid`: configured expected key ID;
 - `public_jwk`: derived from provider public-key metadata, not from private key
   material;
-- `sign`: signs the exact JWS signing input bytes;
+- `sign_rs256`: signs the exact JWS signing input bytes;
 - `verify_claims`: verifies the compact JWS against `public_jwks()` just like local
   signers.
 
-The first implementation can be a tested mock provider plus config and HTTP
-bootstrap wiring. A later provider can target AWS KMS, Google Cloud KMS, or
-PKCS#11/HSM.
+`STS_SIGNING_PROVIDER=mock-external` exercises this boundary with a local mock
+provider. It is not a production custody claim. It exists so bootstrap, JWKS,
+signing, mismatch, and no-fallback behavior can be tested before a cloud provider
+SDK is added.
 
 ## Provider Examples To Evaluate
 
@@ -55,6 +59,7 @@ STS_SIGNING_PROVIDER=file | mock-external | aws-kms | gcp-kms | pkcs11
 STS_SIGNING_ALG=RS256
 STS_SIGNING_KID=<expected kid>
 STS_SIGNING_PUBLIC_JWKS_FILE=<public-only JWKS cache, optional>
+STS_MOCK_EXTERNAL_SIGNER_KEY_FILE=<mock-only private JWK file>
 AWS_KMS_KEY_ID=<provider key id, provider-specific>
 ```
 
@@ -62,7 +67,10 @@ Provider credentials should come from the cloud runtime identity or a mounted
 credential file managed by the deployment, never from command-line arguments or
 issue evidence.
 
-## Acceptance Tests
+Only `file` and `mock-external` are implemented today. `aws-kms`, `gcp-kms`, and
+`pkcs11` must fail closed until their providers are implemented and tested.
+
+## Implemented Tests
 
 - mock external signer mints a token that verifies against the Rust `/jwks`;
 - `/jwks` includes only public JWK members;

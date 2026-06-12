@@ -7,11 +7,13 @@
 //! the explicit `pqc-openssl-unstable` feature and never falls back to RS256.
 
 use std::fmt;
+use std::sync::Arc;
 
 use aws_lc_rs::{
     digest::{SHA256, digest as aws_digest},
     encoding::{AsDer, Pkcs8V1Der},
-    signature::{KeyPair as AwsKeyPair, RsaKeyPair, RsaPublicKeyComponents},
+    rand::SystemRandom,
+    signature::{KeyPair as AwsKeyPair, RSA_PKCS1_SHA256, RsaKeyPair, RsaPublicKeyComponents},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{
@@ -269,6 +271,16 @@ pub trait JoseSigner: Send + Sync {
     fn verify_claims(&self, token: &str) -> Result<MintedClaims, JoseError>;
 }
 
+/// Minimal provider boundary for external RS256 key custody.
+///
+/// The JOSE crate owns compact-JWS serialization and public JWKS verification.
+/// Providers receive only the JWS signing input bytes and return the raw RS256
+/// signature bytes. Real KMS/HSM providers can implement this trait without
+/// exposing private key material to HTTP or token-policy crates.
+pub trait ExternalRs256SignerProvider: Send + Sync {
+    fn sign_rs256(&self, signing_input: &[u8]) -> Result<Vec<u8>, JoseError>;
+}
+
 /// Parse a public RSA key from an RSA JWK.
 ///
 /// This keeps key material handling in the JOSE crate instead of making the HTTP
@@ -506,6 +518,167 @@ pub struct RsaJoseSigner {
     kid: String,
     encoding_key: EncodingKey,
     public_jwk: PublicJwk,
+}
+
+/// RS256 JOSE signer that delegates the private signing operation to a provider.
+pub struct ExternalRs256JoseSigner {
+    kid: String,
+    public_jwk: PublicJwk,
+    provider: Arc<dyn ExternalRs256SignerProvider>,
+}
+
+impl fmt::Debug for ExternalRs256JoseSigner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExternalRs256JoseSigner")
+            .field("kid", &self.kid)
+            .field("alg", &"RS256")
+            .finish()
+    }
+}
+
+impl ExternalRs256JoseSigner {
+    pub fn new(
+        kid: impl Into<String>,
+        public_jwk: PublicJwk,
+        provider: Arc<dyn ExternalRs256SignerProvider>,
+    ) -> Result<Self, JoseError> {
+        let kid = kid.into();
+        if kid.trim().is_empty() {
+            return Err(JoseError::new(
+                JoseErrorKind::InvalidKey,
+                "external signer kid is required",
+            ));
+        }
+        validate_public_jwk(&public_jwk)?;
+        if public_jwk.kty != "RSA" || public_jwk.alg != "RS256" {
+            return Err(JoseError::new(
+                JoseErrorKind::UnsupportedAlgorithm,
+                "external signer currently supports RS256 RSA public keys only",
+            ));
+        }
+        if public_jwk.kid != kid {
+            return Err(JoseError::new(
+                JoseErrorKind::InvalidKey,
+                "external signer kid does not match public JWK kid",
+            ));
+        }
+        Ok(Self { kid, public_jwk, provider })
+    }
+
+    fn sign_json_claims_with_typ<T: Serialize>(
+        &self,
+        claims: &T,
+        typ: &str,
+    ) -> Result<String, JoseError> {
+        #[derive(Serialize)]
+        struct ProtectedHeader<'a> {
+            alg: &'a str,
+            kid: &'a str,
+            typ: &'a str,
+        }
+
+        let header = ProtectedHeader { alg: "RS256", kid: &self.kid, typ };
+        let protected = serde_json::to_vec(&header).map_err(|e| {
+            JoseError::new(JoseErrorKind::InvalidClaims, format!("encode JWS header failed: {e}"))
+        })?;
+        let payload = serde_json::to_vec(claims).map_err(|e| {
+            JoseError::new(JoseErrorKind::InvalidClaims, format!("encode claims failed: {e}"))
+        })?;
+        let signing_input =
+            format!("{}.{}", URL_SAFE_NO_PAD.encode(protected), URL_SAFE_NO_PAD.encode(payload));
+        let signature = self.provider.sign_rs256(signing_input.as_bytes())?;
+        Ok(format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature)))
+    }
+}
+
+impl JoseSigner for ExternalRs256JoseSigner {
+    fn alg(&self) -> &'static str {
+        "RS256"
+    }
+
+    fn sign_claims(&self, claims: &MintedClaims) -> Result<String, JoseError> {
+        self.sign_json_claims_with_typ(claims, "at+jwt")
+    }
+
+    fn public_jwks(&self) -> JwksDocument {
+        JwksDocument::new(vec![self.public_jwk.clone()])
+    }
+
+    fn verify_claims(&self, token: &str) -> Result<MintedClaims, JoseError> {
+        let header = decode_compact_jws_header(token)?;
+        if header.alg != "RS256" {
+            return Err(JoseError::new(
+                JoseErrorKind::VerificationFailed,
+                "unexpected JWS algorithm",
+            ));
+        }
+        if header.kid.as_deref() != Some(self.kid.as_str()) {
+            return Err(JoseError::new(JoseErrorKind::VerificationFailed, "unexpected JWS kid"));
+        }
+        verify_claims_against_jwks(token, &self.public_jwks())
+    }
+}
+
+/// Test/mock provider for exercising the external signer boundary without cloud SDKs.
+///
+/// This is intentionally named and documented as a mock provider. Production KMS/HSM
+/// integrations should implement `ExternalRs256SignerProvider` without loading local
+/// private key material.
+pub struct MockExternalRs256Provider {
+    key_pair: RsaKeyPair,
+    signature_len: usize,
+}
+
+impl fmt::Debug for MockExternalRs256Provider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MockExternalRs256Provider").finish_non_exhaustive()
+    }
+}
+
+impl MockExternalRs256Provider {
+    pub fn from_private_jwk_for_backend(
+        selection: &BackendSelection,
+        private_jwk_json: impl AsRef<str>,
+    ) -> Result<Self, JoseError> {
+        ensure_classical_backend(selection)?;
+        let jwk: PrivateRsaJwk = serde_json::from_str(private_jwk_json.as_ref()).map_err(|e| {
+            JoseError::new(JoseErrorKind::InvalidKey, format!("invalid RSA private JWK JSON: {e}"))
+        })?;
+        if jwk.kty != "RSA" {
+            return Err(JoseError::new(
+                JoseErrorKind::InvalidKey,
+                format!("unsupported private JWK key type {}", jwk.kty),
+            ));
+        }
+        let private_der = rsa_private_jwk_to_pkcs1_der(&jwk)?;
+        let key_pair = RsaKeyPair::from_der(&private_der).map_err(|e| {
+            JoseError::new(JoseErrorKind::InvalidKey, format!("invalid RSA private key: {e}"))
+        })?;
+        if key_pair.public_modulus_len() * 8 < 2048 {
+            return Err(JoseError::new(
+                JoseErrorKind::InvalidKey,
+                "RSA signing key modulus must be at least 2048 bits",
+            ));
+        }
+        let signature_len = key_pair.public_modulus_len();
+        Ok(Self { key_pair, signature_len })
+    }
+}
+
+impl ExternalRs256SignerProvider for MockExternalRs256Provider {
+    fn sign_rs256(&self, signing_input: &[u8]) -> Result<Vec<u8>, JoseError> {
+        let rng = SystemRandom::new();
+        let mut signature = vec![0_u8; self.signature_len];
+        self.key_pair.sign(&RSA_PKCS1_SHA256, &rng, signing_input, &mut signature).map_err(
+            |e| {
+                JoseError::new(
+                    JoseErrorKind::InvalidKey,
+                    format!("external RS256 signing failed: {e}"),
+                )
+            },
+        )?;
+        Ok(signature)
+    }
 }
 
 /// A freshly generated classical RSA signing key for file-backed operation.
@@ -1468,6 +1641,83 @@ mod tests {
         assert_eq!(decoded.aud, "api://chat-mcp");
         assert_eq!(decoded.client_id, "chat-mcp");
         assert_eq!(decoded.scope, "chat.read");
+    }
+
+    #[test]
+    fn external_rs256_signer_round_trips_with_mock_provider() {
+        let generated = RsaJoseSigner::generate_private_jwk().expect("generated key");
+        let provider = Arc::new(
+            MockExternalRs256Provider::from_private_jwk_for_backend(
+                &BackendSelection::Classical,
+                &generated.private_jwk_json,
+            )
+            .expect("provider"),
+        );
+        let signer = ExternalRs256JoseSigner::new(
+            generated.public_jwk.kid.clone(),
+            generated.public_jwk,
+            provider,
+        )
+        .expect("external signer");
+
+        let token = signer.sign_claims(&claims()).expect("sign");
+        let decoded = signer.verify_claims(&token).expect("verify");
+        assert_eq!(decoded.sub, "user@example.com");
+        assert_eq!(decoded.aud, "api://chat-mcp");
+        let jwks_json = serde_json::to_value(signer.public_jwks()).expect("jwks");
+        assert!(jwks_json["keys"][0].get("d").is_none());
+        assert!(jwks_json["keys"][0].get("p").is_none());
+        assert!(jwks_json["keys"][0].get("q").is_none());
+    }
+
+    #[test]
+    fn external_rs256_signer_rejects_public_kid_mismatch() {
+        let generated = RsaJoseSigner::generate_private_jwk().expect("generated key");
+        let provider = Arc::new(
+            MockExternalRs256Provider::from_private_jwk_for_backend(
+                &BackendSelection::Classical,
+                &generated.private_jwk_json,
+            )
+            .expect("provider"),
+        );
+        let err =
+            ExternalRs256JoseSigner::new("wrong-kid", generated.public_jwk, provider).unwrap_err();
+        assert_eq!(err.kind, JoseErrorKind::InvalidKey);
+        assert!(err.message.contains("kid"));
+    }
+
+    #[test]
+    fn external_rs256_provider_failure_fails_closed() {
+        #[derive(Debug)]
+        struct FailingProvider;
+
+        impl ExternalRs256SignerProvider for FailingProvider {
+            fn sign_rs256(&self, _signing_input: &[u8]) -> Result<Vec<u8>, JoseError> {
+                Err(JoseError::new(JoseErrorKind::InvalidKey, "provider refused signing"))
+            }
+        }
+
+        let public_jwk = RsaJoseSigner::generate_private_jwk().expect("generated key").public_jwk;
+        let signer = ExternalRs256JoseSigner::new(
+            public_jwk.kid.clone(),
+            public_jwk,
+            Arc::new(FailingProvider),
+        )
+        .expect("external signer");
+        let err = signer.sign_claims(&claims()).unwrap_err();
+        assert_eq!(err.kind, JoseErrorKind::InvalidKey);
+        assert!(err.message.contains("provider"));
+    }
+
+    #[test]
+    fn mock_external_provider_honors_backend_selection() {
+        let generated = RsaJoseSigner::generate_private_jwk().expect("generated key");
+        let err = MockExternalRs256Provider::from_private_jwk_for_backend(
+            &BackendSelection::parse("ML-DSA-65"),
+            generated.private_jwk_json,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, JoseErrorKind::UnsupportedAlgorithm);
     }
 
     #[test]
