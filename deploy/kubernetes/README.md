@@ -1,7 +1,7 @@
-# Kubernetes Reference Deployment Draft
+# Kubernetes Reference Deployment
 
-This draft is for issue #42. It is a starting point for a Kubernetes reference
-deployment of `sts-cli serve`; it is not a production hardening claim.
+This reference deployment is for issue #42. It is a starting point for running
+`sts-cli serve`; it is not a production hardening or high-availability claim.
 
 The manifests keep runtime configuration and key material outside the image:
 
@@ -13,9 +13,11 @@ The manifests keep runtime configuration and key material outside the image:
   reaches the Service;
 - readiness probes call discovery metadata and liveness probes call `/jwks`.
 
-The current product still uses the in-process replay backend and file-backed STS
-signing key. Multi-replica deployments need #44 before replay is correct across
-replicas, and higher-assurance key custody needs #43.
+The raw manifests intentionally set `replicas: 1`. Multi-replica deployments need
+a shared replay backend such as PR #63 before replay is correct across replicas.
+The raw manifests use the file-backed STS signing key path; external key custody
+requires a provider-boundary implementation such as PR #64 plus a concrete
+production provider.
 
 ## Configure
 
@@ -45,6 +47,18 @@ If live IdP JWKS retrieval is intended instead of `IDP_JWKS_FILE`, remove the
 kubectl apply --dry-run=client -f deploy/kubernetes/
 kubectl apply -f deploy/kubernetes/
 kubectl -n sts-delegate-rs rollout status deployment/sts-delegate-rs
+```
+
+## Terraform Reference
+
+A Terraform Kubernetes reference module is available in
+`deploy/terraform/kubernetes/`. It keeps secret values in sensitive variables and
+uses the same single-replica safety scope as the raw manifests.
+
+```bash
+terraform -chdir=deploy/terraform/kubernetes fmt -check
+terraform -chdir=deploy/terraform/kubernetes init -backend=false
+terraform -chdir=deploy/terraform/kubernetes validate
 ```
 
 ## Smoke

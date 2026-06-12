@@ -149,6 +149,10 @@ docker run --rm -p 8888:8888 \
 The image runs as a non-root `sts` user. Mounted key/JWKS files must be readable
 by that user or by a compatible group.
 
+Reference Kubernetes raw manifests and a Terraform Kubernetes module live under
+`deploy/`. They mount config and secrets at runtime, keep `replicas=1` until
+shared replay is configured, and expect TLS termination at ingress.
+
 The default signing runtime is classical RS256. Experimental ML-DSA signing,
 AKP JWKS publication, and ML-DSA verification can be compiled with
 `pqc-openssl-unstable`; runtime selection then requires a concrete
