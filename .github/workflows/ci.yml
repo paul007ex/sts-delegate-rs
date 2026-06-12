@@ -27,9 +27,6 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
 
-      - name: Secure Rust audit loop
-        run: python3 scripts/security_audit_loop.py
-
       - name: Install OpenSSL 3.5 for PQC default gates
         run: |
           set -euo pipefail
@@ -48,6 +45,9 @@ jobs:
             echo "PKG_CONFIG_PATH=$OPENSSL_INSTALL_DIR/lib64/pkgconfig:$OPENSSL_INSTALL_DIR/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
             echo "LD_LIBRARY_PATH=$OPENSSL_INSTALL_DIR/lib64:$OPENSSL_INSTALL_DIR/lib:${LD_LIBRARY_PATH:-}"
           } >> "$GITHUB_ENV"
+
+      - name: Secure Rust audit loop
+        run: python3 scripts/security_audit_loop.py
 
       - name: Workspace tests
         run: cargo test --workspace
