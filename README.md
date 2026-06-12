@@ -17,6 +17,21 @@ Rust-native successor to `sts-delegate`: an RFC 8693 token-exchange STS with OAu
 
 The current Python implementation remains the behavior oracle until the Rust contract tests prove parity. The Rust repo must preserve observable endpoints, claim shapes, and failure classes while keeping the architecture explicit and maintainable.
 
+## Rust docs
+
+- [Rust product surface](docs/reference/product-surface.md) maps endpoints, claims,
+  config, errors, and Python-oracle reference docs to current Rust behavior.
+- [Okta, OBO, and MCP docs plan](docs/explanation/okta-mcp-obo-plan.md) separates
+  OIDC login, Okta-documented OBO, and Rust token exchange.
+- [obo-lab contract coverage plan](docs/requirements/obo-lab-contract-coverage.md)
+  classifies scenario-level lab tests against Rust contract coverage.
+- [Production runbook](docs/operations/production-runbook.md) covers startup checks,
+  alerts, rotation, incident response, and deployment evidence.
+- [Release security](docs/operations/release-security.md) records current checksum
+  verification and the remaining SBOM/provenance/signing work.
+- [Cloud deployment roadmap](docs/operations/cloud-roadmap.md) keeps KMS/HSM, shared
+  replay, and Helm/Terraform work explicit instead of overclaiming it.
+
 ## Runtime bootstrap
 
 `sts-cli` now exposes the Rust HTTP runtime boundary:
