@@ -14,6 +14,8 @@ use sts_jose::{
     JoseSigner, JwksDocument, PublicJwk, RsaJoseSigner, rsa_public_key_bits_from_jwk,
     verify_claims_against_jwks_with_header,
 };
+#[cfg(feature = "pqc-openssl-unstable")]
+use sts_jose::{MlDsaAlgorithm, MlDsaJoseSigner};
 
 const PRIVATE_JWK_MEMBERS: &[&str] = &["d", "p", "q", "dp", "dq", "qi", "oth", "k", "priv"];
 const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
@@ -62,6 +64,11 @@ enum Command {
     Pqc {
         #[command(subcommand)]
         command: PqcCommand,
+    },
+    /// Verify a minted compact JWT against a public JWKS and print safe claims.
+    Token {
+        #[command(subcommand)]
+        command: TokenCommand,
     },
     /// Call the STS token endpoint with a redacted RFC 8693 token exchange request.
     Exchange(Box<ExchangeArgs>),
@@ -113,6 +120,27 @@ enum DpopKeyCommand {
 enum PqcCommand {
     /// Check compiled feature status and ML-DSA sign/verify availability.
     Preflight,
+    /// Manage ML-DSA signing keys for the experimental PQC backend.
+    Key {
+        #[command(subcommand)]
+        command: PqcKeyCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PqcKeyCommand {
+    /// Generate an ML-DSA private AKP JWK and optional public JWKS.
+    Generate(PqcKeyGenerateArgs),
+    /// Inspect one ML-DSA AKP key or JWKS without printing private material.
+    Inspect(InspectFileArgs),
+    /// Rotate a file-backed ML-DSA private AKP JWK and stage overlap JWKS.
+    Rotate(PqcKeyRotateArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum TokenCommand {
+    /// Verify a compact JWT against a public JWKS.
+    Verify(TokenVerifyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -140,6 +168,57 @@ struct DpopKeyGenerateArgs {
     /// Output path for the private DPoP holder JWK. The file must not already exist.
     #[arg(long, value_name = "PATH")]
     out: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct PqcKeyGenerateArgs {
+    /// ML-DSA JOSE algorithm: ML-DSA-44, ML-DSA-65, or ML-DSA-87.
+    #[arg(long, default_value = "ML-DSA-65")]
+    alg: String,
+    /// Optional key id. Defaults to the RFC 9964 AKP thumbprint.
+    #[arg(long)]
+    kid: Option<String>,
+    /// Output path for the private AKP JWK. The file must not already exist unless --force is used.
+    #[arg(long, value_name = "PATH")]
+    out: PathBuf,
+    /// Optional output path for the public JWKS.
+    #[arg(long, value_name = "PATH")]
+    public_jwks_out: Option<PathBuf>,
+    /// Replace existing output files.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
+struct PqcKeyRotateArgs {
+    /// Current ML-DSA private AKP JWK file.
+    #[arg(long, value_name = "PATH")]
+    key_file: PathBuf,
+    /// Public overlap JWKS file.
+    #[arg(long, value_name = "PATH")]
+    extra_jwks_file: PathBuf,
+    /// Optional replacement key id. Defaults to the RFC 9964 AKP thumbprint.
+    #[arg(long)]
+    kid: Option<String>,
+    /// Validate the rotation plan without writing files or generating replacement key material.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct TokenVerifyArgs {
+    /// File containing the compact JWT to verify. The token is never printed.
+    #[arg(long, value_name = "PATH")]
+    token_file: PathBuf,
+    /// Public JWKS file used to verify the compact JWT.
+    #[arg(long, value_name = "PATH", conflicts_with = "jwks_url")]
+    jwks_file: Option<PathBuf>,
+    /// Public JWKS URL used to verify the compact JWT.
+    #[arg(long, value_name = "URL", conflicts_with = "jwks_file")]
+    jwks_url: Option<String>,
+    /// Output style. All styles redact the compact token.
+    #[arg(long, value_enum, default_value = "redacted")]
+    output: ExchangeOutputFormat,
 }
 
 #[derive(Debug, Args)]
@@ -280,6 +359,14 @@ async fn run(cli: Cli) -> Result<String, CliError> {
         },
         Command::Pqc { command } => match command {
             PqcCommand::Preflight => run_pqc_preflight(),
+            PqcCommand::Key { command } => match command {
+                PqcKeyCommand::Generate(args) => generate_pqc_key(args),
+                PqcKeyCommand::Inspect(args) => inspect_pqc_key(&args.file),
+                PqcKeyCommand::Rotate(args) => rotate_pqc_key(args),
+            },
+        },
+        Command::Token { command } => match command {
+            TokenCommand::Verify(args) => verify_token(args).await,
         },
         Command::Exchange(args) => run_exchange(*args).await,
     }
@@ -377,6 +464,188 @@ fn run_pqc_preflight() -> Result<String, CliError> {
 
     lines.push(String::new());
     Ok(lines.join("\n"))
+}
+
+#[cfg(feature = "pqc-openssl-unstable")]
+fn parse_mldsa_algorithm(value: &str) -> Result<MlDsaAlgorithm, CliError> {
+    MlDsaAlgorithm::from_jose_alg(value)
+        .or_else(|| MlDsaAlgorithm::from_selector(value))
+        .ok_or_else(|| CliError::usage("PQC algorithm must be ML-DSA-44, ML-DSA-65, or ML-DSA-87"))
+}
+
+fn generate_pqc_key(args: PqcKeyGenerateArgs) -> Result<String, CliError> {
+    #[cfg(not(feature = "pqc-openssl-unstable"))]
+    {
+        let _ = args;
+        Err(CliError::runtime("pqc key generate requires the pqc-openssl-unstable feature"))
+    }
+
+    #[cfg(feature = "pqc-openssl-unstable")]
+    {
+        let algorithm = parse_mldsa_algorithm(&args.alg)?;
+        let generated = MlDsaJoseSigner::generate_private_jwk(algorithm, args.kid.as_deref())
+            .map_err(|err| CliError::runtime(format!("failed to generate ML-DSA key: {err}")))?;
+        write_secret_text(&args.out, &generated.private_jwk_json, 0o600, args.force)?;
+        if let Some(path) = &args.public_jwks_out {
+            atomic_write_json_if_allowed(
+                path,
+                &JwksDocument::new(vec![generated.public_jwk.clone()]),
+                0o644,
+                args.force,
+            )?;
+        }
+        Ok(format!(
+            "pqc_key_status=generated\nprivate_key_file={}\nprivate_key_mode=0600\nalg={}\nkty=AKP\nkid={}\npublic_key_sha256_prefix={}\npublic_jwks_file={}\n",
+            sanitize_path(&args.out),
+            generated.public_jwk.alg,
+            sanitize(&generated.public_jwk.kid),
+            akp_public_sha256_prefix(&generated.public_jwk)?,
+            args.public_jwks_out
+                .as_deref()
+                .map(sanitize_path)
+                .unwrap_or_else(|| "(not-written)".to_string()),
+        ))
+    }
+}
+
+fn inspect_pqc_key(path: &Path) -> Result<String, CliError> {
+    let raw = fs::read_to_string(path).map_err(|err| {
+        CliError::runtime(format!("failed to read PQC key file {}: {err}", sanitize_path(path)))
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| CliError::usage(format!("PQC key file is invalid JSON: {err}")))?;
+    if value.get("priv").is_some() {
+        return inspect_pqc_private_key(&raw);
+    }
+    let keys = normalize_jwks_value(&value)?;
+    let inspected = inspect_public_keys(&keys)?;
+    Ok(render_inspection(&inspected, InspectMode::Jwks))
+}
+
+fn inspect_pqc_private_key(raw: &str) -> Result<String, CliError> {
+    #[cfg(not(feature = "pqc-openssl-unstable"))]
+    {
+        let _ = raw;
+        Err(CliError::runtime(
+            "pqc key inspect for private AKP JWK requires the pqc-openssl-unstable feature",
+        ))
+    }
+
+    #[cfg(feature = "pqc-openssl-unstable")]
+    {
+        let value: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|err| CliError::usage(format!("PQC private key JSON is invalid: {err}")))?;
+        let alg = value
+            .get("alg")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| CliError::usage("PQC private key missing alg"))?;
+        let signer = MlDsaJoseSigner::from_private_jwk_for_backend(
+            &sts_jose::BackendSelection::parse(alg),
+            raw,
+            "",
+        )
+        .map_err(|err| CliError::usage(format!("PQC private key is invalid: {err}")))?;
+        let public = signer.public_jwks().keys[0].clone();
+        Ok(format!(
+            "pqc_key_status=private-valid\nalg={}\nkty=AKP\nkid={}\npublic_key_bytes={}\npublic_key_sha256_prefix={}\nprivate_material=redacted\n",
+            public.alg,
+            sanitize(&public.kid),
+            akp_public_bytes(&public)?,
+            akp_public_sha256_prefix(&public)?,
+        ))
+    }
+}
+
+fn rotate_pqc_key(args: PqcKeyRotateArgs) -> Result<String, CliError> {
+    #[cfg(not(feature = "pqc-openssl-unstable"))]
+    {
+        let _ = args;
+        Err(CliError::runtime("pqc key rotate requires the pqc-openssl-unstable feature"))
+    }
+
+    #[cfg(feature = "pqc-openssl-unstable")]
+    {
+        let current = load_current_pqc_signing_key(&args.key_file)?;
+        let overlap = load_existing_overlap(&args.extra_jwks_file)?;
+        if args.dry_run {
+            return Ok(format!(
+                "pqc_rotate_status=dry_run\ncurrent_kid={}\ncurrent_alg={}\nwould_stage_kid={}\nwould_overlap_keys={}\nprivate_key_file={}\noverlap_jwks_file={}\nrestart_required=true\n",
+                sanitize(&current.kid),
+                current.alg,
+                sanitize(&current.kid),
+                overlap.iter().filter(|key| key.kid != current.kid).count() + 1,
+                sanitize_path(&args.key_file),
+                sanitize_path(&args.extra_jwks_file),
+            ));
+        }
+
+        let _lock = RotationLock::acquire(&args.key_file)?;
+        let algorithm = parse_mldsa_algorithm(&current.alg)?;
+        let generated = MlDsaJoseSigner::generate_private_jwk(algorithm, args.kid.as_deref())
+            .map_err(|err| {
+                CliError::runtime(format!("failed to generate replacement ML-DSA key: {err}"))
+            })?;
+        let mut retained = vec![current.clone()];
+        for key in overlap {
+            if key.kid != current.kid && key.kid != generated.public_jwk.kid {
+                retained.push(key);
+            }
+        }
+        atomic_write_json(&args.extra_jwks_file, &JwksDocument::new(retained), 0o644)?;
+        atomic_write_text(&args.key_file, &generated.private_jwk_json, 0o600)?;
+        Ok(format!(
+            "pqc_rotate_status=rotated\nold_kid={}\nnew_kid={}\nalg={}\nprivate_key_file={}\nprivate_key_mode=0600\noverlap_jwks_file={}\nrestart_required=true\n",
+            sanitize(&current.kid),
+            sanitize(&generated.public_jwk.kid),
+            generated.public_jwk.alg,
+            sanitize_path(&args.key_file),
+            sanitize_path(&args.extra_jwks_file),
+        ))
+    }
+}
+
+async fn verify_token(args: TokenVerifyArgs) -> Result<String, CliError> {
+    let token = read_secret_file(&args.token_file, "token")?;
+    let client = reqwest::Client::new();
+    let (jwks, source) =
+        load_jwks_for_verification(args.jwks_file.as_deref(), args.jwks_url.as_deref(), &client)
+            .await?;
+    let verified = verify_claims_against_jwks_with_header::<serde_json::Value>(&token, &jwks)
+        .map_err(|err| {
+            CliError::runtime(format!(
+                "token verification failed: {}",
+                sanitize_oauth_text(&err.to_string())
+            ))
+        })?;
+    let mut safe = serde_json::Map::new();
+    safe.insert("token_verify_status".to_string(), serde_json::json!("ok"));
+    safe.insert(
+        "access_token_sha256_prefix".to_string(),
+        serde_json::json!(sha256_hex_prefix(&token)),
+    );
+    safe.insert("jwt_signature_verified".to_string(), serde_json::json!(true));
+    safe.insert("jwt_verification_source".to_string(), serde_json::json!(source));
+    safe.insert("jwt_header_alg".to_string(), serde_json::json!(sanitize(&verified.alg)));
+    safe.insert("jwt_header_kid".to_string(), serde_json::json!(sanitize(&verified.kid)));
+    safe.insert("claims".to_string(), safe_claims_summary(&verified.claims));
+
+    match args.output {
+        ExchangeOutputFormat::Redacted => Ok(render_token_verify_map_lines(&safe)),
+        ExchangeOutputFormat::Claims => {
+            let mut output = serde_json::to_string_pretty(
+                safe.get("claims").unwrap_or(&serde_json::Value::Object(safe.clone())),
+            )
+            .unwrap_or_else(|_| "{}".to_string());
+            output.push('\n');
+            Ok(output)
+        }
+        ExchangeOutputFormat::Json => {
+            let mut output = serde_json::to_string_pretty(&serde_json::Value::Object(safe))
+                .unwrap_or_else(|_| "{}".to_string());
+            output.push('\n');
+            Ok(output)
+        }
+    }
 }
 
 struct ExchangeHttpRequest {
@@ -565,6 +834,31 @@ fn write_new_secret_text(path: &Path, value: &str, mode: u32) -> Result<(), CliE
         })?;
     }
     Ok(())
+}
+
+#[cfg(feature = "pqc-openssl-unstable")]
+fn write_secret_text(path: &Path, value: &str, mode: u32, force: bool) -> Result<(), CliError> {
+    if force {
+        atomic_write_text(path, value, mode)
+    } else {
+        write_new_secret_text(path, value, mode)
+    }
+}
+
+#[cfg(feature = "pqc-openssl-unstable")]
+fn atomic_write_json_if_allowed(
+    path: &Path,
+    value: &JwksDocument,
+    mode: u32,
+    force: bool,
+) -> Result<(), CliError> {
+    if !force && path.exists() {
+        return Err(CliError::runtime(format!(
+            "refusing to replace existing file {}; pass --force to overwrite",
+            sanitize_path(path)
+        )));
+    }
+    atomic_write_json(path, value, mode)
 }
 
 fn unix_timestamp_now() -> Result<i64, CliError> {
@@ -794,6 +1088,47 @@ async fn load_exchange_jwks(
     Ok(None)
 }
 
+async fn load_jwks_for_verification(
+    jwks_file: Option<&Path>,
+    jwks_url: Option<&str>,
+    client: &reqwest::Client,
+) -> Result<(JwksDocument, String), CliError> {
+    if let Some(path) = jwks_file {
+        let raw = fs::read_to_string(path).map_err(|err| {
+            CliError::runtime(format!("failed to read JWKS file {}: {err}", sanitize_path(path)))
+        })?;
+        return parse_exchange_jwks_document(&raw, "JWKS file")
+            .map(|jwks| (jwks, "file".to_string()));
+    }
+    if let Some(url) = jwks_url {
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            return Err(CliError::usage("JWKS URL must be an http or https URL"));
+        }
+        let response = client.get(url).send().await.map_err(|err| {
+            CliError::runtime(format!(
+                "failed to fetch JWKS URL: {}",
+                sanitize_oauth_text(&err.to_string())
+            ))
+        })?;
+        let status = response.status();
+        let raw = response.text().await.map_err(|err| {
+            CliError::runtime(format!(
+                "failed to read JWKS response body: {}",
+                sanitize_oauth_text(&err.to_string())
+            ))
+        })?;
+        if !status.is_success() {
+            return Err(CliError::runtime(format!(
+                "JWKS URL fetch failed\nhttp_status={}",
+                status.as_u16()
+            )));
+        }
+        return parse_exchange_jwks_document(&raw, "JWKS URL")
+            .map(|jwks| (jwks, "url".to_string()));
+    }
+    Err(CliError::usage("token verify requires --jwks-file or --jwks-url"))
+}
+
 fn parse_exchange_jwks_document(raw: &str, label: &str) -> Result<JwksDocument, CliError> {
     let value: serde_json::Value = serde_json::from_str(raw)
         .map_err(|err| CliError::usage(format!("{label} is invalid JSON: {err}")))?;
@@ -947,6 +1282,41 @@ fn render_exchange_map_lines(
     output
 }
 
+fn render_token_verify_map_lines(safe: &serde_json::Map<String, serde_json::Value>) -> String {
+    let mut output = String::new();
+    for name in [
+        "token_verify_status",
+        "access_token_sha256_prefix",
+        "jwt_signature_verified",
+        "jwt_verification_source",
+        "jwt_header_alg",
+        "jwt_header_kid",
+    ] {
+        if let Some(value) = safe.get(name) {
+            output.push_str(&format!("{name}={}\n", display_json_scalar(value)));
+        }
+    }
+    if let Some(serde_json::Value::Object(claims)) = safe.get("claims") {
+        for name in [
+            "iss",
+            "aud",
+            "scope",
+            "client_id",
+            "sub_sha256_prefix",
+            "jti_sha256_prefix",
+            "act_sub",
+            "cnf_jkt_sha256_prefix",
+            "iat",
+            "exp",
+        ] {
+            if let Some(value) = claims.get(name) {
+                output.push_str(&format!("claims.{name}={}\n", display_json_scalar(value)));
+            }
+        }
+    }
+    output
+}
+
 fn display_json_scalar(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(value) => sanitize(value),
@@ -961,6 +1331,11 @@ fn display_json_scalar(value: &serde_json::Value) -> String {
 
 fn sha256_hex_prefix(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
+    digest.iter().take(8).map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn sha256_bytes_hex_prefix(value: &[u8]) -> String {
+    let digest = Sha256::digest(value);
     digest.iter().take(8).map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -1136,6 +1511,57 @@ fn load_current_signing_key(path: &Path) -> Result<PublicJwk, CliError> {
         .ok_or_else(|| CliError::runtime("current signing key produced no public JWK"))
 }
 
+#[cfg(feature = "pqc-openssl-unstable")]
+fn load_current_pqc_signing_key(path: &Path) -> Result<PublicJwk, CliError> {
+    let raw = fs::read_to_string(path).map_err(|err| {
+        CliError::runtime(format!(
+            "failed to read current PQC signing key {}: {err}",
+            sanitize_path(path)
+        ))
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
+        CliError::usage(format!(
+            "current PQC signing key {} must be an AKP private JWK JSON object: {err}",
+            sanitize_path(path)
+        ))
+    })?;
+    let Some(object) = value.as_object() else {
+        return Err(CliError::usage(format!(
+            "current PQC signing key {} must be an AKP private JWK JSON object",
+            sanitize_path(path)
+        )));
+    };
+    if object.get("priv").is_none()
+        || object.get("kty").and_then(serde_json::Value::as_str) != Some("AKP")
+    {
+        return Err(CliError::usage(format!(
+            "current PQC signing key {} must be an AKP private JWK",
+            sanitize_path(path)
+        )));
+    }
+    let alg = object
+        .get("alg")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| CliError::usage("current PQC signing key missing alg"))?;
+    let signer = MlDsaJoseSigner::from_private_jwk_for_backend(
+        &sts_jose::BackendSelection::parse(alg),
+        &raw,
+        "",
+    )
+    .map_err(|err| {
+        CliError::usage(format!(
+            "current PQC signing key {} is invalid: {err}",
+            sanitize_path(path)
+        ))
+    })?;
+    signer
+        .public_jwks()
+        .keys
+        .into_iter()
+        .next()
+        .ok_or_else(|| CliError::runtime("current PQC signing key produced no public JWK"))
+}
+
 fn load_existing_overlap(path: &Path) -> Result<Vec<PublicJwk>, CliError> {
     let raw = match fs::read_to_string(path) {
         Ok(raw) => raw,
@@ -1160,16 +1586,25 @@ fn parse_public_jwks_document(raw: &str, label: &str) -> Result<Vec<PublicJwk>, 
     for (index, key) in keys.into_iter().enumerate() {
         let jwk: PublicJwk = serde_json::from_value(serde_json::Value::Object(key.clone()))
             .map_err(|err| {
+                CliError::usage(format!("{label} key[{index}] is not a valid public JWK: {err}"))
+            })?;
+        if jwk.kty == "RSA" {
+            let bits = rsa_public_key_bits_from_jwk(&jwk).map_err(|err| {
                 CliError::usage(format!(
                     "{label} key[{index}] is not a valid RSA public JWK: {err}"
                 ))
             })?;
-        let bits = rsa_public_key_bits_from_jwk(&jwk).map_err(|err| {
-            CliError::usage(format!("{label} key[{index}] is not a valid RSA public JWK: {err}"))
-        })?;
-        if bits < 2048 {
+            if bits < 2048 {
+                return Err(CliError::usage(format!(
+                    "{label} key[{index}] RSA modulus must be at least 2048 bits"
+                )));
+            }
+        } else if jwk.kty == "AKP" {
+            let _ = akp_public_bytes(&jwk)?;
+        } else {
             return Err(CliError::usage(format!(
-                "{label} key[{index}] RSA modulus must be at least 2048 bits"
+                "{label} key[{index}] unsupported JWK kty {}",
+                jwk.kty
             )));
         }
         public_keys.push(jwk);
@@ -1346,6 +1781,8 @@ struct InspectedKey {
     use_: Option<String>,
     alg: Option<String>,
     rsa_modulus_bits: Option<usize>,
+    akp_public_bytes: Option<usize>,
+    akp_public_sha256_prefix: Option<String>,
 }
 
 fn inspect_public_keys(
@@ -1364,7 +1801,22 @@ fn inspect_public_keys(
         let alg = optional_string(key, "alg", index)?;
         let rsa_modulus_bits =
             if kty == "RSA" { Some(rsa_modulus_bits_from_key(key, index)?) } else { None };
-        inspected.push(InspectedKey { index, kid, kty, use_, alg, rsa_modulus_bits });
+        let (akp_public_bytes, akp_public_sha256_prefix) = if kty == "AKP" {
+            let public = akp_public_from_key(key, index)?;
+            (Some(public.len()), Some(sha256_bytes_hex_prefix(&public)))
+        } else {
+            (None, None)
+        };
+        inspected.push(InspectedKey {
+            index,
+            kid,
+            kty,
+            use_,
+            alg,
+            rsa_modulus_bits,
+            akp_public_bytes,
+            akp_public_sha256_prefix,
+        });
     }
     Ok(inspected)
 }
@@ -1416,6 +1868,51 @@ fn decode_base64url_uint(member: &str, value: &str, index: usize) -> Result<Vec<
         .map_err(|_| CliError::usage(format!("key[{index}] member {member} is not base64url")))
 }
 
+fn akp_public_from_key(
+    key: &serde_json::Map<String, serde_json::Value>,
+    index: usize,
+) -> Result<Vec<u8>, CliError> {
+    if key.get("n").is_some() || key.get("e").is_some() {
+        return Err(CliError::usage(format!(
+            "key[{index}] AKP key must not contain RSA n/e members"
+        )));
+    }
+    let alg = required_string(key, "alg", index)?;
+    let algorithm = sts_jose::MlDsaAlgorithm::from_jose_alg(&alg)
+        .ok_or_else(|| CliError::usage(format!("key[{index}] unsupported AKP alg {alg}")))?;
+    let public = required_string(key, "pub", index)?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(public)
+        .map_err(|_| CliError::usage(format!("key[{index}] member pub is not base64url")))?;
+    if bytes.len() != algorithm.public_key_len() {
+        return Err(CliError::usage(format!(
+            "key[{index}] AKP pub length must be {} bytes for {}",
+            algorithm.public_key_len(),
+            algorithm.jose_alg()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn akp_public_bytes(jwk: &PublicJwk) -> Result<usize, CliError> {
+    let value = serde_json::to_value(jwk)
+        .map_err(|err| CliError::runtime(format!("failed to inspect public JWK: {err}")))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| CliError::runtime("public JWK did not serialize to an object"))?;
+    akp_public_from_key(object, 0).map(|bytes| bytes.len())
+}
+
+#[cfg(feature = "pqc-openssl-unstable")]
+fn akp_public_sha256_prefix(jwk: &PublicJwk) -> Result<String, CliError> {
+    let value = serde_json::to_value(jwk)
+        .map_err(|err| CliError::runtime(format!("failed to inspect public JWK: {err}")))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| CliError::runtime("public JWK did not serialize to an object"))?;
+    akp_public_from_key(object, 0).map(|bytes| sha256_bytes_hex_prefix(&bytes))
+}
+
 fn render_inspection(keys: &[InspectedKey], mode: InspectMode) -> String {
     let mut output = String::new();
     match mode {
@@ -1434,6 +1931,16 @@ fn render_inspection(keys: &[InspectedKey], mode: InspectMode) -> String {
         output.push_str(&format!("key[{}].alg={}\n", key.index, display_optional(&key.alg)));
         if let Some(bits) = key.rsa_modulus_bits {
             output.push_str(&format!("key[{}].rsa_modulus_bits={bits}\n", key.index));
+        }
+        if let Some(bytes) = key.akp_public_bytes {
+            output.push_str(&format!("key[{}].akp_public_bytes={bytes}\n", key.index));
+        }
+        if let Some(prefix) = &key.akp_public_sha256_prefix {
+            output.push_str(&format!(
+                "key[{}].akp_public_sha256_prefix={}\n",
+                key.index,
+                sanitize(prefix)
+            ));
         }
     }
     output
@@ -1535,6 +2042,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parser_accepts_pqc_key_generate_command() {
+        let cli = Cli::try_parse_from([
+            "sts-cli",
+            "pqc",
+            "key",
+            "generate",
+            "--alg",
+            "ML-DSA-65",
+            "--kid",
+            "ml-key",
+            "--out",
+            "mldsa-private.json",
+            "--public-jwks-out",
+            "mldsa-public.jwks.json",
+        ])
+        .expect("parse pqc key generate");
+        match cli.command {
+            Command::Pqc {
+                command: PqcCommand::Key { command: PqcKeyCommand::Generate(args) },
+            } => {
+                assert_eq!(args.alg, "ML-DSA-65");
+                assert_eq!(args.kid.as_deref(), Some("ml-key"));
+                assert_eq!(args.out, PathBuf::from("mldsa-private.json"));
+                assert_eq!(args.public_jwks_out, Some(PathBuf::from("mldsa-public.jwks.json")));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_accepts_pqc_key_rotate_command() {
+        let cli = Cli::try_parse_from([
+            "sts-cli",
+            "pqc",
+            "key",
+            "rotate",
+            "--key-file",
+            "mldsa-private.json",
+            "--extra-jwks-file",
+            "mldsa-retiring.jwks.json",
+            "--kid",
+            "new-ml-key",
+            "--dry-run",
+        ])
+        .expect("parse pqc key rotate");
+        match cli.command {
+            Command::Pqc { command: PqcCommand::Key { command: PqcKeyCommand::Rotate(args) } } => {
+                assert_eq!(args.key_file, PathBuf::from("mldsa-private.json"));
+                assert_eq!(args.extra_jwks_file, PathBuf::from("mldsa-retiring.jwks.json"));
+                assert_eq!(args.kid.as_deref(), Some("new-ml-key"));
+                assert!(args.dry_run);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_accepts_token_verify_command() {
+        let cli = Cli::try_parse_from([
+            "sts-cli",
+            "token",
+            "verify",
+            "--token-file",
+            "token.jwt",
+            "--jwks-file",
+            "jwks.json",
+        ])
+        .expect("parse token verify");
+        match cli.command {
+            Command::Token { command: TokenCommand::Verify(args) } => {
+                assert_eq!(args.token_file, PathBuf::from("token.jwt"));
+                assert_eq!(args.jwks_file, Some(PathBuf::from("jwks.json")));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
     #[cfg(not(feature = "pqc-openssl-unstable"))]
     #[tokio::test]
     async fn pqc_preflight_reports_not_compiled_without_feature() {
@@ -1561,6 +2146,225 @@ mod tests {
         assert!(output.contains("ML-DSA-87_sign_verify=ok"));
         assert!(!output.contains("eyJ"));
         assert!(!output.contains("priv"));
+    }
+
+    #[cfg(feature = "pqc-openssl-unstable")]
+    #[test]
+    fn pqc_key_generate_and_inspect_do_not_print_private_material() {
+        let dir = unique_temp_dir("sts-cli-pqc-key");
+        let private_file = dir.join("mldsa-private.json");
+        let public_file = dir.join("mldsa-public.jwks.json");
+        let output = generate_pqc_key(PqcKeyGenerateArgs {
+            alg: "ML-DSA-65".to_string(),
+            kid: Some("ml-key".to_string()),
+            out: private_file.clone(),
+            public_jwks_out: Some(public_file.clone()),
+            force: false,
+        })
+        .expect("generate pqc key");
+
+        assert!(output.contains("pqc_key_status=generated"));
+        assert!(output.contains("alg=ML-DSA-65"));
+        assert!(output.contains("kid=ml-key"));
+        assert!(!output.contains("\"priv\""));
+        assert!(fs::read_to_string(&private_file).expect("private").contains("\"priv\""));
+        let public = fs::read_to_string(&public_file).expect("public");
+        assert!(public.contains("\"pub\""));
+        assert!(!public.contains("\"priv\""));
+
+        let private_inspect = inspect_pqc_key(&private_file).expect("inspect private");
+        assert!(private_inspect.contains("pqc_key_status=private-valid"));
+        assert!(private_inspect.contains("private_material=redacted"));
+        assert!(!private_inspect.contains("\"priv\""));
+
+        let public_inspect = inspect_pqc_key(&public_file).expect("inspect public");
+        assert!(public_inspect.contains("jwks_status=public"));
+        assert!(public_inspect.contains("key[0].kty=AKP"));
+        assert!(public_inspect.contains("key[0].alg=ML-DSA-65"));
+        assert!(public_inspect.contains("key[0].akp_public_bytes=1952"));
+
+        let err = generate_pqc_key(PqcKeyGenerateArgs {
+            alg: "ML-DSA-65".to_string(),
+            kid: Some("ml-key".to_string()),
+            out: private_file,
+            public_jwks_out: None,
+            force: false,
+        })
+        .unwrap_err();
+        assert!(err.message.contains("failed to create secret file"));
+    }
+
+    #[cfg(feature = "pqc-openssl-unstable")]
+    #[tokio::test]
+    async fn pqc_key_rotate_dry_run_validates_without_writing_files() {
+        let dir = unique_temp_dir("sts-cli-pqc-rotate-dry-run");
+        let key_file = dir.join("sts_mldsa_private.json");
+        let overlap_file = dir.join("sts_mldsa_retiring.jwks.json");
+        let (old_private, _) = mldsa_private_jwk_with_kid("old-ml-kid");
+        fs::write(&key_file, &old_private).expect("write current key");
+
+        let output = run(Cli {
+            command: Command::Pqc {
+                command: PqcCommand::Key {
+                    command: PqcKeyCommand::Rotate(PqcKeyRotateArgs {
+                        key_file: key_file.clone(),
+                        extra_jwks_file: overlap_file.clone(),
+                        kid: Some("new-ml-kid".to_string()),
+                        dry_run: true,
+                    }),
+                },
+            },
+        })
+        .await
+        .expect("dry run");
+
+        assert!(output.contains("pqc_rotate_status=dry_run"));
+        assert!(output.contains("current_kid=old-ml-kid"));
+        assert!(output.contains("current_alg=ML-DSA-65"));
+        assert!(output.contains("would_overlap_keys=1"));
+        assert_eq!(fs::read_to_string(&key_file).expect("read current key"), old_private);
+        assert!(!overlap_file.exists());
+        assert!(!output.contains("\"priv\""));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "pqc-openssl-unstable")]
+    #[tokio::test]
+    async fn pqc_key_rotate_stages_old_public_key_before_replacing_private_key() {
+        let dir = unique_temp_dir("sts-cli-pqc-rotate-success");
+        let key_file = dir.join("sts_mldsa_private.json");
+        let overlap_file = dir.join("sts_mldsa_retiring.jwks.json");
+        let (old_private, old_public) = mldsa_private_jwk_with_kid("old-ml-kid");
+        let (_, older_public) = mldsa_private_jwk_with_kid("older-ml-kid");
+        fs::write(&key_file, old_private).expect("write current key");
+        write_jwks(&overlap_file, vec![older_public.clone()]);
+
+        let output = run(Cli {
+            command: Command::Pqc {
+                command: PqcCommand::Key {
+                    command: PqcKeyCommand::Rotate(PqcKeyRotateArgs {
+                        key_file: key_file.clone(),
+                        extra_jwks_file: overlap_file.clone(),
+                        kid: Some("new-ml-kid".to_string()),
+                        dry_run: false,
+                    }),
+                },
+            },
+        })
+        .await
+        .expect("rotate");
+
+        assert!(output.contains("pqc_rotate_status=rotated"));
+        assert!(output.contains("old_kid=old-ml-kid"));
+        assert!(output.contains("new_kid=new-ml-kid"));
+        assert!(output.contains("private_key_mode=0600"));
+        assert!(!output.contains("\"priv\""));
+
+        let new_private = fs::read_to_string(&key_file).expect("read new private key");
+        let new_value: serde_json::Value =
+            serde_json::from_str(&new_private).expect("new private key JSON");
+        assert_eq!(new_value.get("kid").and_then(serde_json::Value::as_str), Some("new-ml-kid"));
+        assert_eq!(new_value.get("kty").and_then(serde_json::Value::as_str), Some("AKP"));
+        assert_eq!(new_value.get("alg").and_then(serde_json::Value::as_str), Some("ML-DSA-65"));
+        assert!(new_value.get("priv").is_some());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&key_file).expect("key metadata").permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(&overlap_file).expect("overlap metadata").permissions().mode() & 0o777,
+                0o644
+            );
+        }
+
+        let overlap = read_jwks(&overlap_file);
+        let kids: BTreeSet<String> = overlap.keys.iter().map(|key| key.kid.clone()).collect();
+        assert_eq!(kids, BTreeSet::from(["older-ml-kid".to_string(), "old-ml-kid".to_string()]));
+        let staged_old = overlap.keys.iter().find(|key| key.kid == "old-ml-kid").expect("old key");
+        assert_eq!(staged_old, &old_public);
+        let raw_overlap = fs::read_to_string(&overlap_file).expect("read overlap");
+        assert!(!raw_overlap.contains("\"priv\""));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "pqc-openssl-unstable")]
+    #[tokio::test]
+    async fn pqc_key_rotate_rejects_public_current_key_without_writing_overlap() {
+        let dir = unique_temp_dir("sts-cli-pqc-rotate-public-current");
+        let key_file = dir.join("sts_mldsa_public.json");
+        let overlap_file = dir.join("sts_mldsa_retiring.jwks.json");
+        let (_, old_public) = mldsa_private_jwk_with_kid("public-only-ml");
+        fs::write(&key_file, serde_json::to_string(&old_public).expect("public jwk"))
+            .expect("write public current key");
+
+        let err = run(Cli {
+            command: Command::Pqc {
+                command: PqcCommand::Key {
+                    command: PqcKeyCommand::Rotate(PqcKeyRotateArgs {
+                        key_file: key_file.clone(),
+                        extra_jwks_file: overlap_file.clone(),
+                        kid: None,
+                        dry_run: false,
+                    }),
+                },
+            },
+        })
+        .await
+        .expect_err("public key must fail");
+
+        assert_eq!(err.code, 2);
+        assert!(err.message.contains("must be an AKP private JWK"));
+        assert!(!overlap_file.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "pqc-openssl-unstable")]
+    #[tokio::test]
+    async fn token_verify_accepts_mldsa_akp_jwks_and_redacts_token() {
+        let dir = unique_temp_dir("sts-cli-token-verify-mldsa");
+        let token_file = dir.join("token.jwt");
+        let jwks_file = dir.join("jwks.json");
+        let generated =
+            MlDsaJoseSigner::generate_private_jwk(MlDsaAlgorithm::MlDsa65, Some("sts-mldsa-kid"))
+                .expect("generated mldsa");
+        let signer = MlDsaJoseSigner::from_private_jwk_for_backend(
+            &sts_jose::BackendSelection::parse("ML-DSA-65"),
+            &generated.private_jwk_json,
+            "",
+        )
+        .expect("signer");
+        let token = signer
+            .sign_json_claims(&serde_json::json!({
+                "iss": "http://127.0.0.1:8888/tenant1",
+                "sub": "user@example.com",
+                "aud": "api://chat-mcp",
+                "scope": "chat.read",
+                "act": {"sub": "chat-mcp"},
+                "iat": 1_000,
+                "exp": 2_000,
+                "jti": "minted-jti-secret"
+            }))
+            .expect("sign token");
+        fs::write(&token_file, &token).expect("write token");
+        write_jwks(&jwks_file, signer.public_jwks().keys);
+
+        let output = verify_token(TokenVerifyArgs {
+            token_file,
+            jwks_file: Some(jwks_file),
+            jwks_url: None,
+            output: ExchangeOutputFormat::Redacted,
+        })
+        .await
+        .expect("verify token");
+        assert!(output.contains("token_verify_status=ok"));
+        assert!(output.contains("jwt_signature_verified=true"));
+        assert!(output.contains("jwt_header_alg=ML-DSA-65"));
+        assert!(output.contains("claims.act_sub=chat-mcp"));
+        assert!(!output.contains(&token));
+        assert!(!output.contains("minted-jti-secret"));
     }
 
     #[test]
@@ -2267,6 +3071,20 @@ mod tests {
             RsaJoseSigner::from_private_jwk(&private_jwk, "fallback").expect("parse private jwk");
         let public = signer.public_jwks().keys.into_iter().next().expect("public jwk");
         (private_jwk, public)
+    }
+
+    #[cfg(feature = "pqc-openssl-unstable")]
+    fn mldsa_private_jwk_with_kid(kid: &str) -> (String, PublicJwk) {
+        let generated = MlDsaJoseSigner::generate_private_jwk(MlDsaAlgorithm::MlDsa65, Some(kid))
+            .expect("generate mldsa key");
+        let signer = MlDsaJoseSigner::from_private_jwk_for_backend(
+            &sts_jose::BackendSelection::parse("ML-DSA-65"),
+            &generated.private_jwk_json,
+            "",
+        )
+        .expect("parse mldsa private jwk");
+        let public = signer.public_jwks().keys.into_iter().next().expect("public jwk");
+        (generated.private_jwk_json, public)
     }
 
     fn write_jwks(path: &Path, keys: Vec<PublicJwk>) {

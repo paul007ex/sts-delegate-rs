@@ -32,10 +32,24 @@ REPO = Path(__file__).resolve().parents[1]
 DEFAULT_ENV_FILE = Path("/Users/Shared/claude/obo-lab/okta.env")
 DEFAULT_SUBJECT_TOKEN_FILE = Path("/Users/Shared/claude/obo-lab/user_access_token.txt")
 DEFAULT_STS_PRIVATE_JWK_FILE = Path("/Users/Shared/claude/obo-lab/secrets/obo_sts_private_key.json")
+DEFAULT_MCP_CONFIG = Path("/Users/Shared/claude/obo-lab/.mcp.json")
+DEFAULT_FASTMCP_PYTHON = Path("/Users/Shared/claude/obo-lab/.venv/bin/python3")
 
 ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
 JWT_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:jwt"
 TOKEN_EXCHANGE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange"
+PQC_SIGNING_ALG = "ML-DSA-65"
+
+MCP_TARGET_SPECS = {
+    "chat-mcp": ("api://chat-mcp", "chat.read"),
+    "databricks-mcp": ("api://databricks-mcp", "databricks.read"),
+    "servicenow-mcp": ("api://servicenow-mcp", "servicenow.read"),
+}
+MCP_TOOL_PROBES = {
+    "chat-mcp": ("say", {"message": "hello from sts-delegate-rs PQC canary"}),
+    "databricks-mcp": ("run_sql_query", {"sql": "SELECT 1"}),
+    "servicenow-mcp": ("list_incidents", {}),
+}
 
 TOKEN_FIELD_NAMES = {
     "access_token",
@@ -52,6 +66,75 @@ BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 SECRET_QUERY_RE = re.compile(
     r"(?i)([?&](?:access_token|subject_token|actor_token|client_assertion|client_secret|authorization)=)[^&\s]+"
 )
+
+FASTMCP_CLIENT_PROGRAM = r"""
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import sys
+
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
+
+
+JWT_RE = re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\b")
+
+
+def safe_data_summary(data):
+    if not isinstance(data, dict):
+        return {"data_type": type(data).__name__}
+    summary = {"data_keys": sorted(str(key) for key in data)}
+    via_actor = data.get("via_actor")
+    if isinstance(via_actor, dict):
+        summary["via_actor"] = via_actor.get("sub")
+    elif isinstance(via_actor, str) and not JWT_RE.search(via_actor):
+        summary["via_actor"] = via_actor[:120]
+    for key in ("sub", "aud", "scope", "iss", "actor", "tool"):
+        value = data.get(key)
+        if isinstance(value, str) and not JWT_RE.search(value):
+            summary[key] = value[:160]
+    return summary
+
+
+async def call_one(server: dict) -> dict:
+    transport = StreamableHttpTransport(server["url"], headers=server["headers"])
+    async with Client(transport) as client:
+        tools = await client.list_tools()
+        tool_names = sorted(tool.name for tool in tools)
+        result = {"tools": tool_names}
+        identity_tools = [name for name in ("whoami", "incoming", "outgoing") if name in tool_names]
+        identity_results = {}
+        for tool_name in identity_tools:
+            response = await client.call_tool(tool_name, {})
+            identity_results[tool_name] = safe_data_summary(getattr(response, "data", None))
+        if identity_results:
+            result["identity"] = identity_results
+        tool_name = server.get("tool")
+        if tool_name:
+            response = await client.call_tool(tool_name, server.get("args") or {})
+            result["tool"] = tool_name
+            result["tool_call"] = safe_data_summary(getattr(response, "data", None))
+            result["call_status"] = "ok"
+        else:
+            result["call_status"] = "no_tool_probe"
+        return result
+
+
+async def main() -> None:
+    payload = json.load(sys.stdin)
+    results = {}
+    for name, server in sorted(payload["servers"].items()):
+        try:
+            results[name] = {"ok": True, **await call_one(server)}
+        except Exception as exc:  # noqa: BLE001 - subprocess output is parsed and redacted by caller.
+            results[name] = {"ok": False, "error_type": type(exc).__name__, "message": str(exc)[:300]}
+    print(json.dumps(results, sort_keys=True))
+
+
+asyncio.run(main())
+"""
 
 
 class CanaryError(RuntimeError):
@@ -190,6 +273,16 @@ def jwt_claims_unverified(token: str) -> dict[str, Any]:
     return claims
 
 
+def jwt_header_unverified(token: str) -> dict[str, Any]:
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise CanaryError("token is not a compact JWT")
+    header = json.loads(b64url_decode(parts[0]))
+    if not isinstance(header, dict):
+        raise CanaryError("JWT header is not an object")
+    return header
+
+
 def jwk_int(jwk: dict[str, Any], name: str) -> int:
     value = jwk.get(name)
     if not isinstance(value, str) or not value:
@@ -246,17 +339,19 @@ def generate_actor_private_jwk(actor_id: str) -> dict[str, str]:
     return rsa_private_jwk_from_key(key, f"{actor_id}-canary-key")
 
 
-def write_actor_jwks(private_jwk: dict[str, Any], directory: Path) -> Path:
+def write_actor_jwks(private_jwks: list[dict[str, Any]], directory: Path) -> Path:
+    if not private_jwks:
+        raise CanaryError("at least one actor JWK is required")
     path = directory / "actor_jwks.json"
     path.write_text(
-        json.dumps({"keys": [public_jwk_from_private_jwk(private_jwk)]}, sort_keys=True),
+        json.dumps({"keys": [public_jwk_from_private_jwk(jwk) for jwk in private_jwks]}, sort_keys=True),
         encoding="utf-8",
     )
     path.chmod(0o600)
     log(
         "actor_jwks_ready",
-        key_count=1,
-        actor_id=str(private_jwk.get("kid", "")).split("-canary-key")[0],
+        key_count=len(private_jwks),
+        actor_ids=[str(jwk.get("kid", "")).split("-canary-key")[0] for jwk in private_jwks],
         actor_jwks_file=str(path),
         actor_jwks_file_sha256_prefix=file_sha256_prefix(path),
     )
@@ -368,6 +463,54 @@ def verify_rs256_jwt_against_jwks(token: str, jwks: dict[str, Any]) -> dict[str,
     return jwt_claims_unverified(token)
 
 
+def verify_token_with_cli(
+    binary: Path,
+    *,
+    token: str,
+    jwks: dict[str, Any],
+    directory: Path,
+    label: str,
+    expected_alg: str,
+) -> dict[str, Any]:
+    header = jwt_header_unverified(token)
+    if header.get("alg") != expected_alg:
+        raise CanaryError(f"{label} minted token alg mismatch")
+    token_file = directory / f"{label}_access_token.jwt"
+    jwks_file = directory / f"{label}_rust_jwks.json"
+    token_file.write_text(token, encoding="utf-8")
+    jwks_file.write_text(json.dumps(jwks, sort_keys=True), encoding="utf-8")
+    token_file.chmod(0o600)
+    jwks_file.chmod(0o600)
+    output = run_cli(
+        binary,
+        [
+            "token",
+            "verify",
+            "--token-file",
+            str(token_file),
+            "--jwks-file",
+            str(jwks_file),
+        ],
+        timeout=60,
+    )
+    for expected in (
+        "token_verify_status=ok",
+        "jwt_signature_verified=true",
+        f"jwt_header_alg={expected_alg}",
+    ):
+        if expected not in output:
+            raise CanaryError(f"sts-cli token verify output missing {expected}")
+    log(
+        "token_verify_pass",
+        label=label,
+        jwt_header_alg=expected_alg,
+        token_sha256_prefix=sha256_prefix(token),
+        token_len=len(token),
+        output_sha256_prefix=sha256_prefix(output),
+    )
+    return jwt_claims_unverified(token)
+
+
 def free_loopback_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -382,22 +525,30 @@ def file_sha256_prefix(path: Path) -> str:
     return digest.hexdigest()[:16]
 
 
-def build_cli(skip_build: bool) -> Path:
+def build_cli(skip_build: bool, *, pqc: bool) -> Path:
     binary = REPO / "target/debug/sts-cli"
     if not skip_build or not binary.exists():
+        command = ["cargo", "build", "-p", "sts-cli"]
+        if pqc:
+            command.extend(["--features", "pqc-openssl-unstable"])
         completed = subprocess.run(
-            ["cargo", "build", "-p", "sts-cli"],
+            command,
             cwd=REPO,
             text=True,
             capture_output=True,
             check=False,
-            timeout=180,
+            timeout=300,
         )
         if completed.returncode != 0:
             raise CanaryError(f"cargo build failed rc={completed.returncode}: {redact_string(completed.stderr[-500:])}")
     if not binary.exists():
         raise CanaryError("target/debug/sts-cli was not produced")
     log("sts_cli_binary_ready", exe=str(binary), exe_sha256_prefix=file_sha256_prefix(binary))
+    if pqc:
+        preflight = run_cli(binary, ["pqc", "preflight"], timeout=60)
+        if "pqc_openssl_feature_enabled=true" not in preflight or f"{PQC_SIGNING_ALG}_sign_verify=ok" not in preflight:
+            raise CanaryError("sts-cli PQC preflight did not prove OpenSSL ML-DSA readiness")
+        log("sts_cli_pqc_preflight_pass", output_sha256_prefix=sha256_prefix(preflight))
     return binary
 
 
@@ -418,6 +569,98 @@ def run_cli(binary: Path, args: list[str], *, timeout: int = 30) -> str:
     if JWT_RE.search(combined) or BEARER_RE.search(combined):
         raise CanaryError("sts-cli output contained an unredacted token-looking value")
     return completed.stdout
+
+
+def fastmcp_call_servers(
+    servers: dict[str, dict[str, Any]],
+    *,
+    fastmcp_python: Path,
+    timeout: int,
+) -> dict[str, dict[str, Any]]:
+    if not fastmcp_python.exists():
+        raise CanaryError(f"FastMCP Python interpreter missing: {fastmcp_python}")
+    completed = subprocess.run(
+        [str(fastmcp_python), "-c", FASTMCP_CLIENT_PROGRAM],
+        input=json.dumps({"servers": servers}),
+        cwd=REPO,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    if completed.returncode != 0:
+        combined = f"{completed.stdout}\n{completed.stderr}"
+        raise CanaryError(
+            f"FastMCP client subprocess failed rc={completed.returncode}: {redact_string(combined[-700:])}"
+        )
+    try:
+        parsed = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise CanaryError("FastMCP client subprocess returned non-JSON output") from exc
+    if not isinstance(parsed, dict):
+        raise CanaryError("FastMCP client subprocess returned invalid result shape")
+    return {str(name): result for name, result in parsed.items() if isinstance(result, dict)}
+
+
+def mcp_servers_from_config(config_path: Path) -> dict[str, str]:
+    if not config_path.exists():
+        raise CanaryError(f"MCP config missing: {config_path}")
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        raise CanaryError("MCP config has no mcpServers object")
+    urls: dict[str, str] = {}
+    for name, server in sorted(servers.items()):
+        if not isinstance(server, dict):
+            continue
+        url = server.get("url")
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            urls[str(name)] = url
+    if not urls:
+        raise CanaryError("MCP config has no HTTP server URLs")
+    return urls
+
+
+def run_fastmcp_proof(
+    *,
+    mcp_config: Path,
+    fastmcp_python: Path,
+    minted_tokens: dict[str, str],
+    require_mcp: bool,
+) -> None:
+    if not mcp_config.exists():
+        log("mcp_not_configured", config=str(mcp_config), missing=["mcp config"])
+        if require_mcp:
+            raise CanaryError(f"MCP config missing: {mcp_config}")
+        return
+    urls = mcp_servers_from_config(mcp_config)
+    servers: dict[str, dict[str, Any]] = {}
+    for name, token in sorted(minted_tokens.items()):
+        url = urls.get(name)
+        if not url:
+            continue
+        tool_name, tool_args = MCP_TOOL_PROBES.get(name, (None, {}))
+        servers[name] = {
+            "url": url,
+            "headers": {"Authorization": f"Bearer {token}"},
+            "tool": tool_name,
+            "args": tool_args,
+        }
+    if not servers:
+        log("mcp_not_configured", config=str(mcp_config), missing=["matching configured MCP server URLs"])
+        if require_mcp:
+            raise CanaryError("no configured MCP server URL matched minted token targets")
+        return
+    results = fastmcp_call_servers(servers, fastmcp_python=fastmcp_python, timeout=60)
+    failures = [f"{name}:{result.get('error_type', 'error')}" for name, result in results.items() if not result.get("ok")]
+    log(
+        "mcp_fastmcp_calls_checked",
+        config=str(mcp_config),
+        servers={name: {"url": servers[name]["url"], "token_sha256_prefix": sha256_prefix(minted_tokens[name])} for name in servers},
+        results=results,
+    )
+    if require_mcp and failures:
+        raise CanaryError(f"MCP proof failed: {', '.join(failures)}")
 
 
 def process_command(pid: int) -> str | None:
@@ -573,6 +816,27 @@ def exchange_form(subject_token: str, actor_token: str, target_audience: str, ta
     }
 
 
+def canary_targets(config: dict[str, Any], *, prove_mcp: bool) -> dict[str, tuple[str, str]]:
+    targets = {str(config["actor_id"]): (str(config["target_audience"]), str(config["target_scope"]))}
+    if prove_mcp:
+        targets.update(MCP_TARGET_SPECS)
+    return targets
+
+
+def target_policy_for(targets: dict[str, tuple[str, str]], *, pqc: bool) -> dict[str, Any]:
+    policy: dict[str, Any] = {}
+    for _actor_id, (audience, scope) in sorted(targets.items()):
+        entry: dict[str, Any] = {
+            "allowed_scopes": [scope],
+            "default_scopes": [scope],
+        }
+        if pqc:
+            entry["accepted_token_signing_algs"] = [PQC_SIGNING_ALG]
+            entry["pqc_required"] = True
+        policy[audience] = entry
+    return policy
+
+
 def validate_exchange_claims(
     *,
     label: str,
@@ -589,6 +853,8 @@ def validate_exchange_claims(
         raise CanaryError(f"{label} token_type mismatch")
     if response.get("issued_token_type") != ACCESS_TOKEN_TYPE:
         raise CanaryError(f"{label} issued_token_type mismatch")
+    if response.get("signing_alg_selected") not in (None, "RS256", PQC_SIGNING_ALG):
+        raise CanaryError(f"{label} signing_alg_selected is unexpected")
     if claims.get("sub") != subject_claims.get("sub"):
         raise CanaryError(f"{label} did not preserve subject")
     act = claims.get("act")
@@ -605,11 +871,18 @@ def validate_exchange_claims(
 
 
 def safe_claim_event(response: dict[str, Any], claims: dict[str, Any], *, dpop_jkt: str | None = None) -> dict[str, Any]:
+    header = jwt_header_unverified(str(response.get("access_token", "")))
     event = {
         "status": 200,
         "token_type": response.get("token_type"),
         "issued_token_type": response.get("issued_token_type"),
+        "signing_alg_selected": response.get("signing_alg_selected"),
+        "pqc_fallback": response.get("pqc_fallback"),
+        "jwt_header_alg": header.get("alg"),
+        "jwt_header_kid": header.get("kid"),
         "access_token_sha256_prefix": sha256_prefix(str(response.get("access_token", ""))),
+        "access_token_len": len(str(response.get("access_token", ""))),
+        "iss": claims.get("iss"),
         "sub_sha256_prefix": sha256_prefix(str(claims.get("sub", ""))),
         "jti_sha256_prefix": sha256_prefix(str(claims.get("jti", ""))) if claims.get("jti") else None,
         "act_sub": claims.get("act", {}).get("sub") if isinstance(claims.get("act"), dict) else None,
@@ -628,29 +901,56 @@ def run_live(args: argparse.Namespace) -> bool:
     if config is None:
         return not args.require_live
 
-    binary = build_cli(args.skip_build)
+    binary = build_cli(args.skip_build, pqc=args.pqc)
     port = free_loopback_port()
     issuer = f"http://127.0.0.1:{port}/tenant1"
-    target_policy = {
-        config["target_audience"]: {
-            "allowed_scopes": [config["target_scope"]],
-            "default_scopes": [config["target_scope"]],
-        }
-    }
+    targets = canary_targets(config, prove_mcp=args.prove_mcp)
+    actor_ids = sorted(targets)
+    target_policy = target_policy_for(targets, pqc=args.pqc)
     with tempfile.TemporaryDirectory(prefix="sts-rust-canary-") as raw_tmpdir:
         tmpdir = Path(raw_tmpdir)
+        sts_private_jwk_file = Path(config["sts_private_jwk_file"])
+        if args.pqc:
+            sts_private_jwk_file = tmpdir / "sts_mldsa_private.json"
+            sts_public_jwks_file = tmpdir / "sts_mldsa_public.jwks.json"
+            key_output = run_cli(
+                binary,
+                [
+                    "pqc",
+                    "key",
+                    "generate",
+                    "--alg",
+                    PQC_SIGNING_ALG,
+                    "--out",
+                    str(sts_private_jwk_file),
+                    "--public-jwks-out",
+                    str(sts_public_jwks_file),
+                ],
+                timeout=60,
+            )
+            for expected in ("pqc_key_status=generated", f"alg={PQC_SIGNING_ALG}", "private_key_mode=0600"):
+                if expected not in key_output:
+                    raise CanaryError(f"sts-cli PQC key generation output missing {expected}")
+            log(
+                "sts_pqc_key_ready",
+                alg=PQC_SIGNING_ALG,
+                private_key_file=str(sts_private_jwk_file),
+                public_jwks_file=str(sts_public_jwks_file),
+                output_sha256_prefix=sha256_prefix(key_output),
+            )
+
         idp_jwks_file = fetch_idp_jwks_file(config["issuer"], tmpdir)
-        actor_jwk = generate_actor_private_jwk(config["actor_id"])
-        actor_jwks_file = write_actor_jwks(actor_jwk, tmpdir)
+        actor_jwks_by_id = {actor_id: generate_actor_private_jwk(actor_id) for actor_id in actor_ids}
+        actor_jwks_file = write_actor_jwks(list(actor_jwks_by_id.values()), tmpdir)
         process_env = os.environ.copy()
         process_env.update(
             {
                 "IDP_ISSUER": config["issuer"],
                 "EXPECTED_SUBJECT_AUD": config["expected_aud"],
-                "ACTOR_IDS": config["actor_id"],
+                "ACTOR_IDS": ",".join(actor_ids),
                 "OBO_STS_ISSUER": issuer,
                 "STS_HTTP_ADDR": f"127.0.0.1:{port}",
-                "OBO_STS_KEY_FILE": str(config["sts_private_jwk_file"]),
+                "OBO_STS_KEY_FILE": str(sts_private_jwk_file),
                 "IDP_JWKS_FILE": str(idp_jwks_file),
                 "ACTOR_JWKS_FILE": str(actor_jwks_file),
                 "CLIENT_JWKS_FILE": str(actor_jwks_file),
@@ -660,6 +960,15 @@ def run_live(args: argparse.Namespace) -> bool:
                 "SUBJECT_SCOPE_BOUND_REQUIRED": "false",
             }
         )
+        if args.pqc:
+            process_env.update(
+                {
+                    "STS_SIGNING_ALG": PQC_SIGNING_ALG,
+                    "STS_PQC_PREFERRED": "true",
+                    "STS_ALLOW_NON_PQC": "false",
+                    "STS_PQC_PREFERRED_ALGS": PQC_SIGNING_ALG,
+                }
+            )
 
         process = subprocess.Popen(
             [str(binary), "serve"],
@@ -685,15 +994,29 @@ def run_live(args: argparse.Namespace) -> bool:
             jwks = ready["jwks"]
             token_endpoint = metadata["token_endpoint"]
             subject_token = config["subject_token"]
+            primary_actor_jwk = actor_jwks_by_id[str(config["actor_id"])]
+            expected_alg = PQC_SIGNING_ALG if args.pqc else "RS256"
 
-            bearer_actor = actor_assertion(actor_jwk, config["actor_id"], issuer, subject_token)
+            bearer_actor = actor_assertion(primary_actor_jwk, config["actor_id"], issuer, subject_token)
             bearer_status, bearer_body = post_token(
                 token_endpoint,
                 exchange_form(subject_token, bearer_actor, config["target_audience"], config["target_scope"]),
             )
             if bearer_status != 200 or not isinstance(bearer_body, dict) or not isinstance(bearer_body.get("access_token"), str):
                 raise CanaryError(f"Bearer exchange failed status={bearer_status} body={redact(bearer_body)}")
-            bearer_claims = verify_rs256_jwt_against_jwks(str(bearer_body["access_token"]), jwks)
+            if args.pqc:
+                if bearer_body.get("signing_alg_selected") != PQC_SIGNING_ALG or bearer_body.get("pqc_fallback") is not False:
+                    raise CanaryError("Bearer PQC exchange did not use fail-closed ML-DSA signing")
+                bearer_claims = verify_token_with_cli(
+                    binary,
+                    token=str(bearer_body["access_token"]),
+                    jwks=jwks,
+                    directory=tmpdir,
+                    label="bearer",
+                    expected_alg=expected_alg,
+                )
+            else:
+                bearer_claims = verify_rs256_jwt_against_jwks(str(bearer_body["access_token"]), jwks)
             validate_exchange_claims(
                 label="bearer",
                 response=bearer_body,
@@ -714,7 +1037,7 @@ def run_live(args: argparse.Namespace) -> bool:
                 now=int(time.time()),
                 jti=secrets.token_urlsafe(24),
             )
-            dpop_actor = actor_assertion(actor_jwk, config["actor_id"], issuer, subject_token)
+            dpop_actor = actor_assertion(primary_actor_jwk, config["actor_id"], issuer, subject_token)
             dpop_status, dpop_body = post_token(
                 token_endpoint,
                 exchange_form(subject_token, dpop_actor, config["target_audience"], config["target_scope"]),
@@ -722,7 +1045,19 @@ def run_live(args: argparse.Namespace) -> bool:
             )
             if dpop_status != 200 or not isinstance(dpop_body, dict) or not isinstance(dpop_body.get("access_token"), str):
                 raise CanaryError(f"DPoP exchange failed status={dpop_status} body={redact(dpop_body)}")
-            dpop_claims = verify_rs256_jwt_against_jwks(str(dpop_body["access_token"]), jwks)
+            if args.pqc:
+                if dpop_body.get("signing_alg_selected") != PQC_SIGNING_ALG or dpop_body.get("pqc_fallback") is not False:
+                    raise CanaryError("DPoP PQC exchange did not use fail-closed ML-DSA signing")
+                dpop_claims = verify_token_with_cli(
+                    binary,
+                    token=str(dpop_body["access_token"]),
+                    jwks=jwks,
+                    directory=tmpdir,
+                    label="dpop",
+                    expected_alg=expected_alg,
+                )
+            else:
+                dpop_claims = verify_rs256_jwt_against_jwks(str(dpop_body["access_token"]), jwks)
             validate_exchange_claims(
                 label="dpop",
                 response=dpop_body,
@@ -736,7 +1071,7 @@ def run_live(args: argparse.Namespace) -> bool:
             )
             log("dpop_exchange_pass", **safe_claim_event(dpop_body, dpop_claims, dpop_jkt=dpop_jkt))
 
-            replay_actor = actor_assertion(actor_jwk, config["actor_id"], issuer, subject_token)
+            replay_actor = actor_assertion(primary_actor_jwk, config["actor_id"], issuer, subject_token)
             replay_status, replay_body = post_token(
                 token_endpoint,
                 exchange_form(subject_token, replay_actor, config["target_audience"], config["target_scope"]),
@@ -751,7 +1086,7 @@ def run_live(args: argparse.Namespace) -> bool:
             cli_jwks_file = tmpdir / "cli_rust_jwks.json"
             cli_dpop_key_file = tmpdir / "cli_dpop_holder_private_jwk.json"
             cli_subject_file.write_text(subject_token, encoding="utf-8")
-            cli_actor = actor_assertion(actor_jwk, config["actor_id"], issuer, subject_token)
+            cli_actor = actor_assertion(primary_actor_jwk, config["actor_id"], issuer, subject_token)
             cli_actor_file.write_text(cli_actor, encoding="utf-8")
             cli_jwks_file.write_text(json.dumps(jwks, sort_keys=True), encoding="utf-8")
             for path in (cli_subject_file, cli_actor_file, cli_jwks_file):
@@ -793,11 +1128,56 @@ def run_live(args: argparse.Namespace) -> bool:
             ):
                 if expected not in cli_output:
                     raise CanaryError(f"sts-cli DPoP exchange output missing {expected}")
+            if f"jwt_header_alg={expected_alg}" not in cli_output:
+                raise CanaryError(f"sts-cli DPoP exchange output did not verify {expected_alg}")
             log(
                 "cli_dpop_exchange_pass",
                 output_sha256_prefix=sha256_prefix(cli_output),
                 key_output_sha256_prefix=sha256_prefix(key_output),
             )
+
+            if args.prove_mcp:
+                mcp_tokens: dict[str, str] = {}
+                for actor_id, (target_audience, target_scope) in sorted(MCP_TARGET_SPECS.items()):
+                    actor_jwk = actor_jwks_by_id[actor_id]
+                    actor_token = actor_assertion(actor_jwk, actor_id, issuer, subject_token)
+                    status, body = post_token(
+                        token_endpoint,
+                        exchange_form(subject_token, actor_token, target_audience, target_scope),
+                    )
+                    if status != 200 or not isinstance(body, dict) or not isinstance(body.get("access_token"), str):
+                        raise CanaryError(f"MCP token exchange for {actor_id} failed status={status} body={redact(body)}")
+                    if args.pqc and (body.get("signing_alg_selected") != PQC_SIGNING_ALG or body.get("pqc_fallback") is not False):
+                        raise CanaryError(f"MCP token exchange for {actor_id} did not use fail-closed ML-DSA signing")
+                    if args.pqc:
+                        claims = verify_token_with_cli(
+                            binary,
+                            token=str(body["access_token"]),
+                            jwks=jwks,
+                            directory=tmpdir,
+                            label=f"mcp_{actor_id}",
+                            expected_alg=expected_alg,
+                        )
+                    else:
+                        claims = verify_rs256_jwt_against_jwks(str(body["access_token"]), jwks)
+                    validate_exchange_claims(
+                        label=f"mcp_{actor_id}",
+                        response=body,
+                        claims=claims,
+                        expected_token_type="Bearer",
+                        subject_claims=config["subject_claims"],
+                        actor_id=actor_id,
+                        target_audience=target_audience,
+                        target_scope=target_scope,
+                    )
+                    mcp_tokens[actor_id] = str(body["access_token"])
+                    log("mcp_token_exchange_pass", server=actor_id, **safe_claim_event(body, claims))
+                run_fastmcp_proof(
+                    mcp_config=args.mcp_config,
+                    fastmcp_python=args.fastmcp_python,
+                    minted_tokens=mcp_tokens,
+                    require_mcp=args.require_mcp,
+                )
             log("live_rust_sts_canary_result", result="pass")
             return True
         except Exception as exc:
@@ -822,6 +1202,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-scope", default="chat.read")
     parser.add_argument("--require-live", action="store_true", help="fail instead of reporting not_configured")
     parser.add_argument("--skip-build", action="store_true", help="reuse existing target/debug/sts-cli")
+    parser.add_argument("--pqc", action="store_true", help="run the live canary with ML-DSA STS signing")
+    parser.add_argument("--prove-mcp", action="store_true", help="mint per-MCP-server tokens and call configured MCP servers")
+    parser.add_argument("--mcp-config", type=Path, default=DEFAULT_MCP_CONFIG)
+    parser.add_argument("--fastmcp-python", type=Path, default=DEFAULT_FASTMCP_PYTHON)
+    parser.add_argument("--require-mcp", action="store_true", help="fail if configured MCP calls do not pass")
     parser.add_argument("--self-test-redaction", action="store_true")
     return parser.parse_args()
 
